@@ -77,7 +77,7 @@ served by the loopback fixture.
 Run the protected acceptance check with:
 
 ```bash
-python3 -B .moonshiner/verify.py
+python3 -B tests/verify.py
 ```
 
 It generates credentials and scenario values at runtime, starts only a loopback
@@ -86,6 +86,6 @@ performs `createToken` and its non-OpenAPI `GET /v1/sddc-manager` version probe
 before the three workflow operations. The fixture permits that bootstrap probe
 in addition to the four operationIds pinned by the focused contract.
 
-Everything under `.moonshiner/` and `docs/`, plus
+Everything under `tests/` and `docs/`, plus
 `src/VcfLifecycleConnectivity.psd1`, is protected. Edit only
 `src/VcfLifecycleConnectivity.psm1`.

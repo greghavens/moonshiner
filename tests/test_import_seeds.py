@@ -50,6 +50,13 @@ class SeedComplete(unittest.TestCase):
     def test_missing_protected_test_file(self):
         self.assertIsNotNone(imp.seed_complete(make_seed(self.root, with_files=False)))
 
+    def test_verifier_only_test_file_is_complete(self):
+        seed = make_seed(self.root, with_files=False)
+        hidden = seed / "verification" / "t.py"
+        hidden.parent.mkdir()
+        hidden.write_text("private verifier\n")
+        self.assertIsNone(imp.seed_complete(seed))
+
 
 class Resolve(unittest.TestCase):
     def setUp(self):

@@ -1,9 +1,7 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-build_dir=$(mktemp -d)
-trap 'rm -rf -- "$build_dir"' EXIT
-
-javac --release 17 --add-modules jdk.httpserver \
-  -d "$build_dir" OperationsForNetworksClient.java TestMain.java
-java --add-modules jdk.httpserver -cp "$build_dir" TestMain
+#!/bin/sh
+set -eu
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+find . -type f -name '*.java' ! -path './tests/*' ! -path './test/*' ! -path './verify/*' ! -path './verifier/*' ! -path './harness/*' ! -path './mock/*' -print > "$tmp/sources"
+test -s "$tmp/sources"
+javac -d "$tmp/classes" @"$tmp/sources"

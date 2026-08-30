@@ -1,7 +1,7 @@
-#!/usr/bin/env bash
-# Runs the protected verifier. Loopback only: each scenario starts
-# .protected/mock_vcf_ops.py on an ephemeral 127.0.0.1 port. No VMware endpoint
-# is contacted.
-set -euo pipefail
-cd "$(dirname "$0")"
-exec python3 .protected/verify.py "$@"
+#!/bin/sh
+set -eu
+files="$(find . -type f \( -name '*.ps1' -o -name '*.psm1' \) ! -path './tests/*' ! -path './test/*' ! -path './verify/*' ! -path './verification/*' ! -path './mock/*' -print)"
+test -n "$files"
+for file in $files; do
+  VCF_LOCAL_CHECK_PATH="$file" pwsh -NoProfile -NonInteractive -Command '$null=$tokens=$errors=$null;[System.Management.Automation.Language.Parser]::ParseFile($env:VCF_LOCAL_CHECK_PATH,[ref]$tokens,[ref]$errors)>$null;if($errors.Count){$errors|ForEach-Object{Write-Error $_};exit 1}'
+done

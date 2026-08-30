@@ -1,14 +1,7 @@
 #!/bin/sh
-# Compiles the client and the harness, then runs the verification suite.
-# Everything runs against a loopback mock; no VMware endpoint is contacted.
 set -eu
-
-cd "$(dirname "$0")"
-
-rm -rf build
-mkdir -p build
-
-find src test -name '*.java' -print > build/sources.txt
-javac -d build @build/sources.txt
-
-exec java -cp build TestMain "$PWD"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+find . -type f -name '*.java' ! -path './tests/*' ! -path './test/*' ! -path './verify/*' ! -path './verifier/*' ! -path './harness/*' ! -path './mock/*' -print > "$tmp/sources"
+test -s "$tmp/sources"
+javac -d "$tmp/classes" @"$tmp/sources"

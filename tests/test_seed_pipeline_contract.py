@@ -15,7 +15,9 @@ class SeedPipelineContractTests(unittest.TestCase):
         record = {"artifact_contract": "genuine_harness_task"}
         with mock.patch.object(seed_pipeline, "bundled_plan_record", return_value=record):
             prompt = seed_pipeline._author_system("instruction-following-r3-0001")
-        self.assertIn("task.json, files/, and reference_fix.patch", prompt)
+        self.assertIn("task.json, files/, verification/, and reference_fix.patch",
+                      prompt)
+        self.assertIn("never materialized for the trace harness", prompt)
         self.assertIn("selected unmodified agent harness", prompt)
         self.assertIn("real reachable sources", prompt)
         self.assertIn("must never be simulated", prompt)

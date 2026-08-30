@@ -22,7 +22,7 @@ verification.
 Run acceptance verification with:
 
 ```sh
-python3 -B .protected/verify.py
+python3 -B tests/verify.py
 ```
 
 The installer OpenAPI document is vendored from tag `9.0.0.0`, commit

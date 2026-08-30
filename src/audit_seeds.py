@@ -3,8 +3,9 @@
 
 A seed is COMPLETE when its ``task.json`` parses, carries an ``id`` matching its
 directory name, a ``category``, and a ``prompt``, and honours whatever else it
-declares: a seed naming ``test_files`` ships them under ``files/``, and a seed
-naming a ``verify_cmd`` ships a non-empty ``reference_fix.patch`` proving local
+declares: a seed naming ``test_files`` ships them under candidate-visible
+``files/`` or verifier-only ``verification/``, and a seed naming a
+``verify_cmd`` ships a non-empty ``reference_fix.patch`` proving local
 solvability. Holdout tasks are patch-exempt: they are vetted by held-out
 evaluation, not by a shipped reference fix.
 
@@ -24,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter
+import re
 import sys
 from pathlib import Path
 
@@ -53,8 +55,18 @@ REQUIRED = ("id", "category", "prompt")
 PILOT_EXEMPT = {"py-lru-eviction", "py-config-merge", "go-worker-pool",
                 "ts-pagination"}
 PATCH_EXEMPT = PILOT_EXEMPT | set(CONFIG.get("holdout_tasks", []))
-SEED_ENTRIES = {"task.json", "files", "reference_fix.patch"}
+SEED_ENTRIES = {"task.json", "files", "verification", "reference_fix.patch"}
 REASONING_FIELD = "requires_reasoning"
+
+
+def reference_patch_targets(patch: Path) -> set[str]:
+    """Return candidate paths written by a unified reference patch."""
+    targets = set()
+    for line in patch.read_text(errors="replace").splitlines():
+        match = re.match(r"^\+\+\+ b/(.+)$", line)
+        if match:
+            targets.add(match.group(1))
+    return targets
 
 
 def check(directory: Path, worlds: dict | None = None) -> str | None:
@@ -98,9 +110,12 @@ def check(directory: Path, worlds: dict | None = None) -> str | None:
         return f"id {task['id']!r} != dir name"
     if task.get("test_files"):
         files = directory / "files"
+        verification = directory / "verification"
         if not files.is_dir():
             return "no files/"
-        absent = [name for name in task["test_files"] if not (files / name).exists()]
+        absent = [name for name in task["test_files"]
+                  if not (files / name).exists()
+                  and not (verification / name).exists()]
         if absent:
             return f"test files absent: {absent}"
     if (task.get("verify_cmd") and not oci_environment
@@ -108,6 +123,14 @@ def check(directory: Path, worlds: dict | None = None) -> str | None:
         patch = directory / "reference_fix.patch"
         if not patch.exists() or patch.stat().st_size == 0:
             return "reference_fix.patch missing/empty"
+        verification = directory / "verification"
+        if verification.is_dir():
+            overlaps = sorted(
+                target for target in reference_patch_targets(patch)
+                if (verification / target).exists())
+            if overlaps:
+                return ("verification files overlap reference-patch targets: "
+                        f"{overlaps}")
 
     # ``expected`` is what states the simulated-tool contract; ``world`` alone is
     # a domain label that code-contract seeds also carry. A seed stating that

@@ -1,10 +1,7 @@
 #!/bin/sh
-# Build, exercise the client against the loopback mock, then check the result and the wire shape.
-# Contacts nothing but 127.0.0.1.
 set -eu
-
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-cd "$ROOT"
-
-sh ./run.sh
-exec python3 verify/verify.py "$ROOT"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+find . -type f -name '*.java' ! -path './tests/*' ! -path './test/*' ! -path './verify/*' ! -path './verifier/*' ! -path './harness/*' ! -path './mock/*' -print > "$tmp/sources"
+test -s "$tmp/sources"
+javac -d "$tmp/classes" @"$tmp/sources"

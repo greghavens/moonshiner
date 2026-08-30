@@ -23,11 +23,11 @@ from seed_inventory import bundled_plan_record
 SCHEMA = json.loads((ROOT / "schemas" / "author_review_verdict.schema.json").read_text())
 CANDIDATES = WORKSPACES / "seed-candidates"
 
-AUTHOR_SYSTEM = """You author one Moonshiner seed for the selected unmodified agent harness. Work only in the current workspace. Create exactly task.json, files/, and reference_fix.patch at the workspace root. Implement only the requested seed objective and constraints. Do not broaden them or add a policy, approval or eligibility gate, spending or call ceiling, abstraction, or workflow requirement unless the brief explicitly requests it. The seed must be self-contained: do not depend on absolute host paths, home directories, sibling repositories, or files outside those artifacts. The task.json prompt must contain only the end-user task that the trace harness should receive; never put authoring instructions, metadata, judge feedback, or Moonshiner control text in it. The task may provide a safely simulated environment through fixtures, local services, or reversible state, but the harness's tools and their results must never be simulated, intercepted, embedded, or replaced. Never embed tool calls, tool results, expected call arguments, answer-key response maps, fictional tool schemas, initial service state, or .invalid URLs. A web-research task must require genuine network research against real reachable sources using the harness. Provide deterministic protected verification and a reference patch proving the requested deliverable can be produced. Do not run another coding agent."""
+AUTHOR_SYSTEM = """You author one Moonshiner seed for the selected unmodified agent harness. Work only in the current workspace. Create task.json, files/, verification/, and reference_fix.patch at the workspace root. Implement only the requested seed objective and constraints. Do not broaden them or add a policy, approval or eligibility gate, spending or call ceiling, abstraction, or workflow requirement unless the brief explicitly requests it. The seed must be self-contained: do not depend on absolute host paths, home directories, sibling repositories, or files outside those artifacts. Put only candidate-visible starter content in files/. Put every verifier-only authority, answer key, private test, and private fixture in verification/ using the path it must have when overlaid for formal verification; verification/ is never materialized for the trace harness. The task.json prompt must contain only the end-user task that the trace harness should receive; never put authoring instructions, metadata, judge feedback, or Moonshiner control text in it. The task may provide a safely simulated environment through fixtures, local services, or reversible state, but the harness's tools and their results must never be simulated, intercepted, embedded, or replaced. Never embed tool calls, tool results, expected call arguments, answer-key response maps, fictional tool schemas, initial service state, or .invalid URLs in candidate-visible content. A web-research task must require genuine network research against real reachable sources using the harness. Provide deterministic protected verification and a reference patch proving the requested deliverable can be produced. Do not run another coding agent."""
 
 REAUTHOR_SYSTEM = """You reauthor one contaminated Moonshiner seed for the
-selected unmodified agent harness. Work only in the current workspace. Create exactly task.json,
-files/, and reference_fix.patch at the workspace root. Preserve the supplied
+selected unmodified agent harness. Work only in the current workspace. Create task.json,
+files/, verification/, and reference_fix.patch at the workspace root. Preserve the supplied
 seed ID, capability objective, category, and training tags. Implement only the
 requested seed objective and constraints.
 Do not broaden them or add a policy, approval or eligibility gate, spending or
@@ -35,6 +35,10 @@ call ceiling, abstraction, or workflow requirement unless the supplied seed
 explicitly requests it. The seed must be self-contained: it must not depend on
 absolute host paths, home
 directories, sibling repositories, or files outside those artifacts. The
+files/ tree contains only candidate-visible starter content. Put every
+verifier-only authority, answer key, private test, and private fixture in
+verification/ at the path it must have when overlaid for formal verification;
+verification/ is never materialized for the trace harness. The
 task.json prompt must contain only the end-user task that the trace harness
 should receive; never put authoring instructions, metadata, judge feedback, or
 Moonshiner control text in it. The task must make the agent use the selected
@@ -42,8 +46,8 @@ harness's genuine executable tools against the provided sandboxed
 environment. The environment and its data may be simulated; tool execution
 must never be simulated. Never embed tool calls, tool results, expected call
 arguments, answer-key response maps, initial service state, fictional tool
-schemas, or .invalid URLs in task.json. Use actual files, databases, commands,
-or local services under files/ when controlled state is needed. A web-research
+schemas, or .invalid URLs in candidate-visible content. Use actual files,
+databases, commands, or local services under files/ when controlled state is needed. A web-research
 task must require genuine network research against real reachable sources via
 the harness, never fixtures. Create deterministic protected verification and a
 reference patch proving the requested deliverable can be produced. Do not run
@@ -153,7 +157,7 @@ def _latest_preserved_candidate(seed_id: str) -> Path | None:
 def _promote_candidate(candidate: Path, destination: Path) -> None:
     """Copy only durable seed content across the final promotion boundary."""
     destination.mkdir(parents=True)
-    for name in ("task.json", "files", "reference_fix.patch"):
+    for name in ("task.json", "files", "verification", "reference_fix.patch"):
         source = candidate / name
         if not source.exists():
             continue
@@ -165,11 +169,11 @@ def _promote_candidate(candidate: Path, destination: Path) -> None:
 
 def _review_prompt(seed: dict, report: dict, brief: str) -> str:
     return f"""Review and, when possible, FIX this authored Moonshiner seed in place.
-You are the final seed judge and are authorized to make every necessary in-scope repair without asking for human approval. You may edit task.json, files/, tests, and reference_fix.patch. Preserve the core objective; repair prompt/test mismatches, weak tests, unrelated baseline bugs, broken patches, and nondeterminism. Do not reject or defer a seed merely because it requires edits you can make. After edits, return only the required JSON verdict. Use verdict=accept only if the resulting on-disk seed is ready. Use needs_human only when the objective is genuinely ambiguous or fixing it would redefine the objective.
+You are the final seed judge and are authorized to make every necessary in-scope repair without asking for human approval. You may edit task.json, files/, verification/, tests, and reference_fix.patch. Preserve the core objective; repair prompt/test mismatches, weak tests, unrelated baseline bugs, broken patches, and nondeterminism. Do not reject or defer a seed merely because it requires edits you can make. After edits, return only the required JSON verdict. Use verdict=accept only if the resulting on-disk seed is ready. Use needs_human only when the objective is genuinely ambiguous or fixing it would redefine the objective.
 
 The original authoring brief below is the authoritative statement of the requested seed objective and constraints. Compare the entire authored seed against it. Repair any missing scenario, deliverable, action, or constraint instead of inferring the objective only from the authored task.json. Do not broaden the brief or add a policy, approval or eligibility gate, spending or call ceiling, abstraction, or workflow requirement unless the brief explicitly requests it.
 
-Independently enforce the final artifact contract while repairing it. The seed must be self-contained and must not depend on absolute host paths, home directories, sibling repositories, or files outside task.json, files/, and reference_fix.patch. The task.json prompt must contain only the end-user task for the trace harness, with no authoring instructions, metadata, judge feedback, or Moonshiner control text. The selected unmodified harness must execute every tool call and produce every tool result genuinely. A simulated environment may use local fixtures, services, databases, and reversible state, but the seed must not embed or replace tool calls, tool results, expected arguments, answer-key response maps, fictional tool schemas, or initial service state. Web research must use real reachable sources, never fixtures or .invalid URLs; local or protected files must not disclose the facts the research is intended to discover. Verification must be deterministic and protected, grade the resulting environment or artifacts rather than expected commands or reasoning, and the reference patch must prove the requested deliverable is achievable.
+Independently enforce the final artifact contract while repairing it. The seed must be self-contained and must not depend on absolute host paths, home directories, sibling repositories, or files outside task.json, files/, verification/, and reference_fix.patch. Candidate-visible starter content belongs in files/. Every verifier-only authority, answer key, private test, and private fixture belongs in verification/ at the path it must have when overlaid for formal verification; nothing in verification/ reaches the trace harness. The task.json prompt must contain only the end-user task for the trace harness, with no authoring instructions, metadata, judge feedback, or Moonshiner control text. The selected unmodified harness must execute every tool call and produce every tool result genuinely. A simulated environment may use local fixtures, services, databases, and reversible state, but candidate-visible content must not embed or replace tool calls, tool results, expected arguments, answer-key response maps, fictional tool schemas, or initial service state. Web research must use real reachable sources, never fixtures or .invalid URLs; candidate-visible files must not disclose the facts the research is intended to discover. Verification must be deterministic and protected, grade the resulting environment or artifacts rather than expected commands or reasoning, and the reference patch must prove the requested deliverable is achievable.
 
 SEED ID: {seed['id']}
 ORIGINAL AUTHORING BRIEF:
@@ -310,12 +314,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[seed stopped] {args.id}: infrastructure failure — "
                       f"{environment_detail}", file=sys.stderr)
                 return INFRASTRUCTURE_EXIT
-            # The judge corrects; it does not reject. It edits the candidate
-            # and re-verifies its own work, so its verdict is the decision.
-            # Re-running validation here and vetoing on the result discarded
-            # seeds the judge had already fixed — including failures the judge
-            # cannot fix by editing a seed, like a runtime writing to HOME.
-            accepted = verdict_clear
+            # The judge repairs rather than discarding the seed, but promotion
+            # still requires independent proof that the repaired on-disk seed
+            # is valid. An unresolved candidate remains retained below for the
+            # next repair attempt instead of being promoted or re-authored.
+            accepted = verdict_clear and final_report["passed"]
             status = "accepted" if accepted else ("retry" if number < args.max_attempts else "retired")
             error = None if accepted else "; ".join(
                 final_report.get("failures")

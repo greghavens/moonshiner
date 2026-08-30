@@ -34,7 +34,7 @@ class AuthorIsToldTheId(unittest.TestCase):
 
     def test_the_contract_the_author_works_to_is_otherwise_unchanged(self):
         system = seed_pipeline._author_system("vcf90-0002")
-        self.assertIn("Create exactly task.json, files/, and reference_fix.patch",
+        self.assertIn("Create task.json, files/, verification/, and reference_fix.patch",
                       system)
         self.assertIn("never be simulated", system)
 
@@ -61,24 +61,20 @@ class AuthorIsToldTheId(unittest.TestCase):
 
 
 class TheJudgeCorrectsAndTheSeedMovesOn(unittest.TestCase):
-    """Authoring is: author, judge, judge fixes, move on.
+    """The judge repairs; independent validation controls promotion."""
 
-    The pipeline re-ran validation after the judge had edited and re-verified
-    the candidate, and failed the seed on that second opinion. It discarded
-    work the judge had already fixed, including faults no edit to a seed can
-    fix — a runtime writing cache files into the sandbox HOME, for one.
-    """
-
-    def test_the_verdict_alone_decides(self):
+    def test_judge_acceptance_and_validation_are_both_required(self):
         source = (ROOT / "src" / "seed_pipeline.py").read_text()
         decision = source[source.index("            accepted = "):]
         decision = decision[:decision.index("\n")]
-        self.assertEqual("accepted = verdict_clear", decision.strip())
+        self.assertEqual(
+            'accepted = verdict_clear and final_report["passed"]',
+            decision.strip())
 
-    def test_validation_still_runs_for_the_record(self):
+    def test_validation_runs_after_the_judge_repairs(self):
         source = (ROOT / "src" / "seed_pipeline.py").read_text()
         self.assertIn("final_report = validate_report(seed)", source,
-                      "the report is still produced, it just does not veto")
+                      "the repaired candidate must be validated before promotion")
 
     def test_judge_is_authorized_to_repair_without_approval(self):
         prompt = seed_pipeline._review_prompt(
@@ -97,7 +93,7 @@ class TheJudgeCorrectsAndTheSeedMovesOn(unittest.TestCase):
         self.assertIn("prompt must contain only the end-user task", prompt)
         self.assertIn("unmodified harness must execute every tool call", prompt)
         self.assertIn("Web research must use real reachable sources", prompt)
-        self.assertIn("local or protected files must not disclose", prompt)
+        self.assertIn("candidate-visible files must not disclose", prompt)
         self.assertIn("grade the resulting environment or artifacts", prompt)
         self.assertIn("ORIGINAL AUTHORING BRIEF:\nResearch the public", prompt)
 

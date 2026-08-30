@@ -15,7 +15,7 @@ src/vcfops_alerts/contract.py loads the contract, builds request targets
 src/vcfops_alerts/client.py   the client
 src/vcfops_alerts/__main__.py the command
 src/vcfops_alerts/errors.py   exceptions (already written)
-.protected/                   verification; read it, run it, do not modify it
+tests/                   verification; read it, run it, do not modify it
 ```
 
 ## 1. The contract
@@ -197,7 +197,7 @@ password.
 ## 5. Verification
 
 ```
-python3 -B .protected/verify.py
+python3 -B tests/verify.py
 ```
 
 starts a loopback mock pinned to your `docs/contract.json` — it routes only the

@@ -35,6 +35,29 @@ class Check(unittest.TestCase):
     def test_complete_with_patch_passes(self):
         self.assertIsNone(aud.check(make_complete(self.root, "z-seed", patch=True)))
 
+    def test_verifier_only_test_file_may_live_outside_candidate_files(self):
+        directory = make_complete(self.root, "z-seed", patch=True)
+        (directory / "files" / "t.py").unlink()
+        hidden = directory / "verification" / "t.py"
+        hidden.parent.mkdir()
+        hidden.write_text("private verifier\n")
+        self.assertIsNone(aud.check(directory))
+
+    def test_verifier_overlay_cannot_replace_a_reference_solution_file(self):
+        directory = make_complete(self.root, "z-seed", patch=True)
+        (directory / "reference_fix.patch").write_text(
+            "diff --git a/src/client.py b/src/client.py\n"
+            "--- a/src/client.py\n"
+            "+++ b/src/client.py\n"
+            "@@ -1 +1 @@\n-old\n+fixed\n")
+        hidden = directory / "verification" / "src" / "client.py"
+        hidden.parent.mkdir(parents=True)
+        hidden.write_text("answer\n")
+        self.assertEqual(
+            "verification files overlap reference-patch targets: "
+            "['src/client.py']",
+            aud.check(directory))
+
     def test_missing_patch_fails_for_non_exempt(self):
         why = aud.check(make_complete(self.root, "z-seed", patch=False))
         self.assertIn("reference_fix.patch", why)

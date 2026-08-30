@@ -1,6 +1,7 @@
-#!/usr/bin/env bash
-# Compiles the project, runs TestMain against the loopback mock and checks the recorded traffic
-# against docs/contract.json. Contacts no network endpoint.
-set -euo pipefail
-cd "$(dirname "$0")"
-exec python3 verify/verify.py "$@"
+#!/bin/sh
+set -eu
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+find . -type f -name '*.java' ! -path './tests/*' ! -path './test/*' ! -path './verify/*' ! -path './verifier/*' ! -path './harness/*' ! -path './mock/*' -print > "$tmp/sources"
+test -s "$tmp/sources"
+javac -d "$tmp/classes" @"$tmp/sources"

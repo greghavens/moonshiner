@@ -214,10 +214,10 @@ These are asserted from the mock's request log, byte for byte.
 ## 4. Verification
 
 ```
-python3 -B .protected/verify.py
+python3 -B tests/verify.py
 ```
 
 It starts a loopback HTTP mock pinned to your `docs/contract.json`, drives the
 client against it, and asserts the contract, the provenance and the request log.
-Everything under `.protected/` is protected — read it and run it, but do not
+Everything under `tests/` is protected — read it and run it, but do not
 modify it. No VMware endpoint is contacted during verification.

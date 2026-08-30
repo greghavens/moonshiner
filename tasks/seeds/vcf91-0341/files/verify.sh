@@ -1,12 +1,7 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-build_dir="$script_dir/.verify-build"
-trap 'rm -rf -- "$build_dir"' EXIT
-rm -rf -- "$build_dir"
-mkdir -p "$build_dir"
-
-cd "$script_dir"
-javac -d "$build_dir" AutomationClient.java TestMain.java
-java -cp "$build_dir" TestMain
+#!/bin/sh
+set -eu
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+find . -type f -name '*.java' ! -path './tests/*' ! -path './test/*' ! -path './verify/*' ! -path './verifier/*' ! -path './harness/*' ! -path './mock/*' -print > "$tmp/sources"
+test -s "$tmp/sources"
+javac -d "$tmp/classes" @"$tmp/sources"

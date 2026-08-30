@@ -14,7 +14,8 @@ where the canonical seed is missing or broken, from a fallback source.
 
 A seed is complete when its ``task.json`` parses and carries every required
 field, its ``id`` matches the directory name, ``files/`` exists, and every
-protected ``test_files`` entry is present. A seed that is incomplete in BOTH
+protected ``test_files`` entry is present under ``files/`` or ``verification/``.
+A seed that is incomplete in BOTH
 sources is reported invalid and never half-copied. Seeds already present here
 are left untouched unless ``--force``.
 
@@ -85,7 +86,10 @@ def seed_complete(directory: Path) -> str | None:
     files = directory / "files"
     if not files.is_dir():
         return "no files/"
-    absent = [name for name in task["test_files"] if not (files / name).exists()]
+    verification = directory / "verification"
+    absent = [name for name in task["test_files"]
+              if not (files / name).exists()
+              and not (verification / name).exists()]
     if absent:
         return f"test files absent: {absent}"
     return None

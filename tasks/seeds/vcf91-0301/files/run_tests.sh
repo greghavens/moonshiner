@@ -1,6 +1,7 @@
-#!/usr/bin/env bash
-# Compile the client, run the TestMain harness against the loopback mock, and
-# verify the wire shape of every request it made.
-set -euo pipefail
-cd "$(dirname "$0")"
-exec python3 -B tools/verify.py "$@"
+#!/bin/sh
+set -eu
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+find . -type f -name '*.java' ! -path './tests/*' ! -path './test/*' ! -path './verify/*' ! -path './verifier/*' ! -path './harness/*' ! -path './mock/*' -print > "$tmp/sources"
+test -s "$tmp/sources"
+javac -d "$tmp/classes" @"$tmp/sources"

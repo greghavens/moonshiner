@@ -1,18 +1,7 @@
-#!/usr/bin/env bash
-# Compiles the client together with the harness and runs the contract conformance suite.
-# Everything happens on 127.0.0.1; no VMware endpoint is contacted.
-set -euo pipefail
-
-cd "$(dirname "$0")"
-
-if ! command -v javac >/dev/null 2>&1; then
-    echo "javac not found on PATH; a JDK 17 or newer is required" >&2
-    exit 127
-fi
-
-rm -rf build/classes
-mkdir -p build/classes
-
-javac --release 17 -Xlint:-options -d build/classes harness/*.java src/*.java
-
-exec java -cp build/classes TestMain
+#!/bin/sh
+set -eu
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+find . -type f -name '*.java' ! -path './tests/*' ! -path './test/*' ! -path './verify/*' ! -path './verifier/*' ! -path './harness/*' ! -path './mock/*' -print > "$tmp/sources"
+test -s "$tmp/sources"
+javac -d "$tmp/classes" @"$tmp/sources"

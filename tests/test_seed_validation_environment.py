@@ -34,6 +34,77 @@ diff --git a/value.txt b/value.txt
 """
 
 
+class VerifierAuthoritiesStayOutOfTraceWorkspaces(unittest.TestCase):
+    def test_formal_verification_uses_a_disposable_hidden_overlay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            workspaces = root / "workspaces"
+            workspace = workspaces / "trace"
+            workspace.mkdir(parents=True)
+            (workspace / "candidate.txt").write_text("candidate\n")
+            seed_directory = root / "seed"
+            authority = seed_directory / "verification" / "docs" / "contract.json"
+            authority.parent.mkdir(parents=True)
+            authority.write_text('{"answer": true}\n')
+            seed = {"id": "hidden-authority", "_dir": seed_directory,
+                    "verify_cmd": "python3 tests/verify.py",
+                    "test_files": ["docs/contract.json"]}
+            completed = subprocess.CompletedProcess([], 0, "passed", "")
+
+            def verify(_command, target, _timeout, **_kwargs):
+                self.assertNotEqual(workspace, target)
+                self.assertEqual('{"answer": true}\n',
+                                 (target / "docs" / "contract.json").read_text())
+                self.assertEqual("candidate\n",
+                                 (target / "candidate.txt").read_text())
+                return completed
+
+            with mock.patch.object(common, "WORKSPACES", workspaces), \
+                    mock.patch.object(common, "warm_dependency_cache"), \
+                    mock.patch.object(common, "_sandboxed_command",
+                                      side_effect=verify):
+                passed, output = common.run_verify(seed, workspace)
+
+            self.assertTrue(passed)
+            self.assertEqual("passed", output)
+            self.assertFalse((workspace / "docs" / "contract.json").exists())
+            self.assertEqual([], list(workspaces.glob("verify-hidden-authority-*")))
+            self.assertIsNotNone(
+                common.protected_hashes(seed, workspace)["docs/contract.json"])
+
+    def test_verifier_overlay_does_not_follow_a_candidate_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            workspaces = root / "workspaces"
+            workspace = workspaces / "trace"
+            workspace.mkdir(parents=True)
+            outside = root / "outside"
+            outside.mkdir()
+            (workspace / "docs").symlink_to(outside, target_is_directory=True)
+            seed_directory = root / "seed"
+            authority = seed_directory / "verification" / "docs" / "contract.json"
+            authority.parent.mkdir(parents=True)
+            authority.write_text('{"answer": true}\n')
+            seed = {"id": "hidden-authority", "_dir": seed_directory,
+                    "verify_cmd": "python3 tests/verify.py"}
+            completed = subprocess.CompletedProcess([], 0, "passed", "")
+
+            def verify(_command, target, _timeout, **_kwargs):
+                self.assertFalse((target / "docs").is_symlink())
+                self.assertEqual('{"answer": true}\n',
+                                 (target / "docs" / "contract.json").read_text())
+                return completed
+
+            with mock.patch.object(common, "WORKSPACES", workspaces), \
+                    mock.patch.object(common, "warm_dependency_cache"), \
+                    mock.patch.object(common, "_sandboxed_command",
+                                      side_effect=verify):
+                passed, _ = common.run_verify(seed, workspace)
+
+            self.assertTrue(passed)
+            self.assertEqual([], list(outside.iterdir()))
+
+
 class AProtectedTestDirectoryIsValidated(unittest.TestCase):
     """A protected path can name a directory, not only one file."""
 

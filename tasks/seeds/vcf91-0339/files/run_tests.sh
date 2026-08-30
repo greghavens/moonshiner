@@ -1,9 +1,7 @@
 #!/bin/sh
 set -eu
-
-build_dir="$(mktemp -d)"
-trap 'rm -rf "$build_dir"' EXIT HUP INT TERM
-
-javac --release 17 --add-modules jdk.httpserver -encoding UTF-8 -d "$build_dir" \
-  VcfAutomationClient.java MockVcfAutomation.java WireVerifier.java TestMain.java
-java --add-modules jdk.httpserver -cp "$build_dir" TestMain
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+find . -type f -name '*.java' ! -path './tests/*' ! -path './test/*' ! -path './verify/*' ! -path './verifier/*' ! -path './harness/*' ! -path './mock/*' -print > "$tmp/sources"
+test -s "$tmp/sources"
+javac -d "$tmp/classes" @"$tmp/sources"

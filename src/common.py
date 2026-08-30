@@ -408,7 +408,10 @@ def seed_fingerprint(seed: dict) -> str:
     """
     digest = hashlib.sha256()
     task_path = seed["_dir"] / "task.json"
-    for path in [task_path, *sorted((seed["_dir"] / "files").rglob("*"))]:
+    roots = [seed["_dir"] / "files", seed["_dir"] / "verification"]
+    for path in [task_path, *(path for root in roots
+                              for path in sorted(root.rglob("*"))
+                              if root.exists())]:
         if not path.is_file():
             continue
         relative = path.relative_to(seed["_dir"]).as_posix().encode()
@@ -424,6 +427,39 @@ def _seed_files(seed: dict) -> Path | None:
     """Return repository fixtures when the catalog entry has them."""
     directory = seed.get("_dir")
     return Path(directory) / "files" if directory is not None else None
+
+
+def _seed_verification_files(seed: dict) -> Path | None:
+    """Return verifier-only files that must never enter a trace workspace."""
+    directory = seed.get("_dir")
+    return Path(directory) / "verification" if directory is not None else None
+
+
+def _overlay_verification_files(source: Path, target: Path) -> None:
+    """Overlay verifier files without following candidate-created symlinks."""
+    for source_path in sorted(source.rglob("*"), key=lambda path: (
+            len(path.relative_to(source).parts),
+            path.relative_to(source).as_posix())):
+        relative = source_path.relative_to(source)
+        target_path = target / relative
+        if source_path.is_symlink():
+            raise ValueError(
+                f"verification files contain prohibited symlink: {source_path}")
+        if source_path.is_dir():
+            if target_path.is_symlink() or (target_path.exists()
+                                            and not target_path.is_dir()):
+                target_path.unlink()
+            target_path.mkdir(parents=True, exist_ok=True)
+            continue
+        if not source_path.is_file():
+            raise ValueError(
+                f"verification files contain unsupported entry: {source_path}")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if target_path.is_symlink():
+            target_path.unlink()
+        elif target_path.is_dir():
+            shutil.rmtree(target_path)
+        shutil.copy2(source_path, target_path)
 
 
 def jsonl_lines(path: Path, *, errors: str | None = None) -> list[str]:
@@ -709,15 +745,25 @@ def run_verify(seed: dict, workspace: Path, timeout: int | None = None
     """
     if timeout is None:
         timeout = min(int(seed.get("verify_timeout") or 180), 360)
-    from task_environment import environment_spec, verify_environment
-    if environment_spec(seed) is not None:
-        return verify_environment(seed, workspace, timeout)
     if not seed.get("verify_cmd"):
         return None, "(no verify_cmd)"
-    warm_dependency_cache(workspace)
+    verification_source = _seed_verification_files(seed)
+    verification_workspace = None
+    target = workspace
+    if verification_source is not None and verification_source.is_dir():
+        verification_workspace = WORKSPACES / (
+            f"verify-{seed['id']}-{uuid.uuid4().hex[:10]}")
+        shutil.copytree(workspace, verification_workspace, symlinks=True)
+        _overlay_verification_files(verification_source,
+                                    verification_workspace)
+        target = verification_workspace
     try:
+        from task_environment import environment_spec, verify_environment
+        if environment_spec(seed) is not None:
+            return verify_environment(seed, target, timeout)
+        warm_dependency_cache(target)
         from toolchains import declared_powershell_modules
-        proc = _sandboxed_command(verify_argv(seed["verify_cmd"]), workspace,
+        proc = _sandboxed_command(verify_argv(seed["verify_cmd"]), target,
                                   timeout,
                                   powershell_modules=declared_powershell_modules(seed))
         return proc.returncode == 0, (proc.stdout + "\n" + proc.stderr).strip()
@@ -725,6 +771,9 @@ def run_verify(seed: dict, workspace: Path, timeout: int | None = None
         return False, f"(verify timed out after {timeout}s)"
     except FileNotFoundError as exc:
         return False, f"(verify toolchain missing: {exc})"
+    finally:
+        if verification_workspace is not None:
+            remove_workspace(verification_workspace)
 
 
 def default_signal_dispositions() -> list[str]:
@@ -991,8 +1040,12 @@ def preflight_seed_environment(seed: dict, runtime=None) -> tuple[bool, str]:
 def protected_hashes(seed: dict, workspace: Path) -> dict[str, str | None]:
     """Hash protected files so traces that modify tests can be rejected."""
     hashes = {}
+    verification = _seed_verification_files(seed)
     for relative in seed.get("test_files", []):
         path = workspace / relative
+        if (not path.exists() and verification is not None
+                and (verification / relative).exists()):
+            path = verification / relative
         if path.is_file():
             hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
         elif path.is_dir():

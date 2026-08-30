@@ -12,6 +12,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import generate_traces  # noqa: E402
+import common  # noqa: E402
 import seed_pipeline  # noqa: E402
 import trace_pipeline  # noqa: E402
 from runtimes import (REGISTRY, get_judge, get_seed_author, get_teacher,
@@ -117,6 +118,55 @@ class HarnessContract(unittest.TestCase):
             teacher.run_trace.call_args.kwargs["prompt"], seed["prompt"])
         self.assertEqual(record["raw_sha256"],
                          generate_traces._sha256('{"fresh":true}\n'))
+
+    def test_trace_harness_never_receives_verifier_only_files(self):
+        teacher = mock.Mock()
+        teacher.name = "native-harness"
+        teacher.role = {"model": "model", "reasoning": "xhigh"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            workspaces = root / "workspaces"
+            traces = root / "traces"
+            seed_dir = root / "seed"
+            (seed_dir / "files").mkdir(parents=True)
+            (seed_dir / "files" / "candidate.txt").write_text("starter\n")
+            private = seed_dir / "verification" / "docs" / "contract.json"
+            private.parent.mkdir(parents=True)
+            private.write_text('{"answer": true}\n')
+            (seed_dir / "task.json").write_text("{}\n")
+            seed = {"id": "hidden-verifier", "prompt": "Do the task.",
+                    "verify_cmd": "python3 tests/verify.py",
+                    "test_files": ["docs/contract.json"], "_dir": seed_dir}
+            raw = traces / "raw" / "hidden-verifier.jsonl"
+
+            def trace(_seed, workspace, **_kwargs):
+                self.assertTrue((workspace / "candidate.txt").is_file())
+                self.assertFalse((workspace / "docs" / "contract.json").exists())
+                raw.parent.mkdir(parents=True, exist_ok=True)
+                raw.write_text("{}\n")
+                return SimpleNamespace(
+                    unavailable=None, safeguard_refusal=False,
+                    blocked_on_question=False, return_code=0, timed_out=False,
+                    stream_success=True, error=None, raw_path=raw,
+                    trace_format="native-v1", duration_s=1,
+                    observed_model="model", observed_models=["model"],
+                    model_attested=True, model_fallback=False, usage={},
+                    provenance={})
+
+            def verify(_command, workspace, _timeout, **_kwargs):
+                self.assertEqual('{"answer": true}\n',
+                                 (workspace / "docs" / "contract.json").read_text())
+                return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+            teacher.run_trace.side_effect = trace
+            with mock.patch.object(common, "WORKSPACES", workspaces), \
+                    mock.patch.object(common, "warm_dependency_cache"), \
+                    mock.patch.object(common, "_sandboxed_command",
+                                      side_effect=verify):
+                record = generate_traces.trace_task(
+                    seed, teacher, force=True, traces_root=traces)
+
+        self.assertTrue(record["passed"])
 
     def _blocked_trace(self, error: str, **flags) -> dict:
         """Trace one seed against a teacher that stopped for ``error``."""

@@ -176,7 +176,7 @@ string literals in the client.
 
 ## 3. Local mock service
 
-`.protected/lcm_mock_server.py` is a loopback-only HTTP service pinned to your
+`tests/lcm_mock_server.py` is a loopback-only HTTP service pinned to your
 contract: it reads `docs/contract.json`, builds its routing table from the
 operations named there, and serves **nothing else**. If the contract names an
 operation it does not implement, or omits a required one, it refuses to start.
@@ -184,7 +184,7 @@ operation it does not implement, or omits a required one, it refuses to start.
 Run it by hand while developing:
 
 ```sh
-python3 .protected/lcm_mock_server.py --contract docs/contract.json --log /tmp/req.jsonl
+python3 tests/lcm_mock_server.py --contract docs/contract.json --log /tmp/req.jsonl
 ```
 
 It prints one line, `READY <base-url> <token>`, then serves on `127.0.0.1` on an
@@ -198,9 +198,9 @@ The mock contacts no VMware endpoint, and neither does the test suite.
 ## 4. Verify
 
 ```sh
-python3 -B .protected/verify.py
+python3 -B tests/verify.py
 ```
 
-Everything under `.protected/` is protected: read it, run it, but do not modify
+Everything under `tests/` is protected: read it, run it, but do not modify
 it. Create `docs/contract.json` and `docs/official_sources.json`, and fill in
 `src/vcf_lcm/contract.py` and `src/vcf_lcm/client.py`.

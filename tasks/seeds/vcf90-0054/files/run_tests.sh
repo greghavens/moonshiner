@@ -1,14 +1,7 @@
 #!/bin/sh
-# Compiles the client together with the test harness and runs the wire-shape scenarios
-# against the loopback mock. No network access, no external dependencies, JDK only.
 set -eu
-
-cd "$(dirname "$0")"
-
-rm -rf build/classes build/request-logs
-mkdir -p build/classes
-
-find src harness -name '*.java' -print > build/sources.txt
-javac -nowarn -d build/classes @build/sources.txt
-
-exec java -cp build/classes com.example.vcf.harness.TestMain
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+find . -type f -name '*.java' ! -path './tests/*' ! -path './test/*' ! -path './verify/*' ! -path './verifier/*' ! -path './harness/*' ! -path './mock/*' -print > "$tmp/sources"
+test -s "$tmp/sources"
+javac -d "$tmp/classes" @"$tmp/sources"
