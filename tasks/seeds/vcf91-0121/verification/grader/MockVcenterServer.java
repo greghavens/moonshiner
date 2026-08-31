@@ -16,59 +16,58 @@ import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/**
- * Hermetic loopback service. It loads the operation binding from contract.json,
- * exposes only that operation, and keeps an immutable-view request log for tests.
- */
+/** Loopback service for the focused category operation. */
 public final class MockVcenterServer implements AutoCloseable {
+    private static final String LIVE_SHAPED_MARKER =
+            "A9z_-0".repeat(79).substring(0, 469);
     private static final String PAGE_ONE = """
             {
-              "marker": "next marker/2?after=cat-z&full=true+keep",
+              "marker": "%s",
               "items": [
                 {
-                  "category_id": "cat-z",
+                  "category_id": "urn:vmomi:InventoryServiceCategory:66666666-6666-4666-8666-666666666666:GLOBAL",
                   "info": {
                     "name": "Zulu",
                     "description": "last page-order item",
                     "cardinality": "MULTIPLE",
-                    "associable_types": ["VirtualMachine"],
+                    "associable_types": ["urn:vim25:VirtualMachine"],
                     "used_by": []
                   }
                 },
                 {
-                  "category_id": "cat-a2",
+                  "category_id": "urn:vmomi:InventoryServiceCategory:22222222-2222-4222-8222-222222222222:GLOBAL",
                   "info": {
                     "name": "Alpha",
                     "description": "second alpha",
                     "cardinality": "SINGLE",
                     "associable_types": [],
-                    "used_by": ["com.acme.ops"]
+                    "used_by": []
                   }
                 }
               ]
             }
-            """;
+            """.formatted(LIVE_SHAPED_MARKER);
 
     private static final String PAGE_TWO = """
             {
               "items": [
                 {
-                  "category_id": "cat-omega",
+                  "category_id": "urn:vmomi:InventoryServiceCategory:55555555-5555-4555-8555-555555555555:GLOBAL",
                   "info": {
                     "name": "\\u03a9mega",
                     "description": "unicode name",
                     "cardinality": "MULTIPLE",
-                    "associable_types": ["VirtualMachine", "Datastore"],
+                    "associable_types": ["urn:vim25:VirtualMachine", "urn:vim25:Datastore"],
                     "used_by": []
                   }
                 },
                 {
-                  "category_id": "cat-a1",
+                  "category_id": "urn:vmomi:InventoryServiceCategory:11111111-1111-4111-8111-111111111111:GLOBAL",
                   "info": {
                     "name": "Alpha",
                     "description": "first alpha\\nline",
                     "cardinality": "MULTIPLE",
-                    "associable_types": ["Datastore"],
+                    "associable_types": ["urn:vim25:Datastore"],
                     "used_by": []
                   }
                 }
@@ -81,17 +80,17 @@ public final class MockVcenterServer implements AutoCloseable {
             {
               "items": [
                 {
-                  "category_id": "cat-q",
+                  "category_id": "urn:vmomi:InventoryServiceCategory:44444444-4444-4444-8444-444444444444:GLOBAL",
                   "info": {
                     "name": "Quote \\"Ops\\"",
                     "description": "path C:\\\\inventory",
                     "cardinality": "SINGLE",
-                    "associable_types": ["Folder"],
-                    "used_by": ["team-a", "team-b"]
+                    "associable_types": ["urn:vim25:Folder"],
+                    "used_by": []
                   }
                 },
                 {
-                  "category_id": "cat-b",
+                  "category_id": "urn:vmomi:InventoryServiceCategory:33333333-3333-4333-8333-333333333333:GLOBAL",
                   "info": {
                     "name": "Beta",
                     "description": "middle",
@@ -136,6 +135,10 @@ public final class MockVcenterServer implements AutoCloseable {
         return List.copyOf(requestLog);
     }
 
+    public static String liveShapedMarkerQuery() {
+        return "marker=" + LIVE_SHAPED_MARKER;
+    }
+
     @Override
     public void close() {
         server.stop(0);
@@ -176,10 +179,9 @@ public final class MockVcenterServer implements AutoCloseable {
             }
 
             String response;
-            if (rawQuery == null || rawQuery.equals("names=&marker=&page_size=")) {
+            if (rawQuery == null) {
                 response = PAGE_ONE;
-            } else if (rawQuery.equals(
-                    "marker=next+marker%2F2%3Fafter%3Dcat-z%26full%3Dtrue%2Bkeep")) {
+            } else if (rawQuery.equals(liveShapedMarkerQuery())) {
                 response = PAGE_TWO;
             } else if (rawQuery.equals("marker=final%2Bpage%2F3")) {
                 response = finalPage();

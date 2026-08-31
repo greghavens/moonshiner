@@ -150,6 +150,21 @@ class ContractHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "unhandled contract operation"})
 
     def _supervisor_summary(self, supervisor: str) -> None:
+        if self.server.scenario == "supervisor-missing":
+            self._send_json(
+                404,
+                {
+                    "error_type": "NOT_FOUND",
+                    "messages": [
+                        {
+                            "id": "vcenter.wcp.supervisor.notfound",
+                            "default_message": "The Supervisor with identifier supervisor-live-validation-missing was not found.",
+                            "args": ["supervisor-live-validation-missing"],
+                        }
+                    ],
+                },
+            )
+            return
         kubernetes_status = (
             "WARNING"
             if self.server.scenario == "supervisor-not-ready"
@@ -202,7 +217,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ready-file", type=Path, required=True)
     parser.add_argument(
         "--scenario",
-        choices=("ready", "supervisor-not-ready", "namespace-error"),
+        choices=("ready", "supervisor-not-ready", "namespace-error", "supervisor-missing"),
         required=True,
     )
     parser.add_argument("--supervisor-id", required=True)

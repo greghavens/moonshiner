@@ -87,6 +87,17 @@ class State:
         self,
         authority: str,
     ) -> list[dict[str, str]]:
+        with self.lock:
+            call_number = self.discovery_count
+            self.discovery_count += 1
+        if call_number == 0:
+            return [
+                {
+                    "control_plane_api_server_port": 6443,
+                    "master_host": "",
+                    "namespace": "",
+                }
+            ]
         selected = {
             "namespace": self.config["namespace"],
             "master_host": authority,
@@ -95,9 +106,7 @@ class State:
             "namespace": self.config["distractor_namespace"],
             "master_host": authority,
         }
-        with self.lock:
-            reverse = self.discovery_count % 2 == 1
-            self.discovery_count += 1
+        reverse = (call_number - 1) % 2 == 1
         summaries = [distractor, selected]
         if reverse:
             summaries.reverse()
@@ -136,6 +145,17 @@ class State:
                 reverse = self.active_reverse
         with self.lock:
             collection_index = self.collection_index
+
+        if collection_index == 0:
+            return 200, {
+                "apiVersion": "cluster.x-k8s.io/v1beta2",
+                "kind": "ClusterList",
+                "metadata": {
+                    "continue": "",
+                    "resourceVersion": "2623515",
+                },
+                "items": [self.config["live_cluster"]],
+            }
 
         pages: list[list[dict[str, Any]]] = self.config["pages"]
         if page_number >= len(pages):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contract-pinned loopback fixture for the focused vCenter operations."""
+"""Loopback fixture for the focused vCenter operations."""
 
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ class FixtureState:
         with self.lock:
             self.polls += 1
             ordinal = self.polls
-        states = ("PENDING", "RUNNING", "BLOCKED", "SUCCEEDED")
+        states = self.config["states"]
         return ordinal, states[min(ordinal - 1, len(states) - 1)]
 
 
@@ -125,14 +125,14 @@ def _handler_type(state: FixtureState) -> type[BaseHTTPRequestHandler]:
 
             response = {
                 "description": {
-                    "id": "vcf.clone.progress",
-                    "default_message": f"clone poll {poll_ordinal}",
+                    "id": "Description",
+                    "default_message": "",
                     "args": [],
                 },
-                "service": "com.vmware.vcenter.VM",
-                "operation": "clone",
+                "service": "7978ee81-a66c-4c37-8653-c577c0161e9d",
+                "operation": "com.vmware.vcenter.vm.clone",
                 "status": status,
-                "cancelable": status != "SUCCEEDED",
+                "cancelable": False,
             }
             if status == "SUCCEEDED":
                 response["result"] = state.config["virtual_machine_id"]

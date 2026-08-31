@@ -42,10 +42,10 @@ EXPECTED_QUERY_PARAMETERS = {
 
 PROTECTED_SHA256 = {
     "go.mod": "917819b51a6f09e9e15a05c98008408901fd8724c35a0bac6f9d8cf15f843313",
-    "docs/contract.json": "c5e21dcd4dfbc6f8b034fcf8c98b9da942fae6d06a19eda9560f81a8288b3f4f",
+    "docs/contract.json": "2e6b8423eb31f9a2e037bc2847c54e45467bb22c2bcb3145b30138e165ec6472",
     "docs/official_sources.json": "d562b35c42c6cadd980b7b6eaf4432041f27666b080d4ff5270aa73cbb0ee766",
-    "internal/mockvcf/server.go": "4d7a761062321472df0891b7833b0efa604a53601d308992aeb0f40f59f48eaf",
-    "sddclcm/client_test.go": "3f67bde1330e4e96d77ae81f5d8a60a95233002cc6096a5a0f66802a3a524ed9",
+    "internal/mockvcf/server.go": "da734bd3ca42a8ac973fd614e91c94f2d39df15ea5371c14340189995d5125ea",
+    "sddclcm/client_test.go": "54f1131f231ff13b9b195e5e4b9d1d7d6f1ac5dd966b5ffe918efaa6a2f32e95",
     "tests/verify.py": None,  # self, not hashed
 }
 
@@ -175,7 +175,7 @@ def check_contract() -> None:
         pagination.get("first_page_number"),
         pagination.get("envelope_schema"),
         pagination.get("page_metadata_schema"),
-    ) != ("getTasks", "pageNumber", "pageSize", 50, 0, "PageOfTaskSummary", "PageMetadata"):
+    ) != ("getTasks", "pageNumber", "pageSize", 50, 1, "PageOfTaskSummary", "PageMetadata"):
         fail("contract pagination facts changed")
     if pagination.get("page_metadata_properties") != [
         "pageNumber", "pageSize", "totalElements", "totalPages"

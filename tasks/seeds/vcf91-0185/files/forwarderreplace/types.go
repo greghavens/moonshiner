@@ -1,5 +1,4 @@
-// Package forwarderreplace implements the focused VCF Operations Log
-// Management contract recorded in docs/contract.json.
+// Package forwarderreplace implements focused Log Management reconciliation.
 package forwarderreplace
 
 import (

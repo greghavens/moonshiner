@@ -27,10 +27,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/**
- * Contract-pinned loopback vCenter. It exposes only the operations projected in
- * docs/contract.json and keeps a request log directly readable by TestMain.
- */
+/** Loopback vCenter for the credential-generation handoff. */
 public final class MockVcenterServer implements AutoCloseable {
     private final ContractBinding binding;
     private final HttpServer server;
@@ -59,9 +56,9 @@ public final class MockVcenterServer implements AutoCloseable {
         username = "rotation-svc-" + nonce.substring(0, 8);
         oldPassword = "old-" + nonce.substring(8, 20) + "!";
         replacementPassword = "new-" + nonce.substring(20) + "?";
-        oldSessionId = "old-session-" + nonce.substring(0, 16);
-        replacementSessionId = "replacement-session-" + nonce.substring(16);
-        clusterId = "domain-c-" + nonce.substring(5, 17);
+        oldSessionId = nonce;
+        replacementSessionId = UUID.randomUUID().toString().replace("-", "");
+        clusterId = "domain-c9";
 
         server = HttpServer.create(
                 new InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0), 0);
@@ -198,7 +195,8 @@ public final class MockVcenterServer implements AutoCloseable {
             replacementCreated.countDown();
             return;
         }
-        sendJson(exchange, 401, "{\"error\":\"bad credentials\"}");
+        sendJson(exchange, 401,
+                "{\"error_type\":\"UNAUTHENTICATED\",\"messages\":[]}");
     }
 
     private void listClusters(HttpExchange exchange, LoggedRequest request)
@@ -228,12 +226,14 @@ public final class MockVcenterServer implements AutoCloseable {
         }
 
         if (!activeSessions.contains(request.sessionId())) {
-            sendJson(exchange, 401, "{\"error\":\"session retired\"}");
+            sendJson(exchange, 401,
+                    "{\"error_type\":\"UNAUTHENTICATED\",\"messages\":[]}");
             return;
         }
         if (!oldSessionId.equals(request.sessionId())
                 && !replacementSessionId.equals(request.sessionId())) {
-            sendJson(exchange, 401, "{\"error\":\"unknown session\"}");
+            sendJson(exchange, 401,
+                    "{\"error_type\":\"UNAUTHENTICATED\",\"messages\":[]}");
             return;
         }
         sendJson(exchange, 200, clusterBody());
@@ -252,7 +252,8 @@ public final class MockVcenterServer implements AutoCloseable {
             return;
         }
         if (!activeSessions.remove(request.sessionId())) {
-            sendJson(exchange, 401, "{\"error\":\"session not active\"}");
+            sendJson(exchange, 401,
+                    "{\"error_type\":\"UNAUTHENTICATED\",\"messages\":[]}");
             return;
         }
         if (oldSessionId.equals(request.sessionId())) {
@@ -264,8 +265,8 @@ public final class MockVcenterServer implements AutoCloseable {
 
     private String clusterBody() {
         return "[{\"cluster\":\"" + clusterId
-                + "\",\"name\":\"Rotation cluster\","
-                + "\"ha_enabled\":true,\"drs_enabled\":false}]";
+                + "\",\"name\":\"VCF-Mgmt-Cluster\","
+                + "\"ha_enabled\":false,\"drs_enabled\":true}]";
     }
 
     private static String basic(String username, String password) {

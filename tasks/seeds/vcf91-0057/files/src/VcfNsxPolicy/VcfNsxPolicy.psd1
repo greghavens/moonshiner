@@ -9,8 +9,8 @@
     PowerShellVersion = '7.4'
     RequiredModules = @(
         @{
-            ModuleName = 'VMware.Sdk.Vcf.SddcManager'
-            ModuleVersion = '13.5.0'
+            ModuleName = 'VMware.Sdk.Nsx.Policy.Infra'
+            ModuleVersion = '13.5.0.25380678'
         }
     )
     FunctionsToExport = @(

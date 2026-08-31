@@ -119,13 +119,15 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, b"")
             return
         if operation_id == "PatchSecurityPolicyForDomain":
-            if "503" not in route["responses"]:
+            if "400" not in route["responses"]:
                 self._respond(500, b'{"error_code":50000}')
                 return
             self._respond(
-                503,
-                b'{"error_code":73001,"error_message":"policy engine unavailable",'
-                b'"module_name":"policy"}',
+                400,
+                b'{"error_code":500060,"error_message":"Referenced object was not found",'
+                b'"module_name":"Policy","related_errors":['
+                b'{"error_code":500090,"error_message":"Destination group not found",'
+                b'"module_name":"Policy"}]}',
             )
             return
         self._respond(404, b'{"error_code":40401}')

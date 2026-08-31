@@ -32,6 +32,37 @@ const (
 	clusterOperationKey  = "cluster.x-k8s.io/v1beta2:namespaced-clusters:patch"
 )
 
+func TestLiveNamespaceNotFoundStopsBeforeMutation(t *testing.T) {
+	scenario := runtimeScenario(t, "RUNNING", false)
+	scenario.Namespace = "vmsp-platform"
+	scenario.ClusterName = "vcf-msr01"
+	scenario.TargetVersion = "v1.34.2"
+	scenario.FailOperation = contractmock.OperationNamespaceGet
+	scenario.FailStatus = http.StatusNotFound
+	scenario.FailBody = `{"error_type":"NOT_FOUND","messages":[{"args":[],"default_message":"Namespace was not found.","id":"vcenter.wcp.workload.notfound"}]}`
+	server := newServer(t, scenario)
+	defer server.Close()
+	client := newClient(t, server, scenario)
+	_, err := client.ReconcileVersion(
+		context.Background(),
+		scenario.Supervisor,
+		scenario.Namespace,
+		scenario.ClusterName,
+		scenario.TargetVersion,
+	)
+	var apiError *vksguard.APIError
+	if !errors.As(err, &apiError) ||
+		apiError.Operation != contractmock.OperationNamespaceGet ||
+		apiError.StatusCode != http.StatusNotFound {
+		t.Fatalf("error = %#v, want live namespace 404", err)
+	}
+	state := server.Snapshot()
+	if state.PrecheckRequests != 1 || state.PatchAttempts != 0 ||
+		state.ClusterVersion != scenario.OldVersion {
+		t.Fatalf("namespace 404 state = %#v", state)
+	}
+}
+
 func TestBlockedPrecheckStatusesNeverMutate(t *testing.T) {
 	tests := []struct {
 		name   string

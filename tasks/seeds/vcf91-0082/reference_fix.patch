@@ -1,16 +1,21 @@
 diff --git a/NsxPolicyClient.java b/NsxPolicyClient.java
 new file mode 100644
+index 0000000..598abff
 --- /dev/null
 +++ b/NsxPolicyClient.java
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,513 @@
 +import java.io.IOException;
++import java.math.BigDecimal;
 +import java.net.URI;
 +import java.net.http.HttpClient;
 +import java.net.http.HttpRequest;
 +import java.net.http.HttpResponse;
 +import java.nio.charset.StandardCharsets;
 +import java.util.Base64;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
 +import java.util.List;
++import java.util.Map;
 +import java.util.Objects;
 +import java.util.function.IntConsumer;
 +
@@ -23,7 +28,8 @@ new file mode 100644
 +            String connectivityPath,
 +            String transportZonePath,
 +            List<SegmentSubnet> subnets,
-+            List<Tag> tags
++            List<Tag> tags,
++            Integer expectedRevision
 +    ) {}
 +
 +    public record SegmentSubnet(String gatewayAddress, List<String> dhcpRanges) {}
@@ -48,6 +54,28 @@ new file mode 100644
 +
 +        public String responseBody() {
 +            return responseBody;
++        }
++    }
++
++    public static final class AmbiguousMutationException extends RuntimeException {
++        private static final long serialVersionUID = 1L;
++
++        private final int putStatus;
++        private final int readStatus;
++
++        AmbiguousMutationException(int putStatus, int readStatus) {
++            super("NSX Policy mutation outcome is ambiguous after HTTP " + putStatus
++                    + " and reconciliation HTTP " + readStatus);
++            this.putStatus = putStatus;
++            this.readStatus = readStatus;
++        }
++
++        public int putStatus() {
++            return putStatus;
++        }
++
++        public int readStatus() {
++            return readStatus;
 +        }
 +    }
 +
@@ -88,41 +116,97 @@ new file mode 100644
 +        if (segmentId.isEmpty()) {
 +            throw new IllegalArgumentException("segmentId must not be empty");
 +        }
++		if (segment.expectedRevision() != null && segment.expectedRevision() < 0) {
++			throw new IllegalArgumentException("expectedRevision must be nonnegative when set");
++		}
 +
 +        URI uri = URI.create(managerBaseUrl + API_BASE_PATH
 +                + "/infra/segments/" + encodePathSegment(segmentId));
 +        byte[] body = segmentJson(segment).getBytes(StandardCharsets.UTF_8);
 +
-+        for (int attempt = 0; attempt < 2; attempt++) {
-+            HttpRequest request = HttpRequest.newBuilder(uri)
-+                    .header("Authorization", authorization)
-+                    .header("Accept", "application/json")
-+                    .header("Content-Type", "application/json")
-+                    .PUT(HttpRequest.BodyPublishers.ofByteArray(body))
-+                    .build();
-+            HttpResponse<String> response;
-+            try {
-+                response = httpClient.send(
-+                        request,
-+                        HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-+            } catch (InterruptedException interrupted) {
-+                Thread.currentThread().interrupt();
-+                throw new IllegalStateException("NSX Policy request was interrupted", interrupted);
-+            } catch (IOException failure) {
-+                throw new IllegalStateException("NSX Policy request could not be completed", failure);
-+            }
++        HttpResponse<String> first = sendPut(uri, body);
++        if (first.statusCode() >= 200 && first.statusCode() < 300) {
++            return first.body();
++        }
++        if (first.statusCode() != 503 && first.statusCode() != 504) {
++            throw new NsxPolicyException(first.statusCode(), first.body());
++        }
 +
-+            int status = response.statusCode();
-+            if (status >= 200 && status < 300) {
-+                return response.body();
++        HttpResponse<String> observed = sendGet(uri);
++        if (observed.statusCode() == 200) {
++            if (matchesRequestedFields(new String(body, StandardCharsets.UTF_8), observed.body())) {
++                return observed.body();
 +            }
-+            if (attempt == 0 && (status == 503 || status == 504)) {
-+                retryPacer.accept(1);
++            throw new AmbiguousMutationException(first.statusCode(), observed.statusCode());
++        }
++        if (observed.statusCode() != 404) {
++            throw new AmbiguousMutationException(first.statusCode(), observed.statusCode());
++        }
++
++        retryPacer.accept(1);
++        HttpResponse<String> retry = sendPut(uri, body);
++        if (retry.statusCode() >= 200 && retry.statusCode() < 300) {
++            return retry.body();
++        }
++        throw new NsxPolicyException(retry.statusCode(), retry.body());
++    }
++
++    private HttpResponse<String> sendPut(URI uri, byte[] body) {
++        HttpRequest request = HttpRequest.newBuilder(uri)
++                .header("Authorization", authorization)
++                .header("Accept", "application/json")
++                .header("Content-Type", "application/json")
++                .PUT(HttpRequest.BodyPublishers.ofByteArray(body))
++                .build();
++        return send(request);
++    }
++
++    private HttpResponse<String> sendGet(URI uri) {
++        HttpRequest request = HttpRequest.newBuilder(uri)
++                .header("Authorization", authorization)
++                .header("Accept", "application/json")
++                .GET()
++                .build();
++        return send(request);
++    }
++
++    private HttpResponse<String> send(HttpRequest request) {
++        try {
++            return httpClient.send(
++                    request,
++                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        } catch (InterruptedException interrupted) {
++            Thread.currentThread().interrupt();
++            throw new IllegalStateException("NSX Policy request was interrupted", interrupted);
++        } catch (IOException failure) {
++            throw new IllegalStateException("NSX Policy request could not be completed", failure);
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private static boolean matchesRequestedFields(String requestedJson, String observedJson) {
++        Object requestedValue;
++        Object observedValue;
++        try {
++            requestedValue = new JsonParser(requestedJson).parse();
++            observedValue = new JsonParser(observedJson).parse();
++        } catch (IllegalArgumentException malformed) {
++            return false;
++        }
++        if (!(requestedValue instanceof Map<?, ?>) || !(observedValue instanceof Map<?, ?>)) {
++            return false;
++        }
++        Map<String, Object> requested = (Map<String, Object>) requestedValue;
++        Map<String, Object> observed = (Map<String, Object>) observedValue;
++        for (Map.Entry<String, Object> entry : requested.entrySet()) {
++            if ("_revision".equals(entry.getKey())) {
 +                continue;
 +            }
-+            throw new NsxPolicyException(status, response.body());
++            if (!Objects.equals(entry.getValue(), observed.get(entry.getKey()))) {
++                return false;
++            }
 +        }
-+        throw new AssertionError("unreachable retry state");
++        return true;
 +    }
 +
 +    private static String segmentJson(SegmentSpec segment) {
@@ -132,6 +216,10 @@ new file mode 100644
 +        stringField(json, first, "description", segment.description());
 +        stringField(json, first, "connectivity_path", segment.connectivityPath());
 +        stringField(json, first, "transport_zone_path", segment.transportZonePath());
++		if (segment.expectedRevision() != null) {
++			fieldPrefix(json, first, "_revision");
++			json.append(segment.expectedRevision());
++		}
 +
 +        if (segment.subnets() != null) {
 +            fieldPrefix(json, first, "subnets");
@@ -259,5 +347,173 @@ new file mode 100644
 +            }
 +        }
 +        return encoded.toString();
++    }
++
++    private static final class JsonParser {
++        private final String text;
++        private int offset;
++
++        JsonParser(String text) {
++            this.text = Objects.requireNonNull(text, "text");
++        }
++
++        Object parse() {
++            Object value = value();
++            whitespace();
++            if (offset != text.length()) {
++                throw new IllegalArgumentException("trailing JSON data");
++            }
++            return value;
++        }
++
++        private Object value() {
++            whitespace();
++            if (offset >= text.length()) {
++                throw new IllegalArgumentException("missing JSON value");
++            }
++            return switch (text.charAt(offset)) {
++                case '{' -> object();
++                case '[' -> array();
++                case '"' -> string();
++                case 't' -> literal("true", Boolean.TRUE);
++                case 'f' -> literal("false", Boolean.FALSE);
++                case 'n' -> literal("null", null);
++                default -> number();
++            };
++        }
++
++        private Map<String, Object> object() {
++            offset++;
++            LinkedHashMap<String, Object> result = new LinkedHashMap<>();
++            whitespace();
++            if (take('}')) {
++                return result;
++            }
++            while (true) {
++                whitespace();
++                if (offset >= text.length() || text.charAt(offset) != '"') {
++                    throw new IllegalArgumentException("object key expected");
++                }
++                String key = string();
++                whitespace();
++                require(':');
++                if (result.put(key, value()) != null) {
++                    throw new IllegalArgumentException("duplicate object key");
++                }
++                whitespace();
++                if (take('}')) {
++                    return result;
++                }
++                require(',');
++            }
++        }
++
++        private List<Object> array() {
++            offset++;
++            ArrayList<Object> result = new ArrayList<>();
++            whitespace();
++            if (take(']')) {
++                return result;
++            }
++            while (true) {
++                result.add(value());
++                whitespace();
++                if (take(']')) {
++                    return result;
++                }
++                require(',');
++            }
++        }
++
++        private String string() {
++            require('"');
++            StringBuilder result = new StringBuilder();
++            while (offset < text.length()) {
++                char current = text.charAt(offset++);
++                if (current == '"') {
++                    return result.toString();
++                }
++                if (current != '\\') {
++                    if (current < 0x20) {
++                        throw new IllegalArgumentException("control character in string");
++                    }
++                    result.append(current);
++                    continue;
++                }
++                if (offset >= text.length()) {
++                    throw new IllegalArgumentException("truncated escape");
++                }
++                char escaped = text.charAt(offset++);
++                switch (escaped) {
++                    case '"', '\\', '/' -> result.append(escaped);
++                    case 'b' -> result.append('\b');
++                    case 'f' -> result.append('\f');
++                    case 'n' -> result.append('\n');
++                    case 'r' -> result.append('\r');
++                    case 't' -> result.append('\t');
++                    case 'u' -> result.append((char) Integer.parseInt(take(4), 16));
++                    default -> throw new IllegalArgumentException("invalid escape");
++                }
++            }
++            throw new IllegalArgumentException("unterminated string");
++        }
++
++        private Object number() {
++            int start = offset;
++            if (take('-') && offset >= text.length()) {
++                throw new IllegalArgumentException("invalid number");
++            }
++            while (offset < text.length()) {
++                char current = text.charAt(offset);
++                if ((current >= '0' && current <= '9') || current == '.' ||
++                        current == 'e' || current == 'E' || current == '+' || current == '-') {
++                    offset++;
++                } else {
++                    break;
++                }
++            }
++            try {
++                return new BigDecimal(text.substring(start, offset));
++            } catch (NumberFormatException failure) {
++                throw new IllegalArgumentException("invalid number", failure);
++            }
++        }
++
++        private Object literal(String expected, Object value) {
++            if (!text.startsWith(expected, offset)) {
++                throw new IllegalArgumentException("invalid literal");
++            }
++            offset += expected.length();
++            return value;
++        }
++
++        private String take(int count) {
++            if (offset + count > text.length()) {
++                throw new IllegalArgumentException("truncated escape");
++            }
++            String result = text.substring(offset, offset + count);
++            offset += count;
++            return result;
++        }
++
++        private boolean take(char expected) {
++            if (offset < text.length() && text.charAt(offset) == expected) {
++                offset++;
++                return true;
++            }
++            return false;
++        }
++
++        private void require(char expected) {
++            if (!take(expected)) {
++                throw new IllegalArgumentException("expected " + expected);
++            }
++        }
++
++        private void whitespace() {
++            while (offset < text.length() && Character.isWhitespace(text.charAt(offset))) {
++                offset++;
++            }
++        }
 +    }
 +}

@@ -35,81 +35,31 @@ AUTH_SOURCE = "vIDMAuthSource"
 SESSION_TOKEN = "8f2c41d7a05b4e9ab6d33c7e15f08a24::9a1f"
 
 SUPPORTED_PLUGIN_TYPES = [
+    "Actions",
+    "SNMP Trap",
+    "GenericRestPlugin-slack",
+    "Log File",
     "StandardEmailPlugin",
-    "RestPlugin",
-    "SnmpTrapPlugin",
-    "LogFilePlugin",
+    "GenericRestPlugin-servicenow",
+    "WebhookPlugin",
 ]
 
 # Templates returned by getNotificationTemplates, filtered by the optional
 # name query parameter when the client sends one.
 TEMPLATES = [
     {
-        "templateId": "3e6c9a71-4d02-4f18-b5ad-2c7e91f6b830",
-        "name": "Critical Alert Email",
+        "templateId": "d3139f94-3f04-420c-ab71-ba447be0f687",
+        "name": "Default Email Template",
         "pluginTypeId": "StandardEmailPlugin",
         "templateType": "ALERT",
-        "description": "Default payload for critical alert email notifications",
-        "editable": True,
-        "attachedRuleCount": 2,
-    },
-    {
-        "templateId": "b71d5048-9c3a-42e6-8f10-6d4b2a0e7c95",
-        "name": "Capacity Digest Email",
-        "pluginTypeId": "StandardEmailPlugin",
-        "templateType": "ALERT",
-        "description": "Daily capacity roll-up payload",
-        "editable": True,
-        "attachedRuleCount": 0,
-    },
-    {
-        "templateId": "c04f8e23-17b6-4a95-9d3e-5f8071c2ab46",
-        "name": "Webhook Action Payload",
-        "pluginTypeId": "RestPlugin",
-        "templateType": "ACTION",
-        "description": "Outbound webhook action payload",
+        "description": "Description for Default Email Template",
         "editable": False,
-        "attachedRuleCount": 1,
+        "attachedRuleCount": 0,
     },
 ]
 
 # The pluginId the server assigns to whichever plugin instance is created.
 ASSIGNED_PLUGIN_ID = "5d1b7f60-8a24-4c39-b0e7-2f96ac41d853"
-
-# createNotificationPluginRule outcomes, keyed by the rule name in the request
-# body. The names are the only switch: the same name always produces the same
-# result, so a partially applied change is reproducible.
-RULE_OUTCOMES = {
-    # The scenario rule. The plugin and the template resolve cleanly, then the
-    # server rejects the rule itself with a declared 422. Everything the run
-    # already changed stays changed.
-    "vcfops-critical-oncall": {
-        "status": 422,
-        "body": {
-            "message": (
-                "Notification rule 'vcfops-critical-oncall' was rejected: payload "
-                "template 3e6c9a71-4d02-4f18-b5ad-2c7e91f6b830 is bound to outbound "
-                "method StandardEmailPlugin but no delivery address property is "
-                "configured on plugin 5d1b7f60-8a24-4c39-b0e7-2f96ac41d853."
-            ),
-            "httpStatusCode": 422,
-            "apiErrorCode": "NOTIFICATION_RULE_TEMPLATE_INCOMPATIBLE",
-        },
-    },
-    # Control case: the whole change applies.
-    "vcfops-warning-digest": {
-        "status": 201,
-        "rule_id": "a2f47c98-6b31-4d05-8e7a-19c4f0b3d276",
-    },
-}
-
-DEFAULT_RULE_OUTCOME = {
-    "status": 404,
-    "body": {
-        "message": "No notification rule fixture is defined for this rule name.",
-        "httpStatusCode": 404,
-    },
-}
 
 VERSION = {
     "releaseName": "VCF Operations 9.1.0.0",
@@ -117,9 +67,10 @@ VERSION = {
     "minor": 1,
     "minorMinor": 0,
     "patch": 0,
-    "buildNumber": 25380678,
-    "releasedDate": 1772568000000,
-    "humanlyReadableReleaseDate": "Tuesday, March 3, 2026 at 12:00:00 PM Pacific Standard Time",
+    "buildNumber": 25541561,
+    "description": None,
+    "releasedDate": 1772539200000,
+    "humanlyReadableReleaseDate": "Tuesday, March 3, 2026 at 12:00:00 PM Coordinated Universal Time",
 }
 
 
@@ -309,16 +260,26 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._respond(200, {
             "token": SESSION_TOKEN,
-            "validity": 1893456000000,
-            "expiresAt": "Wednesday, January 1, 2030 at 12:00:00 AM UTC",
-            "roles": ["Administrator"],
+            "validity": 1788098400000,
+            "expiresAt": "Sunday, August 30, 2026 at 12:00:00 PM Coordinated Universal Time",
+            "roles": [],
         })
 
     def op_getCurrentVersionOfServer(self, query, body):
         self._respond(200, dict(VERSION))
 
     def op_getAlertPluginTypes(self, query, body):
-        self._respond(200, {"notificationPluginType": list(SUPPORTED_PLUGIN_TYPES)})
+        self._respond(200, {
+            "notificationPluginType": list(SUPPORTED_PLUGIN_TYPES),
+            "links": [
+                {
+                    "href": "/suite-api/api/alertplugins/types/" + plugin_type.replace(" ", "%20"),
+                    "rel": "RELATED",
+                    "name": "linkToPluginType",
+                }
+                for plugin_type in SUPPORTED_PLUGIN_TYPES
+            ],
+        })
 
     def op_createAlertPlugin(self, query, body):
         if not isinstance(body, dict):
@@ -340,6 +301,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         created = dict(body)
         created["pluginId"] = ASSIGNED_PLUGIN_ID
+        created["version"] = 1788098745156
         created["enabled"] = False
         self._respond(201, created)
 
@@ -348,9 +310,11 @@ class Handler(BaseHTTPRequestHandler):
         wanted = query.get("name", [None])[0]
         if wanted is not None:
             results = [t for t in results if t["name"] == wanted]
-        payload = {"notificationTemplates": results}
-        if results:
-            payload["pageInfo"] = {"page": 0, "pageSize": 1000, "totalCount": len(results)}
+        payload = {
+            "notificationTemplates": results,
+            "pageInfo": {"page": 0, "pageSize": 1000, "totalCount": len(results)},
+            "links": [],
+        }
         self._respond(200, payload)
 
     def op_createNotificationPluginRule(self, query, body):
@@ -371,14 +335,40 @@ class Handler(BaseHTTPRequestHandler):
                 "httpStatusCode": 404,
             })
             return
-        outcome = RULE_OUTCOMES.get(body["name"], DEFAULT_RULE_OUTCOME)
-        if outcome["status"] != 201:
-            self._respond(outcome["status"], outcome["body"])
+        properties = body.get("properties") or []
+        if not any(
+            isinstance(item, dict) and item.get("name") == "emailaddr"
+            for item in properties
+        ):
+            self._respond(500, {
+                "type": "Error",
+                "message": "Internal Server error, cause unknown.",
+                "moreInformation": [
+                    {"name": "errorMessage", "value": "property key is required: emailaddr"},
+                    {"name": "localizedMessage", "value": "property key is required: emailaddr;"},
+                ],
+                "httpStatusCode": 500,
+                "apiErrorCode": 500,
+            })
             return
         created = dict(body)
-        created["id"] = outcome["rule_id"]
+        created["id"] = "a2f47c98-6b31-4d05-8e7a-19c4f0b3d276"
         created.setdefault("enabled", True)
+        created.setdefault("templateId", "d3139f94-3f04-420c-ab71-ba447be0f687")
+        created.setdefault("alertControlStates", [])
+        created.setdefault("alertStatuses", [])
+        created.setdefault("criticalities", [])
+        created.setdefault("resourceKindFilters", [])
+        created.setdefault("resourceFilters", [])
+        created.setdefault("alertTypeFilters", [])
+        created.setdefault("sendHeartbeat", False)
         created.setdefault("ruleType", "ALERT")
+        created.setdefault("actionStatuses", [])
+        created.setdefault("links", [{
+            "href": "/suite-api/api/notifications/rules/" + created["id"],
+            "rel": "SELF",
+            "name": "linkToSelf",
+        }])
         self._respond(201, created)
 
 

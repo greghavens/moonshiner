@@ -206,7 +206,7 @@ public final class TestMain {
                         null);
         expectIllegalArgument(
                 () -> client.createLocalLibrary(
-                        "A0000000-0000-4000-8000-000000000000",
+                        "A0000000-0000-4000-8000-00000000000",
                         new VcenterLibraryClient.LibrarySpec(
                                 "library",
                                 List.of(validBacking),

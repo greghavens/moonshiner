@@ -1,4 +1,4 @@
-// Package nsxpolicy implements the contract-pinned NSX Policy bulk-tag
+// Package nsxpolicy implements the focused NSX Policy bulk-tag
 // workflow used by this module.
 package nsxpolicy
 

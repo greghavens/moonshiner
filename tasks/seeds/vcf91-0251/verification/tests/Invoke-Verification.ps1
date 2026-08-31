@@ -32,6 +32,7 @@ $DEF_ID    = 'aaaaaaaa-1111-2222-3333-444444444444'
 $RES_ID    = 'bbbbbbbb-1111-2222-3333-444444444444'
 $TOKEN     = 'mock-ops-token'
 $CSV       = "Resource,Metric,Value`nvcf-esx-01,cpu|demand,42`n"
+$PDF       = "%PDF-1.4 mock report`n"
 
 $script:Results = [System.Collections.Generic.List[object]]::new()
 
@@ -176,7 +177,7 @@ Write-Host "`n== scenario A: minimal request, generation succeeds ==" -Foregroun
 $mock = $null
 try {
     $mock = Start-Mock @{ statusSequence = @('QUEUED', 'SCHEDULED', 'RUNNING', 'COMPLETED') }
-    $out  = Join-Path $mock.Dir 'report-a.csv'
+    $out  = Join-Path $mock.Dir 'report-a.pdf'
 
     $sess = Connect-VcfOpsReportingSession -Server '127.0.0.1' -Port $mock.Port -Protocol 'http' `
         -Credential (New-TestCredential) -SkipCertificateCheck
@@ -268,8 +269,8 @@ try {
             "create=$($create[0].seq) polls=$((@($polls | ForEach-Object { $_.seq })) -join ',') download=$($dl[0].seq)"
     }
 
-    Assert-That 'A: the downloaded report was written to disk intact' `
-        ((Test-Path -LiteralPath $out) -and ((Get-Content -LiteralPath $out -Raw) -replace "`r`n", "`n") -eq $CSV) `
+    Assert-That 'A: omitted format downloaded the live-default PDF intact' `
+        ((Test-Path -LiteralPath $out) -and ((Get-Content -LiteralPath $out -Raw) -replace "`r`n", "`n") -eq $PDF) `
         "exists=$(Test-Path -LiteralPath $out)"
 } catch {
     Assert-That 'A: scenario ran to completion' $false $_.Exception.Message
@@ -339,6 +340,9 @@ try {
         Assert-That 'B: -Format CSV => exactly one format query parameter' `
             ($dl[0].query -eq '?format=CSV') "query='$($dl[0].query)'"
     }
+    Assert-That 'B: explicit CSV report was written to disk intact' `
+        ((Test-Path -LiteralPath $out) -and ((Get-Content -LiteralPath $out -Raw) -replace "`r`n", "`n") -eq $CSV) `
+        "exists=$(Test-Path -LiteralPath $out)"
 } catch {
     Assert-That 'B: scenario ran to completion' $false $_.Exception.Message
 } finally { Stop-Mock $mock }

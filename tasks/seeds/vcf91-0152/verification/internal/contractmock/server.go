@@ -36,6 +36,7 @@ type Scenario struct {
 	ConfigStatus       string
 	FailOperation      string
 	FailStatus         int
+	FailBody           string
 }
 
 // Request is one deep-copied entry in the synchronized request log.
@@ -307,6 +308,7 @@ func (s *Server) serveNamespace(
 			w,
 			s.scenario.FailStatus,
 			s.scenario.VCenterSessionID,
+			s.scenario.FailBody,
 		)
 		return
 	}
@@ -376,6 +378,7 @@ func (s *Server) serveClusterPatch(
 			w,
 			s.scenario.FailStatus,
 			s.scenario.KubernetesToken,
+			s.scenario.FailBody,
 		)
 		return
 	}
@@ -495,9 +498,15 @@ func versionPatch(version string) ([]byte, error) {
 	return bytes.TrimSuffix(output.Bytes(), []byte{'\n'}), nil
 }
 
-func writeFailure(w http.ResponseWriter, status int, secret string) {
+func writeFailure(w http.ResponseWriter, status int, secret, body string) {
 	if status >= 300 && status < 400 {
 		w.Header().Set("Location", "/operation-not-in-contract")
+	}
+	if body != "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+		return
 	}
 	writeJSON(w, status, map[string]any{
 		"error":  "runtime_failure",

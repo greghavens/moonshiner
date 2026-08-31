@@ -855,6 +855,11 @@ func TestNewClientValidation(t *testing.T) {
 			cfg:     Config{BaseURL: "https://sddc.vcf.example.com", Token: mockToken, CorrelationID: "abc\tdef"},
 			wantErr: true,
 		},
+		{
+			name:    "correlation id is not a UUID",
+			cfg:     Config{BaseURL: "https://sddc.vcf.example.com", Token: mockToken, CorrelationID: "not-a-uuid"},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range tests {

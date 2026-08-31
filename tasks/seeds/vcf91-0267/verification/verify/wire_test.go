@@ -160,7 +160,7 @@ func TestRequiredOnlyRequestOmitsEveryUnsetOptionalField(t *testing.T) {
 	reqs := srv.Requests()
 	assertOnlyContractOperations(t, reqs)
 
-	wantSeq := []string{"acquireToken", "createReport", "getReport", "getReport", "getReport", "downloadReport"}
+	wantSeq := []string{"acquireToken", "createReport", "getReport", "getReport", "getReport", "downloadReport", "releaseToken"}
 	if got := operationSequence(reqs); !reflect.DeepEqual(got, wantSeq) {
 		t.Fatalf("operation sequence = %v, want %v", got, wantSeq)
 	}
@@ -237,7 +237,27 @@ func TestRequiredOnlyRequestOmitsEveryUnsetOptionalField(t *testing.T) {
 	if len(dl.Body) != 0 {
 		t.Errorf("downloadReport sent a body of %d bytes, want none", len(dl.Body))
 	}
+	if got := dl.Header.Get("Accept"); got != "application/pdf" {
+		t.Errorf("downloadReport Accept = %q, want application/pdf for the default format", got)
+	}
 	assertAuthorized(t, c, sc.Token, dl)
+
+	// releaseToken: every acquired token is terminated after the flow, using the
+	// authenticated bodyless operation documented by the appliance.
+	release := filter(reqs, "releaseToken")[0]
+	if want := c.API.BasePath + c.Operations["releaseToken"].Path; release.Path != want {
+		t.Errorf("releaseToken path = %q, want %q", release.Path, want)
+	}
+	if len(release.Body) != 0 {
+		t.Errorf("releaseToken sent a body of %d bytes, want none", len(release.Body))
+	}
+	if got := release.Header.Get("Content-Type"); got != "" {
+		t.Errorf("releaseToken Content-Type = %q, want none for a bodyless request", got)
+	}
+	if got := release.Header.Get("Accept"); got != "application/json" {
+		t.Errorf("releaseToken Accept = %q, want application/json", got)
+	}
+	assertAuthorized(t, c, sc.Token, release)
 
 	// The result must reflect the terminal poll, not the createReport response.
 	if res.Report.Status != c.ReportStatus.Successful {
@@ -284,6 +304,7 @@ func TestOptionalFieldsAreSentWhenSet(t *testing.T) {
 		wantAcquireKey  []string
 		wantCreateKeys  []string
 		wantQuery       string
+		wantAccept      string
 		wantContentType string
 		check           func(t *testing.T, body map[string]any)
 	}{
@@ -309,6 +330,7 @@ func TestOptionalFieldsAreSentWhenSet(t *testing.T) {
 			wantAcquireKey:  []string{"authSource", "password", "username"},
 			wantCreateKeys:  []string{"description", "name", "publish", "reportDefinitionId", "resourceId", "subject", "traversalSpec"},
 			wantQuery:       "format=csv",
+			wantAccept:      "text/csv",
 			wantContentType: "text/csv",
 			check: func(t *testing.T, body map[string]any) {
 				if body["name"] != "Cluster Capacity - Weekly" || body["description"] != "Weekly capacity rollup" {
@@ -346,6 +368,7 @@ func TestOptionalFieldsAreSentWhenSet(t *testing.T) {
 			wantAcquireKey:  []string{"password", "username"},
 			wantCreateKeys:  []string{"publish", "reportDefinitionId", "resourceId"},
 			wantQuery:       "format=pdf",
+			wantAccept:      "application/pdf",
 			wantContentType: "application/pdf",
 			check: func(t *testing.T, body map[string]any) {
 				if body["publish"] != false {
@@ -365,6 +388,7 @@ func TestOptionalFieldsAreSentWhenSet(t *testing.T) {
 			wantAcquireKey:  []string{"password", "username"},
 			wantCreateKeys:  []string{"reportDefinitionId", "resourceId", "traversalSpec"},
 			wantQuery:       "",
+			wantAccept:      "application/pdf",
 			wantContentType: "text/csv",
 			check: func(t *testing.T, body map[string]any) {
 				ts, ok := body["traversalSpec"].(map[string]any)
@@ -388,6 +412,7 @@ func TestOptionalFieldsAreSentWhenSet(t *testing.T) {
 			wantAcquireKey:  []string{"password", "username"},
 			wantCreateKeys:  []string{"reportDefinitionId", "resourceId"},
 			wantQuery:       "",
+			wantAccept:      "application/pdf",
 			wantContentType: "text/csv",
 			check:           func(t *testing.T, body map[string]any) {},
 		},
@@ -453,6 +478,12 @@ func TestOptionalFieldsAreSentWhenSet(t *testing.T) {
 			}
 			if dl[0].RawQuery != tc.wantQuery {
 				t.Errorf("downloadReport query = %q, want %q", dl[0].RawQuery, tc.wantQuery)
+			}
+			if got := dl[0].Header.Get("Accept"); got != tc.wantAccept {
+				t.Errorf("downloadReport Accept = %q, want %q", got, tc.wantAccept)
+			}
+			if got := len(filter(reqs, "releaseToken")); got != 1 {
+				t.Errorf("releaseToken called %d times, want 1", got)
 			}
 		})
 	}
@@ -552,6 +583,9 @@ func TestPollsToTerminalStateBeforeDownloading(t *testing.T) {
 			}
 			if got := len(filter(reqs, "downloadReport")); got != tc.wantDownload {
 				t.Errorf("downloadReport called %d times, want %d", got, tc.wantDownload)
+			}
+			if got := len(filter(reqs, "releaseToken")); got != 1 {
+				t.Errorf("releaseToken called %d times, want 1 after the acquired-token flow ended", got)
 			}
 			if tc.wantErr == nil {
 				if res == nil {
@@ -662,6 +696,9 @@ func TestDefaultMaxPollAttempts(t *testing.T) {
 	if got := len(srv.RequestsFor("downloadReport")); got != 0 {
 		t.Errorf("downloadReport called %d times after poll exhaustion, want 0", got)
 	}
+	if got := len(srv.RequestsFor("releaseToken")); got != 1 {
+		t.Errorf("releaseToken called %d times after poll exhaustion, want 1", got)
+	}
 }
 
 // TestPollWaitHonoursContextCancellation synchronizes on the first recorded
@@ -721,6 +758,9 @@ func TestPollWaitHonoursContextCancellation(t *testing.T) {
 	if got := len(srv.RequestsFor("downloadReport")); got != 0 {
 		t.Errorf("downloadReport called %d times after cancellation, want 0", got)
 	}
+	if got := len(srv.RequestsFor("releaseToken")); got != 1 {
+		t.Errorf("releaseToken called %d times after cancellation, want 1", got)
+	}
 }
 
 // TestServerErrorsAreSurfaced checks every operation reports a non-2xx response
@@ -733,9 +773,10 @@ func TestServerErrorsAreSurfaced(t *testing.T) {
 		wantSeq   []string
 	}{
 		{"acquireToken", []string{"acquireToken"}},
-		{"createReport", []string{"acquireToken", "createReport"}},
-		{"getReport", []string{"acquireToken", "createReport", "getReport"}},
-		{"downloadReport", []string{"acquireToken", "createReport", "getReport", "downloadReport"}},
+		{"createReport", []string{"acquireToken", "createReport", "releaseToken"}},
+		{"getReport", []string{"acquireToken", "createReport", "getReport", "releaseToken"}},
+		{"downloadReport", []string{"acquireToken", "createReport", "getReport", "downloadReport", "releaseToken"}},
+		{"releaseToken", []string{"acquireToken", "createReport", "getReport", "downloadReport", "releaseToken"}},
 	}
 
 	for _, tc := range tests {
@@ -774,7 +815,8 @@ func TestServerErrorsAreSurfaced(t *testing.T) {
 			if got := operationSequence(reqs); !reflect.DeepEqual(got, tc.wantSeq) {
 				t.Errorf("operation sequence = %v, want %v", got, tc.wantSeq)
 			}
-			if got := reqs[len(reqs)-1].ResponseStatus; got != http.StatusServiceUnavailable {
+			failed := filter(reqs, tc.operation)
+			if got := failed[len(failed)-1].ResponseStatus; got != http.StatusServiceUnavailable {
 				t.Errorf("%s status = %d, want %d", tc.operation, got, http.StatusServiceUnavailable)
 			}
 		})
@@ -794,7 +836,7 @@ func TestContractProvenance(t *testing.T) {
 		t.Errorf("contract api.basePath = %q, want /suite-api", c.API.BasePath)
 	}
 
-	wantOps := []string{"acquireToken", "createReport", "downloadReport", "getReport"}
+	wantOps := []string{"acquireToken", "createReport", "downloadReport", "getReport", "releaseToken"}
 	got := make([]string, 0, len(c.Operations))
 	for id := range c.Operations {
 		got = append(got, id)

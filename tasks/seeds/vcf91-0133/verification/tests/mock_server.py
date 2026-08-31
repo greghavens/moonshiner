@@ -79,6 +79,7 @@ class ContractServer(ThreadingHTTPServer):
         self.log_path = log_path
         self.config = config
         self.lock = threading.Lock()
+        self.namespace_get_count = 0
 
     def match_route(
         self, method: str, path: str
@@ -161,6 +162,22 @@ class Handler(BaseHTTPRequestHandler):
             if decoded != (config["namespace"],):
                 self._json(404, {"error_type": "NOT_FOUND"})
                 return
+            self.server.namespace_get_count += 1
+            if self.server.namespace_get_count == 1:
+                self._json(
+                    404,
+                    {
+                        "error_type": "NOT_FOUND",
+                        "messages": [
+                            {
+                                "id": "vcenter.wcp.workload.notfound",
+                                "default_message": "Namespace was not found.",
+                                "args": [config["namespace"]],
+                            }
+                        ],
+                    },
+                )
+                return
             self._json(
                 200,
                 {
@@ -238,13 +255,15 @@ class Handler(BaseHTTPRequestHandler):
             "metadata": {
                 "name": config["cluster_name"],
                 "namespace": config["namespace"],
+                "uid": "fcccd77e-e4fa-4ab8-a6a2-4dadf2b34212",
             },
             "spec": {
                 "topology": {
-                    "class": config["cluster_class"],
+                    "classRef": {"name": config["cluster_class"]},
                     "version": config["old_version"],
                 }
             },
+            "status": {"phase": "Provisioned"},
         }
 
     def _empty(self, status: int) -> None:

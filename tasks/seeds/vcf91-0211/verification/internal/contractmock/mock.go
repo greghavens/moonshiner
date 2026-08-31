@@ -191,7 +191,8 @@ func JSONResponse(t testing.TB, status int, value any) Response {
 	return Response{Status: status, ContentType: "application/json", Body: body}
 }
 
-// PageNumber reads the optional zero-based pageNumber query member.
+// PageNumber maps the live one-based pageNumber query to the verifier's
+// zero-based fixture index. An omitted first-page query maps to index zero.
 func PageNumber(request Request) (int, error) {
 	parsed, err := http.NewRequest(request.Method, "http://loopback"+request.RequestURI, nil)
 	if err != nil {
@@ -208,5 +209,8 @@ func PageNumber(request Request) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("invalid pageNumber %q", values[0])
 	}
-	return page, nil
+	if page < 2 {
+		return 0, fmt.Errorf("later pageNumber %d is not one-based progression", page)
+	}
+	return page - 1, nil
 }

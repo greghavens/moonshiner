@@ -28,7 +28,7 @@ public final class TestMain {
                 5,
                 Duration.ZERO);
         VcfHostRefreshClient.RefreshResult second = client.refreshHostsAndWait(
-                new VcfHostRefreshClient.RefreshRequest(selected, Boolean.FALSE),
+                new VcfHostRefreshClient.RefreshRequest(selected, Boolean.TRUE),
                 5,
                 Duration.ZERO);
 
@@ -55,6 +55,12 @@ public final class TestMain {
         for (int index = 0; index < 101; index++) {
             tooMany.add("host-" + index);
         }
+        expectIllegalArgument(
+                () -> client.refreshHostsAndWait(
+                        new VcfHostRefreshClient.RefreshRequest(List.of("host"), Boolean.FALSE),
+                        1,
+                        Duration.ZERO),
+                "explicit false forceRefresh was not rejected locally");
         expectIllegalArgument(
                 () -> client.refreshHostsAndWait(
                         new VcfHostRefreshClient.RefreshRequest(tooMany, null),

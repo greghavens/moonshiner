@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"moonshiner.local/vcf91/namespacebackup/internal/contractmock"
+	"vcfnamespacebackup/internal/contractmock"
 )
 
 func TestBackupNamespace_SortsFlippingCollectionsAndPollsTerminal(t *testing.T) {
@@ -199,6 +199,59 @@ func TestBackupNamespace_SortsFlippingCollectionsAndPollsTerminal(t *testing.T) 
 			}
 		})
 	}
+}
+
+func TestLiveValidatedUnavailableBackupBoundaries(t *testing.T) {
+	t.Run("namespace not found", func(t *testing.T) {
+		mock := contractmock.New(t, "../docs/contract.json", contractmock.Options{
+			NamespaceHTTPStatus: http.StatusNotFound,
+			BeforeClusters:      []contractmock.ClusterFixture{{Name: "vcf-msr01", TopologyVersion: "v1.34.2"}},
+			ErrorBody:           `{"error_type":"NOT_FOUND","messages":[{"args":[],"default_message":"Namespace was not found.","id":"vcenter.wcp.workload.notfound"}]}`,
+		})
+		client, err := NewClient(Config{
+			VCenterURL: mock.URL(), KubernetesURL: mock.URL(),
+			SessionID:       "8a1d0d1b3fe94ad0b05f3a8fcfd92ab5",
+			KubernetesToken: "distinct-kubernetes-bearer",
+			HTTPClient:      mock.HTTPClient(), MaxPolls: 3,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = client.BackupNamespace(context.Background(), BackupRequest{Namespace: "vmsp-platform"})
+		var apiError *APIError
+		if !errors.As(err, &apiError) || apiError.OperationID != OperationGetNamespace || apiError.StatusCode != http.StatusNotFound {
+			t.Fatalf("error = %#v, want live namespace 404", err)
+		}
+		if log := mock.Log(); len(log) != 1 {
+			t.Fatalf("namespace 404 requests = %#v", log)
+		}
+	})
+
+	t.Run("absent Supervisor backup", func(t *testing.T) {
+		mock := contractmock.New(t, "../docs/contract.json", contractmock.Options{
+			BackupHTTPStatus: http.StatusNotFound,
+			BeforeClusters:   []contractmock.ClusterFixture{{Name: "vcf-msr01", TopologyVersion: "v1.34.2"}},
+			ErrorBody:        `{"error_type":"NOT_FOUND","messages":[{"args":[],"default_message":"Supervisor was not found.","id":"vcenter.wcp.supervisor.notfound"}]}`,
+		})
+		client, err := NewClient(Config{
+			VCenterURL: mock.URL(), KubernetesURL: mock.URL(),
+			SessionID:       "8a1d0d1b3fe94ad0b05f3a8fcfd92ab5",
+			KubernetesToken: "distinct-kubernetes-bearer",
+			HTTPClient:      mock.HTTPClient(), MaxPolls: 3,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = client.BackupNamespace(context.Background(), BackupRequest{Namespace: "vmsp-platform"})
+		var apiError *APIError
+		if !errors.As(err, &apiError) || apiError.OperationID != OperationCreateBackup || apiError.StatusCode != http.StatusNotFound {
+			t.Fatalf("error = %#v, want live Supervisor 404", err)
+		}
+		log := mock.Log()
+		if len(log) != 3 || log[2].Operation != "createSupervisorBackup" {
+			t.Fatalf("Supervisor 404 requests = %#v", log)
+		}
+	})
 }
 
 func TestBackupNamespace_TerminalAndConsistencyErrors(t *testing.T) {

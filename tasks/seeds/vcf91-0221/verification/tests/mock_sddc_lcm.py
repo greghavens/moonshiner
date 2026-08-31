@@ -80,7 +80,7 @@ SCENARIOS: tuple[dict[str, Any], ...] = (
     {
         "name": "empty-optional",
         "accepted": task(TASK_IDS[9], "PENDING"),
-        "polls": [task(TASK_IDS[9], "SUCCEEDED")],
+        "polls": [task(TASK_IDS[9], "FAILED")],
     },
     {
         "name": "timeout",

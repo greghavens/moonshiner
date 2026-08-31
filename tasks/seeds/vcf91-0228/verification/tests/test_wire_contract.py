@@ -321,8 +321,8 @@ def check_paging_run(c, log):
 
     c.equal(
         [_query_map(e).get("pageNumber") for e in list_calls],
-        ["0", "1", "2"],
-        "pages were requested in ascending order, starting at 0, stopping at totalPages",
+        ["1", "2", "3"],
+        "pages were requested in ascending order, starting at 1, stopping at totalPages",
     )
 
     for index, entry in enumerate(list_calls):
@@ -396,7 +396,7 @@ def check_bare_run(c, log):
         ["pageNumber", "pageSize"],
         "unfiltered getTasks sends only the paging parameters",
     )
-    c.equal(query.get("pageNumber"), "0", "pageNumber 0 is sent -- 0 is a value, not an absence")
+    c.equal(query.get("pageNumber"), "1", "pageNumber 1 is sent for the one-based collection")
     c.equal(query.get("pageSize"), "50", "pageSize defaults to the contract's documented maximum")
 
 
@@ -412,7 +412,7 @@ def check_all_filters_run(c, log):
     query = _query_map(entry)
     expected = dict(ALL_FILTER_VALUES)
     expected["includeSystemTasks"] = "true"
-    expected["pageNumber"] = "0"
+    expected["pageNumber"] = "1"
     expected["pageSize"] = "50"
     c.equal(query, expected, "every declared filter is accepted and retains its value")
     c.check(

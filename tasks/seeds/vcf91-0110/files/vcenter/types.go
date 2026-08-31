@@ -1,4 +1,4 @@
-// Package vcenter implements the reduced VCF 9.1 vCenter inventory contract.
+// Package vcenter implements VCF 9.1 vCenter inventory collection.
 package vcenter
 
 import (
@@ -47,7 +47,7 @@ type VMSummary struct {
 	Name          string     `json:"name"`
 	PowerState    PowerState `json:"power_state"`
 	CPUCount      *int64     `json:"cpu_count,omitempty"`
-	MemorySizeMiB *int64     `json:"memory_size_mib,omitempty"`
+	MemorySizeMiB *int64     `json:"memory_size_MiB,omitempty"`
 }
 
 // InventorySnapshot is the result (or partial result) of CollectInventory.
@@ -79,7 +79,7 @@ func (e *ProtocolError) Error() string {
 	return fmt.Sprintf("vcenter: %s returned an invalid response", e.OperationID)
 }
 
-// Client calls the three operations in docs/contract.json.
+// Client calls the required vCenter session and inventory operations.
 type Client struct {
 	baseURL    string
 	username   string

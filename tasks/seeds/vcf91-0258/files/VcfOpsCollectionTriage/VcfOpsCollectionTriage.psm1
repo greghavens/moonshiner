@@ -37,6 +37,8 @@ function Get-VcfOpsCollectionDiagnosis {
         [AllowEmptyString()]
         [string] $AuthSource = 'local',
 
+        [switch] $SkipCertificateCheck,
+
         [int] $PageSize = 1000
     )
 

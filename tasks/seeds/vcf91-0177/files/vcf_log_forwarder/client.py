@@ -1,7 +1,6 @@
 """VCF Operations Log Management HTTP client.
 
-Implement this module using only the Python standard library and the pinned
-contract in docs/contract.json.
+Implement this module using only the Python standard library.
 """
 
 from __future__ import annotations
@@ -46,7 +45,7 @@ class ApiResponse:
 
 
 class VcfLogClient:
-    """Minimal client for the two operations selected in docs/contract.json."""
+    """Minimal client for the required Log Management operations."""
 
     def __init__(self, base_url: str, token: str, timeout: float = 10.0):
         raise NotImplementedError

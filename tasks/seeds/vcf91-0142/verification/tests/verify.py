@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from mock_api import ContractMockServer  # noqa: E402
 from vcf_vks_change import (  # noqa: E402
+    ApiError,
     CoordinatedChangeClient,
 )
 
@@ -427,15 +428,15 @@ def main() -> None:
     validate_python_shape()
 
     suffix = secrets.token_hex(7)
-    namespace = f"team blue/ñ-{suffix}"
-    cluster_name = f"payments #1/{suffix}"
+    namespace = "vmsp-platform"
+    cluster_name = "vcf-msr01"
     supervisor = f"supervisor-{secrets.token_hex(9)}"
-    cluster_class = f"builtin-generic-v{secrets.randbelow(6) + 3}.0"
+    cluster_class = "vsphere-9.1.2668"
     old_description = f"before-{secrets.token_hex(8)}"
     namespace_description = f"new description π/{secrets.token_hex(8)}"
-    old_version = f"v1.32.{secrets.randbelow(8) + 1}+vmware.1"
+    old_version = "v1.34.2"
     target_version = f"v1.33.{secrets.randbelow(8) + 1}+vmware.2"
-    session_id = secrets.token_urlsafe(27)
+    session_id = secrets.token_hex(16)
     token = secrets.token_urlsafe(35)
     failure_marker = f"never-expose-{secrets.token_urlsafe(24)}"
 
@@ -454,6 +455,7 @@ def main() -> None:
             old_description=old_description,
             old_version=old_version,
             failure_marker=failure_marker,
+            live_failure_once=True,
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -497,6 +499,26 @@ def main() -> None:
                 read_log(request_log) == [],
                 "argument validation was not completed before traffic",
             )
+
+            try:
+                client.coordinate_change(**valid_arguments)
+            except ApiError as error:
+                require(
+                    "HTTP 404" in str(error),
+                    "live namespace error did not preserve HTTP 404",
+                )
+            else:
+                raise VerificationError(
+                    "live absent namespace unexpectedly passed preflight"
+                )
+            primary_records = read_log(request_log)
+            require(
+                len(primary_records) == 1
+                and primary_records[0]["operation"]
+                == "getSupervisorNamespace",
+                "live namespace 404 did not stop before Kubernetes",
+            )
+            request_log.write_text("", encoding="utf-8")
 
             result = client.coordinate_change(
                 supervisor=supervisor,
@@ -861,7 +883,7 @@ def main() -> None:
         },
         "spec": {
             "topology": {
-                "class": cluster_class,
+                "classRef": {"name": cluster_class},
                 "version": old_version,
             }
         },
@@ -958,7 +980,9 @@ def main() -> None:
     wrong_name["metadata"]["name"] = cluster_name.upper()
     cluster_variants.append(("Cluster name mismatch", wrong_name))
     wrong_class = copy.deepcopy(cluster_info)
-    wrong_class["spec"]["topology"]["class"] = cluster_class.upper()
+    wrong_class["spec"]["topology"]["classRef"]["name"] = (
+        cluster_class.upper()
+    )
     cluster_variants.append(("Cluster class mismatch", wrong_class))
     blank_version = copy.deepcopy(cluster_info)
     blank_version["spec"]["topology"]["version"] = " \t"

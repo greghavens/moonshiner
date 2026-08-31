@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	ReadOperation  = "ReadInfraSegment"
-	PatchOperation = "PatchInfraSegment"
+	ReadOperation = "ReadInfraSegment"
+	PutOperation  = "CreateOrReplaceInfraSegment"
 )
 
 type contract struct {
@@ -33,14 +33,15 @@ type operation struct {
 	Path        string `json:"path"`
 }
 
-// Scenario is supplied at test runtime. ReadBody and PatchBody are response
+// Scenario is supplied at test runtime. ReadBody and PutBody are response
 // documents, not an initial-state fixture.
 type Scenario struct {
-	SegmentID   string
-	ReadStatus  int
-	ReadBody    []byte
-	PatchStatus int
-	PatchBody   []byte
+	SegmentID     string
+	ReadStatus    int
+	ReadBody      []byte
+	PutStatus     int
+	PutBody       []byte
+	RaceAfterRead bool
 }
 
 // LoggedRequest is the stable JSONL assertion surface used by the verifier.
@@ -89,8 +90,8 @@ func New(contractPath, logPath string, scenario Scenario) (*Server, error) {
 		return nil, fmt.Errorf("contract must name exactly two operations")
 	}
 	for id, method := range map[string]string{
-		ReadOperation:  http.MethodGet,
-		PatchOperation: http.MethodPatch,
+		ReadOperation: http.MethodGet,
+		PutOperation:  http.MethodPut,
 	} {
 		op, ok := c.Operations[id]
 		if !ok || op.OperationID != id || op.Method != method ||
@@ -104,8 +105,8 @@ func New(contractPath, logPath string, scenario Scenario) (*Server, error) {
 	if scenario.ReadStatus == 0 {
 		scenario.ReadStatus = http.StatusOK
 	}
-	if scenario.PatchStatus == 0 {
-		scenario.PatchStatus = http.StatusOK
+	if scenario.PutStatus == 0 {
+		scenario.PutStatus = http.StatusOK
 	}
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create log directory: %w", err)
@@ -153,8 +154,8 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case s.contract.Operations[ReadOperation].Method:
 			opID = ReadOperation
-		case s.contract.Operations[PatchOperation].Method:
-			opID = PatchOperation
+		case s.contract.Operations[PutOperation].Method:
+			opID = PutOperation
 		}
 	}
 
@@ -177,13 +178,17 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	switch opID {
 	case ReadOperation:
 		s.writeResponse(w, s.scenario.ReadStatus, s.scenario.ReadBody)
-	case PatchOperation:
-		if s.scenario.PatchStatus == http.StatusOK {
+	case PutOperation:
+		if s.scenario.RaceAfterRead {
+			s.writeResponse(w, http.StatusPreconditionFailed, []byte(`{"error_code":500071,"error_message":"The object has already been modified by another user or process.","module_name":"Policy","details":"version mismatch"}`))
+			return
+		}
+		if s.scenario.PutStatus == http.StatusOK {
 			s.mu.Lock()
 			s.effects++
 			s.mu.Unlock()
 		}
-		s.writeResponse(w, s.scenario.PatchStatus, s.scenario.PatchBody)
+		s.writeResponse(w, s.scenario.PutStatus, s.scenario.PutBody)
 	default:
 		http.NotFound(w, r)
 	}

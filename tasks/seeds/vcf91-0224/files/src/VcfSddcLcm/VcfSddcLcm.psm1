@@ -71,7 +71,7 @@ function Start-VcfSddcLcmSupportBundle {
         [string] $ComponentId,
 
         [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
+        [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
         [string] $CorrelationId,
 
         [int] $LookBackWindow,
@@ -82,8 +82,8 @@ function Start-VcfSddcLcmSupportBundle {
     )
 
     # Implement:
-    #   1. getTasks, filtered to this component, sending only the filters you
-    #      mean - unused optional query parameters must not reach the wire.
+    #   1. getTasks, filtered by the live support-bundle workflow name, sending
+    #      only the filter meant here; live summaries omit component resources.
     #   2. If a returned task already carries $CorrelationId, adopt it and
     #      return with Reused = $true, without issuing a POST.
     #   3. Otherwise POST generateComponentSupportBundle with the

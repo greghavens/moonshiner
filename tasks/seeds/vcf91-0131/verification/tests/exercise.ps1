@@ -50,6 +50,22 @@ try {
         $Handler
     )
 
+    $LiveGapError = $null
+    try {
+        $null = Get-VcfVksClusterInventory `
+            -NamespaceApi $Api `
+            -Namespace $Namespace `
+            -KubernetesToken $KubernetesToken `
+            -PageSize $PageSize `
+            -KubernetesScheme http
+    }
+    catch {
+        $LiveGapError = $_
+    }
+    if ($null -eq $LiveGapError) {
+        throw 'The exact live blank namespace summary was not rejected.'
+    }
+
     $First = @(
         Get-VcfVksClusterInventory `
             -NamespaceApi $Api `

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Loopback-only mock pinned to the focused vCenter OpenAPI contract."""
+"""Loopback vCenter fixture for the focused operations."""
 
 from __future__ import annotations
 
@@ -53,22 +53,12 @@ class ContractServer(ThreadingHTTPServer):
         suffix = secrets.token_hex(8)
         self.username = f"inventory-{suffix}@vsphere.local"
         self.password = f'pw\\"snowman-☃-{suffix}'
-        self.initial_token = "session-old-" + secrets.token_hex(16)
-        self.replacement_token = "session-new-" + secrets.token_hex(16)
+        self.initial_token = "0123456789abcdef0123456789abcdef"
+        self.replacement_token = "fedcba9876543210fedcba9876543210"
         self.datacenter_ids = [
-            "dc core+" + secrets.token_hex(5),
-            "dc/finance " + secrets.token_hex(5),
-            "dc-研究-" + secrets.token_hex(5),
-        ]
-        self.vm_ids = [
-            "vm-" + secrets.token_hex(6),
-            "vm-" + secrets.token_hex(6),
-            "vm-" + secrets.token_hex(6),
-        ]
-        self.vm_names = [
-            'Core "API"',
-            "Finance\\Batch",
-            "Research Ω",
+            "datacenter-3",
+            "datacenter-404",
+            "datacenter encoding+coverage",
         ]
 
     def append_log(self, entry: dict) -> None:
@@ -89,22 +79,27 @@ class ContractServer(ThreadingHTTPServer):
                 return self.replacement_token
             return None
 
-    def summary(self, datacenter_id: str) -> dict:
-        index = self.datacenter_ids.index(datacenter_id)
-        result = {
-            "vm": self.vm_ids[index],
-            "name": self.vm_names[index],
-            "power_state": "POWERED_ON",
-        }
-        if index == 0:
-            result["cpu_count"] = 2
-            result["memory_size_mib"] = 2048
-        elif index == 1:
-            result["memory_size_mib"] = 4096
-        else:
-            result["cpu_count"] = 8
-            result["memory_size_mib"] = None
-        return result
+    def summaries(self, datacenter_id: str) -> list[dict]:
+        if datacenter_id == "datacenter encoding+coverage":
+            return [
+                {"vm": "vm-9001", "name": "missing-cpu-contract-coverage", "power_state": "POWERED_ON", "memory_size_MiB": 4096},
+                {"vm": "vm-9002", "name": "null-memory-contract-coverage", "power_state": "POWERED_ON", "cpu_count": 8, "memory_size_MiB": None},
+            ]
+        if datacenter_id != "datacenter-3":
+            return []
+        return [
+            {"vm": "vm-19", "name": "sddcm01", "power_state": "POWERED_ON", "cpu_count": 4, "memory_size_MiB": 16384},
+            {"vm": "vm-20", "name": "vc01", "power_state": "POWERED_ON", "cpu_count": 4, "memory_size_MiB": 21504},
+            {"vm": "vm-28", "name": "nsx01a", "power_state": "POWERED_ON", "cpu_count": 6, "memory_size_MiB": 24576},
+            {"vm": "vm-33", "name": "vcf-msr01-nxpxf", "power_state": "POWERED_ON", "cpu_count": 4, "memory_size_MiB": 10240},
+            {"vm": "vm-34", "name": "vcf-msr01-5ghdn", "power_state": "POWERED_ON", "cpu_count": 8, "memory_size_MiB": 24576},
+            {"vm": "vm-35", "name": "vcf-msr01-x6j88", "power_state": "POWERED_ON", "cpu_count": 8, "memory_size_MiB": 24576},
+            {"vm": "vm-36", "name": "vcf-msr01-6zpgq", "power_state": "POWERED_ON", "cpu_count": 8, "memory_size_MiB": 24576},
+            {"vm": "vm-37", "name": "vcf01", "power_state": "POWERED_ON", "cpu_count": 4, "memory_size_MiB": 16384},
+            {"vm": "vm-38", "name": "vcf-proxy01", "power_state": "POWERED_ON", "cpu_count": 4, "memory_size_MiB": 16384},
+            {"vm": "vm-39", "name": "vcf-lic01", "power_state": "POWERED_ON", "cpu_count": 2, "memory_size_MiB": 4096},
+            {"vm": "vm-43", "name": "vcf-asr01-szwjz", "power_state": "POWERED_ON", "cpu_count": 8, "memory_size_MiB": 98304},
+        ]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -191,23 +186,18 @@ class Handler(BaseHTTPRequestHandler):
             session_id = self.headers.get("vmware-api-session-id")
             if session_id == self.server.initial_token:
                 if datacenter_id == self.server.datacenter_ids[0]:
-                    self.send_json(200, [self.server.summary(datacenter_id)])
+                    self.send_json(200, self.server.summaries(datacenter_id))
                 else:
                     self.send_json(
                         401,
                         {
                             "error_type": "UNAUTHENTICATED",
-                            "messages": [
-                                {
-                                    "id": "vapi.security.authentication.invalid",
-                                    "default_message": "Session has expired",
-                                }
-                            ],
+                            "messages": [],
                         },
                     )
                 return
             if session_id == self.server.replacement_token:
-                self.send_json(200, [self.server.summary(datacenter_id)])
+                self.send_json(200, self.server.summaries(datacenter_id))
                 return
             self.send_json(401, {"error_type": "UNAUTHENTICATED"})
             return
@@ -247,8 +237,6 @@ def main() -> None:
             "initial_token": server.initial_token,
             "replacement_token": server.replacement_token,
             "datacenter_ids": server.datacenter_ids,
-            "vm_ids": server.vm_ids,
-            "vm_names": server.vm_names,
         },
     )
     try:

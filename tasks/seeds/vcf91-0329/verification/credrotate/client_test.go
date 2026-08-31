@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"moonshiner.local/vcf91-0329/credrotate"
-	"moonshiner.local/vcf91-0329/internal/contractmock"
+	"vcfcredrotate/credrotate"
+	"vcfcredrotate/internal/contractmock"
 )
 
 const (

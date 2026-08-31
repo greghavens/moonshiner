@@ -157,17 +157,20 @@ func TestProtectedCollectRefreshKeepsProgressAndExactWire(t *testing.T) {
 		t.Fatalf("CollectInventory: %v", err)
 	}
 	wantDatacenters := []vcenter.DatacenterSummary{
-		{Datacenter: "datacenter-2", Name: "Alpha"},
-		{Datacenter: "datacenter-1", Name: "Zulu"},
+		{Datacenter: "datacenter-3", Name: "VCF-Datacenter"},
 	}
 	wantVMs := []vcenter.VMSummary{
-		{VM: "vm-1", Name: "App", PowerState: vcenter.PowerStatePoweredOn},
-		{VM: "vm-3", Name: "App", PowerState: vcenter.PowerStateSuspended},
-		{
-			VM: "vm-2", Name: "Database",
-			PowerState: vcenter.PowerStatePoweredOff,
-			CPUCount:   int64Pointer(8), MemorySizeMiB: int64Pointer(32768),
-		},
+		{VM: "vm-28", Name: "nsx01a", PowerState: vcenter.PowerStatePoweredOn, CPUCount: int64Pointer(6), MemorySizeMiB: int64Pointer(24576)},
+		{VM: "vm-19", Name: "sddcm01", PowerState: vcenter.PowerStatePoweredOn, CPUCount: int64Pointer(4), MemorySizeMiB: int64Pointer(16384)},
+		{VM: "vm-20", Name: "vc01", PowerState: vcenter.PowerStatePoweredOn, CPUCount: int64Pointer(4), MemorySizeMiB: int64Pointer(21504)},
+		{VM: "vm-43", Name: "vcf-asr01-szwjz", PowerState: vcenter.PowerStatePoweredOn, CPUCount: int64Pointer(8), MemorySizeMiB: int64Pointer(98304)},
+		{VM: "vm-39", Name: "vcf-lic01", PowerState: vcenter.PowerStatePoweredOn, CPUCount: int64Pointer(2), MemorySizeMiB: int64Pointer(4096)},
+		{VM: "vm-34", Name: "vcf-msr01-5ghdn", PowerState: vcenter.PowerStatePoweredOn, CPUCount: int64Pointer(8), MemorySizeMiB: int64Pointer(24576)},
+		{VM: "vm-36", Name: "vcf-msr01-6zpgq", PowerState: vcenter.PowerStatePoweredOn, CPUCount: int64Pointer(8), MemorySizeMiB: int64Pointer(24576)},
+		{VM: "vm-33", Name: "vcf-msr01-nxpxf", PowerState: vcenter.PowerStatePoweredOn, CPUCount: int64Pointer(4), MemorySizeMiB: int64Pointer(10240)},
+		{VM: "vm-35", Name: "vcf-msr01-x6j88", PowerState: vcenter.PowerStatePoweredOn, CPUCount: int64Pointer(8), MemorySizeMiB: int64Pointer(24576)},
+		{VM: "vm-38", Name: "vcf-proxy01", PowerState: vcenter.PowerStatePoweredOn, CPUCount: int64Pointer(4), MemorySizeMiB: int64Pointer(16384)},
+		{VM: "vm-37", Name: "vcf01", PowerState: vcenter.PowerStatePoweredOn, CPUCount: int64Pointer(4), MemorySizeMiB: int64Pointer(16384)},
 	}
 	if !reflect.DeepEqual(snapshot.Datacenters, wantDatacenters) {
 		t.Errorf("datacenters = %#v, want %#v", snapshot.Datacenters, wantDatacenters)
@@ -451,26 +454,28 @@ func TestProtectedMockRejectsOperationsOutsideContract(t *testing.T) {
 }
 
 func standardScenario() mockvcenter.Scenario {
-	cpu := int64(8)
-	memory := int64(32768)
 	return mockvcenter.Scenario{
 		Username: "administrator@vsphere.local",
 		Password: "pässword:inventory",
 		Tokens: []string{
-			"session-initial-7f6b",
-			"session-replacement-9c2a",
+			"0123456789abcdef0123456789abcdef",
+			"123456789abcdef0123456789abcdef0",
 		},
 		Datacenters: []mockvcenter.Datacenter{
-			{Datacenter: "datacenter-1", Name: "Zulu"},
-			{Datacenter: "datacenter-2", Name: "Alpha"},
+			{Datacenter: "datacenter-3", Name: "VCF-Datacenter"},
 		},
 		VMs: []mockvcenter.VM{
-			{VM: "vm-3", Name: "App", PowerState: "SUSPENDED"},
-			{
-				VM: "vm-2", Name: "Database", PowerState: "POWERED_OFF",
-				CPUCount: &cpu, MemorySizeMiB: &memory,
-			},
-			{VM: "vm-1", Name: "App", PowerState: "POWERED_ON"},
+			{VM: "vm-19", Name: "sddcm01", PowerState: "POWERED_ON", CPUCount: int64Pointer(4), MemorySizeMiB: int64Pointer(16384)},
+			{VM: "vm-20", Name: "vc01", PowerState: "POWERED_ON", CPUCount: int64Pointer(4), MemorySizeMiB: int64Pointer(21504)},
+			{VM: "vm-28", Name: "nsx01a", PowerState: "POWERED_ON", CPUCount: int64Pointer(6), MemorySizeMiB: int64Pointer(24576)},
+			{VM: "vm-33", Name: "vcf-msr01-nxpxf", PowerState: "POWERED_ON", CPUCount: int64Pointer(4), MemorySizeMiB: int64Pointer(10240)},
+			{VM: "vm-34", Name: "vcf-msr01-5ghdn", PowerState: "POWERED_ON", CPUCount: int64Pointer(8), MemorySizeMiB: int64Pointer(24576)},
+			{VM: "vm-35", Name: "vcf-msr01-x6j88", PowerState: "POWERED_ON", CPUCount: int64Pointer(8), MemorySizeMiB: int64Pointer(24576)},
+			{VM: "vm-36", Name: "vcf-msr01-6zpgq", PowerState: "POWERED_ON", CPUCount: int64Pointer(8), MemorySizeMiB: int64Pointer(24576)},
+			{VM: "vm-37", Name: "vcf01", PowerState: "POWERED_ON", CPUCount: int64Pointer(4), MemorySizeMiB: int64Pointer(16384)},
+			{VM: "vm-38", Name: "vcf-proxy01", PowerState: "POWERED_ON", CPUCount: int64Pointer(4), MemorySizeMiB: int64Pointer(16384)},
+			{VM: "vm-39", Name: "vcf-lic01", PowerState: "POWERED_ON", CPUCount: int64Pointer(2), MemorySizeMiB: int64Pointer(4096)},
+			{VM: "vm-43", Name: "vcf-asr01-szwjz", PowerState: "POWERED_ON", CPUCount: int64Pointer(8), MemorySizeMiB: int64Pointer(98304)},
 		},
 	}
 }

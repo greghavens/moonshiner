@@ -1,8 +1,9 @@
 # Drain-safe credential rotation for VCF Operations 9.1
 
 A dependency-free Java client that rotates an adapter credential in VMware
-Cloud Foundation Operations without stranding in-flight collections on the
-outgoing secret.
+Cloud Foundation Operations by creating an overlapping replacement, repointing
+current adapter associations, confirming the old association is empty, and
+then retiring the outgoing credential.
 
 ## Layout
 
@@ -35,8 +36,8 @@ Six operations are in play: `acquireToken`, `getCredential`,
 python3 -B tests/verify.py
 ```
 
-The verifier compiles the client with the harness and runs isolated successful-
-drain and exhausted-drain rotations. Each scenario starts a fresh mock on
+The verifier compiles the client with the harness and runs an immediate
+live-style cutover plus a concurrent-binding safety case. Each scenario starts a fresh mock on
 `127.0.0.1` on an ephemeral port and asserts the wire shape of every request
 from its request log. Nothing outside loopback is contacted. A JDK 17 or later
 and Python 3.8 or later are the only prerequisites.

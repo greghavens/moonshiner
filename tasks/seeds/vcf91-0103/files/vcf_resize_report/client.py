@@ -1,4 +1,4 @@
-"""Implement the contract-pinned vCenter resize reporting client here."""
+"""Implement the focused vCenter resize reporting client here."""
 
 from __future__ import annotations
 

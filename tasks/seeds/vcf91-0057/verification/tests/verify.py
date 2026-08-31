@@ -113,14 +113,32 @@ def powershell_program() -> str:
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-Import-Module $env:VCF_NSX_MANIFEST -Force -ErrorAction Stop
+$manifest = Import-PowerShellDataFile -LiteralPath $env:VCF_NSX_MANIFEST
+$requiredModule = @($manifest.RequiredModules)[0]
+$moduleDirectory = Split-Path -Parent $env:VCF_NSX_MANIFEST
+$modulePath = Join-Path $moduleDirectory 'VcfNsxPolicy.psm1'
+
+Import-Module VMware.Sdk.Nsx.Policy.Initialize -Force -ErrorAction Stop
+Import-Module VMware.Sdk.Nsx.Policy.Infra -Force -ErrorAction Stop
+Import-Module $modulePath -Force -ErrorAction Stop
 
 $newCommand = Get-Command New-VcfNsxPolicyClient -ErrorAction Stop
 $connectionType = $newCommand.Parameters['Connection'].ParameterType.FullName
 
-$client = New-VcfNsxPolicyClient `
-    -Server ([uri] $env:VCF_NSX_SERVER) `
-    -AccessToken $env:VCF_NSX_ACCESS_TOKEN
+$serverUri = [uri] $env:VCF_NSX_SERVER
+$password = ConvertTo-SecureString `
+    $env:VCF_NSX_PASSWORD `
+    -AsPlainText `
+    -Force
+$connection = Connect-NsxServer `
+    -Server $serverUri.Host `
+    -Protocol $serverUri.Scheme `
+    -Port $serverUri.Port `
+    -User $env:VCF_NSX_USER `
+    -Password $password `
+    -NotDefault
+
+$client = New-VcfNsxPolicyClient -Connection $connection
 
 $first = @(Get-VcfNsxPolicySegment -Client $client)
 $second = @(Get-VcfNsxPolicySegment -Client $client)
@@ -136,11 +154,18 @@ $setResult = Set-VcfNsxPolicySegment `
 
 $result = [ordered]@{
     connectionParameterType = $connectionType
+    requiredModuleName = [string] $requiredModule.ModuleName
+    requiredModuleVersion = [string] $requiredModule.ModuleVersion
+    commandSources = [ordered]@{
+        list = (Get-Command Invoke-ListAllInfraSegments -ErrorAction Stop).Source
+        patch = (Get-Command Invoke-PatchInfraSegment -ErrorAction Stop).Source
+        status = (Get-Command Invoke-ReadIntentStatus -ErrorAction Stop).Source
+    }
     first = @($first | ForEach-Object {
-        [ordered]@{ display_name = $_.display_name; id = $_.id }
+        [ordered]@{ display_name = $_.DisplayName; id = $_.Id }
     })
     second = @($second | ForEach-Object {
-        [ordered]@{ display_name = $_.display_name; id = $_.id }
+        [ordered]@{ display_name = $_.DisplayName; id = $_.Id }
     })
     setResult = $setResult
 }
@@ -165,7 +190,8 @@ def run_powershell(port: int, result_path: Path, work: Path) -> None:
             "no_proxy": "127.0.0.1,localhost",
             "VCF_NSX_MANIFEST": str(MANIFEST_PATH),
             "VCF_NSX_SERVER": f"http://127.0.0.1:{port}",
-            "VCF_NSX_ACCESS_TOKEN": "loopback-contract-token",
+            "VCF_NSX_USER": "loopback-contract-user",
+            "VCF_NSX_PASSWORD": "loopback-contract-password",
             "VCF_NSX_SEGMENT_ID": f"workload-{operation_seed}",
             "VCF_NSX_DISPLAY_NAME": f"Workload {operation_seed}",
             "VCF_NSX_CONNECTIVITY_PATH": f"/infra/tier-1s/tier1-{operation_seed}",
@@ -201,8 +227,25 @@ def check_powershell_result(result_path: Path) -> dict[str, str]:
     result = json.loads(result_path.read_text(encoding="utf-8-sig"))
     require(
         result.get("connectionParameterType")
-        == "VMware.Sdk.OpenApi.Cmdlets.IServerConnection",
-        "New-VcfNsxPolicyClient must type Connection as the VMware SDK interface",
+        == "VMware.Sdk.Nsx.Policy.Types.NsxServer",
+        "New-VcfNsxPolicyClient must type Connection as the NSX Policy server",
+    )
+    require(
+        result.get("requiredModuleName") == "VMware.Sdk.Nsx.Policy.Infra"
+        and result.get("requiredModuleVersion") == "13.5.0.25380678",
+        "manifest must require the VCF 9.1 NSX Policy generated-command module",
+    )
+    command_sources = result.get("commandSources")
+    require(
+        isinstance(command_sources, dict)
+        and command_sources
+        == {
+            "list": "VMware.Sdk.Nsx.Policy.Infra",
+            "patch": "VMware.Sdk.Nsx.Policy.Infra",
+            "status": "VMware.Sdk.Nsx.Policy.Infra",
+        },
+        "solution did not use the generated NSX Policy PowerCLI commands: "
+        f"{command_sources!r}",
     )
 
     first = result.get("first")
@@ -257,8 +300,8 @@ def check_request_log(log_path: Path, values: dict[str, str]) -> None:
         "client requested an operation outside docs/contract.json",
     )
     require(
-        all(entry.get("authorizationScheme") == "Bearer" for entry in entries),
-        "client did not send bearer authorization",
+        all(entry.get("authorizationScheme") == "Session" for entry in entries),
+        "generated commands did not use the authenticated PowerCLI connection",
     )
 
     list_entries = [

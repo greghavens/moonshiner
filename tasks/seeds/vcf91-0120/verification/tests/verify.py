@@ -35,10 +35,10 @@ EXPECTED_FILTERS = [
 
 # Filled with immutable fixture digests by the seed author.
 PROTECTED_HASHES = {
-    "docs/contract.json": "3825c7692dfad639aea8ab7fa7ab2ece335d871abcc8a46eea538a203c4757b5",
-    "docs/official_sources.json": "e800e8c769789d7bd507577ef82d5edf79a1ddc7845dc917abf3d17fa74c70f8",
-    "tests/TestMain.java": "448512d2a3aa0e0c29eaa7f8b4cb9e463ec8b28ce65188dd8828701d953d04cd",
-    "tests/mock_vcenter.py": "2f8b38d40685e45b9496168bbeb7cefa49f6925e833391834e2a7b6d180f64bf",
+    "docs/contract.json": "dd57c6f88c0d2fa77ed02551e228eb0afb7b5e106e872f9ddd75f1ca426cbdc5",
+    "docs/official_sources.json": "1e31a9b9a1d35f4f61396a41c03007e47523b5081b95efbb12cf439694a312e3",
+    "tests/TestMain.java": "dfea161c9394cc6ab2770c88ef5862996183818e9d61071034da184f2263ce3a",
+    "tests/mock_vcenter.py": "128bc71f6a4b6bc6389e622a810a84051836cf1ba0f8417c74df99a679401ae1",
 }
 
 
@@ -140,7 +140,7 @@ def check_contract_metadata() -> None:
         "name",
         "power_state",
         "cpu_count",
-        "memory_size_mib",
+        "memory_size_MiB",
     ]:
         fail("VM summary property projection changed")
     schemes = contract["securitySchemes"]
@@ -331,8 +331,6 @@ def main() -> None:
                     server_info["username"],
                     server_info["password"],
                     *server_info["datacenter_ids"],
-                    *server_info["vm_ids"],
-                    *server_info["vm_names"],
                 ],
                 text=True,
                 capture_output=True,

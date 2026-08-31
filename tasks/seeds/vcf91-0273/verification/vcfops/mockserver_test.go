@@ -230,8 +230,8 @@ func (m *mockServer) handleAcquireToken(w http.ResponseWriter, rec requestRecord
 	m.finish(rec)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token":     token,
-		"validity":  int64(21600000),
-		"expiresAt": "2026-05-13T14:19:58Z",
+		"validity":  int64(1788104578791),
+		"expiresAt": "Sunday, August 30, 2026 at 3:27:05 PM Coordinated Universal Time",
 		"roles":     []string{"Administrator"},
 	})
 }
@@ -290,12 +290,30 @@ func (m *mockServer) handleGetCurrentUser(w http.ResponseWriter, rec requestReco
 	rec.Status = http.StatusOK
 	m.finish(rec)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":        "6f2a1b40-3f5e-4a2f-9a1e-000000000001",
-		"username":  username,
-		"firstName": "VCF",
-		"lastName":  "Operator",
-		"enabled":   true,
-		"roleNames": []string{"Administrator"},
+		"id":               "3902116a-1472-425f-b977-546ab9b9f90c",
+		"username":         username,
+		"firstName":        nil,
+		"lastName":         nil,
+		"password":         nil,
+		"enabled":          true,
+		"groupIds":         []string{"d3a08c76-ce4b-4ed4-8b1a-703d3dea7211"},
+		"roleNames":        []string{},
+		"role-permissions": []any{},
+		"lastLoginTime":    int64(1788082025473),
+		"links": []map[string]string{
+			{
+				"href": "/suite-api/api/auth/users/3902116a-1472-425f-b977-546ab9b9f90c",
+				"rel":  "SELF", "name": "linkToSelf",
+			},
+			{
+				"href": "/suite-api/api/auth/users/3902116a-1472-425f-b977-546ab9b9f90c/permissions",
+				"rel":  "RELATED", "name": "userPermissions",
+			},
+			{
+				"href": "/suite-api/api/auth/usergroups/d3a08c76-ce4b-4ed4-8b1a-703d3dea7211",
+				"rel":  "RELATED", "name": "linkToGroup",
+			},
+		},
 	})
 }
 
@@ -327,7 +345,12 @@ func (m *mockServer) handleReleaseToken(w http.ResponseWriter, rec requestRecord
 func (m *mockServer) deny(w http.ResponseWriter, rec requestRecord, status int, msg string) {
 	rec.Status = status
 	m.finish(rec)
-	http.Error(w, msg, status)
+	writeJSON(w, status, map[string]any{
+		"message":        msg,
+		"httpStatusCode": status,
+		"apiErrorCode":   1512,
+		"type":           "API_ERROR",
+	})
 }
 
 // finish appends rec to the request log, assigning its completion sequence.

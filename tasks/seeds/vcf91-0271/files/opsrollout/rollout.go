@@ -67,8 +67,8 @@ type Credentials struct {
 	AuthSource string
 }
 
-// GroupSpec describes the custom group to create. IncludedResourceIDs and
-// ExcludedResourceIDs are optional.
+// GroupSpec describes the custom group to create. IncludedResourceIDs must
+// contain at least one resource; ExcludedResourceIDs is optional.
 type GroupSpec struct {
 	Name                  string
 	AdapterKindKey        string

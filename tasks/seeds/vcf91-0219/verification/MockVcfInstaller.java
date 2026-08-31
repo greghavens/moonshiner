@@ -53,7 +53,7 @@ public final class MockVcfInstaller implements AutoCloseable {
             Pattern.DOTALL);
 
     private static final Set<String> REQUIRED_OPERATION_IDS = Set.of(
-            "updateProxyConfiguration", "updateDepotSettings", "syncDepotMetadata");
+            "updateProxyConfiguration", "updateServicesConfig", "syncDepotMetadata");
 
     private final HttpServer server;
     private final ExecutorService executor;
@@ -167,7 +167,7 @@ public final class MockVcfInstaller implements AutoCloseable {
     private static List<Reply> defaultReplies() {
         return List.of(
                 new Reply(202, task("proxy-task-0219")),
-                new Reply(202, "{\"vmwareAccount\":{\"downloadToken\":\"accepted\"}}"),
+                new Reply(200, services()),
                 new Reply(500, apiError(
                         "DEPOT_SYNC_FAILED",
                         "INTERNAL_ERROR",
@@ -178,8 +178,15 @@ public final class MockVcfInstaller implements AutoCloseable {
 
     public static String task(String id) {
         return "{\"id\":\"" + id + "\",\"name\":\"Update Proxy\","
-                + "\"status\":\"Pending\","
+                + "\"status\":\"COMPLETED_WITH_SUCCESS\","
                 + "\"creationTimestamp\":\"2026-08-03T12:00:00Z\"}";
+    }
+
+    public static String services() {
+        return "{\"services\":[{\"name\":\"VCF Depot\",\"type\":\"VCF_DEPOT\","
+                + "\"key\":\"depot-service-key\",\"nodes\":[{\"name\":\"VCF Depot\","
+                + "\"addresses\":[{\"type\":\"Fqdn\","
+                + "\"value\":\"vcf-flt01.vcf.lab\"}]}]}]}";
     }
 
     public static String apiError(

@@ -37,7 +37,7 @@ NESTING = {
 }
 
 FIXED_VALIDITY = 1798934400000
-FIXED_EXPIRES_AT = "2027-01-01T00:00:00.000Z"
+FIXED_EXPIRES_AT = "Friday, January 1, 2027 at 12:00:00 AM Coordinated Universal Time"
 GROUP_ID_NAMESPACE = uuid.NAMESPACE_URL
 
 
@@ -80,10 +80,42 @@ class State:
 
 
 class Rejected(Exception):
-    def __init__(self, status, message):
+    def __init__(self, status, message, more_information=None):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.more_information = more_information
+
+
+def materialize_group(body, group_id):
+    """Return the server-populated custom-group shape observed on VCF 9.1."""
+    stored = copy.deepcopy(body)
+    stored["id"] = group_id
+    stored["resourceKey"].setdefault("resourceIdentifiers", [])
+    membership = stored["membershipDefinition"]
+    membership.setdefault("includedResources", [])
+    membership.setdefault("excludedResources", [])
+    membership.setdefault("custom-group-properties", [])
+    for rule in membership.get("rules", []):
+        rule.setdefault("statConditionRules", [])
+        rule.setdefault("propertyConditionRules", [])
+        rule.setdefault("resourceNameConditionRules", [])
+        rule.setdefault("relationshipConditionRules", [])
+        rule.setdefault("resourceTagConditionRules", [])
+    stored["links"] = [
+        {
+            "href": "/suite-api/api/resources/groups/%s" % group_id,
+            "rel": "SELF",
+            "name": "linkToSelf",
+        },
+        {
+            "href": "/suite-api/api/resources/groups",
+            "rel": "RELATED",
+            "name": "allGroups",
+            "description": "Link to all custom groups in the system",
+        },
+    ]
+    return stored
 
 
 def contains_null(node, trail="body"):
@@ -213,7 +245,15 @@ def make_handler(contract, state, log_path):
                     raise Rejected(404, "no operation is exposed at %s %s" % (method, path))
                 status, payload = self._dispatch(operation, method, raw_query, body_text, body_json)
             except Rejected as rejected:
-                status, payload = rejected.status, {"message": rejected.message}
+                status = rejected.status
+                payload = {
+                    "type": "Error",
+                    "message": rejected.message,
+                    "httpStatusCode": status,
+                    "apiErrorCode": status,
+                }
+                if rejected.more_information is not None:
+                    payload["moreInformation"] = rejected.more_information
             self._record(method, path, raw_query, body_text, body_json, status, operation_id)
             self._respond(status, payload)
 
@@ -279,7 +319,7 @@ def make_handler(contract, state, log_path):
                 "token": token,
                 "validity": FIXED_VALIDITY,
                 "expiresAt": FIXED_EXPIRES_AT,
-                "roles": ["ContentAdmin"],
+                "roles": [],
             }
 
         def _get_custom_groups(self):
@@ -297,9 +337,21 @@ def make_handler(contract, state, log_path):
             with state.lock:
                 for existing in state.groups.values():
                     if existing.get("resourceKey", {}).get("name") == name:
-                        raise Rejected(409, "a custom group named '%s' already exists" % name)
-                stored = copy.deepcopy(body)
-                stored["id"] = group_id_for(name)
+                        raise Rejected(
+                            500,
+                            "Internal Server error, cause unknown.",
+                            [{
+                                "name": "reason",
+                                "value": "Custom group creation failed: Resource with key "
+                                         "{resName=%s, resKind=%s, adKind=%s} already exists."
+                                         % (
+                                             name,
+                                             (body.get("resourceKey") or {}).get("resourceKindKey"),
+                                             (body.get("resourceKey") or {}).get("adapterKindKey"),
+                                         ),
+                            }],
+                        )
+                stored = materialize_group(body, group_id_for(name))
                 state.groups[stored["id"]] = stored
                 return 201, copy.deepcopy(stored)
 
@@ -314,7 +366,7 @@ def make_handler(contract, state, log_path):
                     raise Rejected(404, "no custom group with id '%s'" % group_id)
                 if existing.get("resourceKey", {}).get("name") != name:
                     raise Rejected(409, "a custom group cannot be renamed through this operation")
-                stored = copy.deepcopy(body)
+                stored = materialize_group(body, group_id)
                 state.groups[group_id] = stored
                 return 200, copy.deepcopy(stored)
 

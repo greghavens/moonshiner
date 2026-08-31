@@ -237,7 +237,7 @@ type Config struct {
 	BaseURL string
 	// Token is the bearer token presented as "Authorization: Bearer <token>".
 	Token string
-	// CorrelationID is optional. When empty, no X-Correlation-Id header is sent.
+	// CorrelationID is an optional bare UUID. When empty, no X-Correlation-Id header is sent.
 	CorrelationID string
 	// PollInterval is the delay between getTask polls. Defaults to 2s.
 	PollInterval time.Duration

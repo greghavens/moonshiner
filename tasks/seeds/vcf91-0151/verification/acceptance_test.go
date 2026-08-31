@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	contractDigest = "5dcb8bf227b407e66c9969a73bebbc02e0c819ab3a805419ca4f931bc282ad8c"
+	contractDigest = "3ab21422f6e349e238d87ffc9f1466ebead86b78cd7c149518e35386e71504bb"
 	sourcesDigest  = "7aa33ad78ccffdf04f462e368651a2088c8a391c33bfbd2b981ba0d49918c93b"
 )
 
@@ -87,6 +87,96 @@ func TestPinnedContractDocuments(t *testing.T) {
 			t.Fatalf("official operation missing from contract: %+v", want)
 		}
 	}
+}
+
+func TestLiveValidatedBoundaryResponses(t *testing.T) {
+	description := "moonshiner-live-validation"
+	change := vkschange.Change{
+		Namespace:         "vmsp-platform",
+		Cluster:           "vcf-msr01",
+		NamespacePatch:    vkschange.NamespacePatch{Description: &description},
+		KubernetesVersion: "v1.34.2",
+	}
+
+	t.Run("legacy namespace get 404", func(t *testing.T) {
+		mock := contractmock.New(t, "docs/contract.json", contractmock.Fixture{
+			Namespace: change.Namespace,
+			Cluster:   change.Cluster,
+			Replies: map[string]contractmock.Reply{
+				vkschange.OperationGetNamespace: {
+					Status: http.StatusNotFound,
+					Body:   `{"error_type":"NOT_FOUND","messages":[{"args":[],"default_message":"Namespace was not found.","id":"vcenter.wcp.workload.notfound"}]}`,
+				},
+			},
+		})
+		client := newClient(mock.URL(), mock.Client())
+		report, err := client.Apply(context.Background(), change)
+		if err == nil {
+			t.Fatal("Apply returned nil error")
+		}
+		assertSteps(t, report.Steps, []vkschange.StepResult{
+			{Operation: vkschange.OperationGetNamespace, State: vkschange.StepFailed, HTTPStatus: 404, Error: report.Steps[0].Error},
+			{Operation: vkschange.OperationUpdateNamespace, State: vkschange.StepSkipped},
+			{Operation: vkschange.OperationPatchVKSCluster, State: vkschange.StepSkipped},
+		})
+		if requests := mock.Requests(); len(requests) != 1 {
+			t.Fatalf("request count = %d, want 1", len(requests))
+		}
+	})
+
+	t.Run("legacy namespace update 404", func(t *testing.T) {
+		mock := contractmock.New(t, "docs/contract.json", contractmock.Fixture{
+			Namespace: change.Namespace,
+			Cluster:   change.Cluster,
+			Replies: map[string]contractmock.Reply{
+				vkschange.OperationUpdateNamespace: {
+					Status: http.StatusNotFound,
+					Body:   `{"error_type":"NOT_FOUND","messages":[{"args":[],"default_message":"Namespace was not found.","id":"vcenter.wcp.workload.notfound"}]}`,
+				},
+			},
+		})
+		client := newClient(mock.URL(), mock.Client())
+		report, err := client.Apply(context.Background(), change)
+		if err == nil {
+			t.Fatal("Apply returned nil error")
+		}
+		assertSteps(t, report.Steps, []vkschange.StepResult{
+			{Operation: vkschange.OperationGetNamespace, State: vkschange.StepSucceeded, HTTPStatus: 200},
+			{Operation: vkschange.OperationUpdateNamespace, State: vkschange.StepFailed, HTTPStatus: 404, Error: report.Steps[1].Error},
+			{Operation: vkschange.OperationPatchVKSCluster, State: vkschange.StepSkipped},
+		})
+		if requests := mock.Requests(); len(requests) != 2 {
+			t.Fatalf("request count = %d, want 2", len(requests))
+		}
+	})
+
+	t.Run("v1beta2 topology version patch", func(t *testing.T) {
+		mock := contractmock.New(t, "docs/contract.json", contractmock.Fixture{
+			Namespace: change.Namespace,
+			Cluster:   change.Cluster,
+			Replies: map[string]contractmock.Reply{
+				vkschange.OperationPatchVKSCluster: {
+					Status: http.StatusOK,
+					Body:   `{"apiVersion":"cluster.x-k8s.io/v1beta2","kind":"Cluster","metadata":{"name":"vcf-msr01","namespace":"vmsp-platform","resourceVersion":"2545994"},"spec":{"topology":{"classRef":{"name":"vsphere-9.1.2668"},"version":"v1.34.2"}}}`,
+				},
+			},
+		})
+		client := newClient(mock.URL(), mock.Client())
+		report, err := client.Apply(context.Background(), change)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertSteps(t, report.Steps, []vkschange.StepResult{
+			{Operation: vkschange.OperationGetNamespace, State: vkschange.StepSucceeded, HTTPStatus: 200},
+			{Operation: vkschange.OperationUpdateNamespace, State: vkschange.StepSucceeded, HTTPStatus: 204},
+			{Operation: vkschange.OperationPatchVKSCluster, State: vkschange.StepSucceeded, HTTPStatus: 200},
+		})
+		requests := mock.Requests()
+		if len(requests) != 3 ||
+			requests[2].Path != "/apis/cluster.x-k8s.io/v1beta2/namespaces/vmsp-platform/clusters/vcf-msr01" {
+			t.Fatalf("v1beta2 request = %#v", requests)
+		}
+	})
 }
 
 func TestApplyLateFailureReportsEarlierStepsAndExactWire(t *testing.T) {
@@ -188,7 +278,7 @@ func TestApplyLateFailureReportsEarlierStepsAndExactWire(t *testing.T) {
 			assertRequest(t, requests[2], requestExpectation{
 				operation:   vkschange.OperationPatchVKSCluster,
 				method:      http.MethodPatch,
-				path:        "/apis/cluster.x-k8s.io/v1beta1/namespaces/team-a/clusters/orders",
+				path:        "/apis/cluster.x-k8s.io/v1beta2/namespaces/team-a/clusters/orders",
 				bearer:      "Bearer kube-token",
 				accept:      "application/json",
 				contentType: "application/merge-patch+json",

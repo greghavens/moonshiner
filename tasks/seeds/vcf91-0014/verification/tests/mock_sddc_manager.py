@@ -238,7 +238,7 @@ class ContractHandler(BaseHTTPRequestHandler):
                 {},
             )
         return (
-            201,
+            200,
             {
                 "accessToken": INITIAL_ACCESS_TOKEN,
                 "refreshToken": {"id": REFRESH_TOKEN_ID},

@@ -70,6 +70,7 @@ class ContractServer(HTTPServer):
         route_pattern: re.Pattern[str],
         log_path: Path,
         release_path: Path,
+        cutover_path: Path,
         scenario: dict[str, str],
     ) -> None:
         super().__init__(address, handler)
@@ -77,8 +78,8 @@ class ContractServer(HTTPServer):
         self.route_pattern = route_pattern
         self.log_path = log_path
         self.release_path = release_path
+        self.cutover_path = cutover_path
         self.scenario = scenario
-        self.phase = "old"
 
     def record(self, record: dict[str, object]) -> None:
         with self.log_path.open("a", encoding="utf-8", newline="\n") as stream:
@@ -161,7 +162,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(404, {"error_message": "Domain not found"})
             return
 
-        phase = self.contract_server.phase
+        phase = (
+            "new" if self.contract_server.cutover_path.exists() else "old"
+        )
         username = scenario[f"{phase}_username"]
         password = scenario[f"{phase}_password"]
         expected_auth = "Basic " + base64.b64encode(
@@ -180,7 +183,6 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
                 time.sleep(0.01)
-            self.contract_server.phase = "new"
 
         group_id = scenario[f"{phase}_group_id"]
         display_name = scenario[f"{phase}_display_name"]
@@ -215,10 +217,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    if len(sys.argv) != 6:
+    if len(sys.argv) != 7:
         print(
             "usage: mock_nsx_policy.py PORT_FILE LOG_FILE CONTRACT_FILE "
-            "SCENARIO_FILE RELEASE_FILE",
+            "SCENARIO_FILE RELEASE_FILE CUTOVER_FILE",
             file=sys.stderr,
         )
         return 2
@@ -228,6 +230,7 @@ def main() -> int:
     contract_path = Path(sys.argv[3])
     scenario_path = Path(sys.argv[4])
     release_path = Path(sys.argv[5])
+    cutover_path = Path(sys.argv[6])
     routes, route_pattern = load_contract(contract_path)
     scenario = json.loads(scenario_path.read_text(encoding="utf-8"))
     log_path.write_text("", encoding="utf-8")
@@ -238,6 +241,7 @@ def main() -> int:
         route_pattern,
         log_path,
         release_path,
+        cutover_path,
         scenario,
     )
 

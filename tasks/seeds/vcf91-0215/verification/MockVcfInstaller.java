@@ -210,10 +210,7 @@ public final class MockVcfInstaller implements AutoCloseable {
 
     private static List<Reply> defaultReplies() {
         return List.of(
-                new Reply(202, task("proxy/task 17", "Pending")),
-                new Reply(200, task("proxy/task 17", "In Progress")),
-                new Reply(200, task("proxy/task 17", "Queued")),
-                new Reply(200, task("proxy/task 17", "Successful")));
+                new Reply(202, task("proxy/task 17", "COMPLETED_WITH_SUCCESS")));
     }
 
     public static String task(String id, String status) {

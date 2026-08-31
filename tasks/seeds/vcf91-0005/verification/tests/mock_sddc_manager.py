@@ -142,7 +142,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 )
             else:
                 self._send_json(
-                    201,
+                    200,
                     {
                         "accessToken": self.server.scenario["accessToken"],
                         "refreshToken": {"id": self.server.scenario["refreshToken"]},
@@ -171,14 +171,14 @@ class FixtureHandler(BaseHTTPRequestHandler):
                     "completionTimestamp": "2026-08-02T12:00:01Z",
                 },
             )
-        elif operation_id == "updateDepotSettings":
+        elif operation_id == "updateServicesConfig":
             self._send_json(
                 400,
                 {
-                    "errorCode": "DEPOT_TOKEN_REJECTED",
+                    "errorCode": "SERVICES_CONFIG_SCHEMA_VALIDATION_FAILED",
                     "errorType": "VALIDATION",
                     "message": self.server.scenario["failureMessage"],
-                    "remediationMessage": "Generate a current download token.",
+                    "remediationMessage": "Please ensure the latest accurate Services Config is uploaded to the SDDC Manager.",
                 },
             )
         else:  # The contract-to-handler mapping is intentionally fail closed.
@@ -213,9 +213,14 @@ def main() -> int:
         "proxyHost": "proxy-" + secrets.token_hex(6) + ".example.test",
         "proxyPort": 1024 + secrets.randbelow(65535 - 1024),
         "proxyProtocol": secrets.choice(("HTTP", "HTTPS")),
-        "depotToken": secrets.token_hex(16),
+        "serviceName": "service-" + secrets.token_hex(6),
+        "serviceType": "VCF_DEPOT",
+        "serviceKey": "service-key-" + secrets.token_hex(6),
+        "nodeName": "node-" + secrets.token_hex(6),
+        "addressType": "FQDN",
+        "addressValue": "node-" + secrets.token_hex(6) + ".example.test",
         "taskId": "task-proxy-" + secrets.token_hex(8),
-        "failureMessage": "The supplied depot download token was rejected (" + secrets.token_hex(6) + ").",
+        "failureMessage": "Services Config schema validation failed and was not saved on the SDDC Manager (" + secrets.token_hex(6) + ").",
     }
     args.request_log.write_text("", encoding="utf-8")
     server = FixtureServer(("127.0.0.1", args.port), args.request_log, scenario)

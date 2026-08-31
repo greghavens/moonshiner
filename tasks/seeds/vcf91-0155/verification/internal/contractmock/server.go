@@ -25,10 +25,14 @@ type ClusterFixture struct {
 
 // Options controls response state without adding routes.
 type Options struct {
-	TaskStatuses    []string
-	NamespaceStatus string
-	AfterClusters   []ClusterFixture
-	InitialReverse  bool
+	TaskStatuses        []string
+	NamespaceStatus     string
+	NamespaceHTTPStatus int
+	BackupHTTPStatus    int
+	BeforeClusters      []ClusterFixture
+	AfterClusters       []ClusterFixture
+	InitialReverse      bool
+	ErrorBody           string
 }
 
 // RequestRecord is a concurrency-safe snapshot of one received request.
@@ -63,20 +67,23 @@ type route struct {
 
 // Server is an isolated loopback HTTP fixture.
 type Server struct {
-	t               testing.TB
-	http            *httptest.Server
-	origin          string
-	fallbackClient  *http.Client
-	routes          []route
-	mu              sync.Mutex
-	log             []RequestRecord
-	taskReads       int
-	clusterReads    int
-	taskStatuses    []string
-	namespaceStatus string
-	beforeClusters  []ClusterFixture
-	afterClusters   []ClusterFixture
-	initialReverse  bool
+	t                   testing.TB
+	http                *httptest.Server
+	origin              string
+	fallbackClient      *http.Client
+	routes              []route
+	mu                  sync.Mutex
+	log                 []RequestRecord
+	taskReads           int
+	clusterReads        int
+	taskStatuses        []string
+	namespaceStatus     string
+	namespaceHTTPStatus int
+	backupHTTPStatus    int
+	errorBody           string
+	beforeClusters      []ClusterFixture
+	afterClusters       []ClusterFixture
+	initialReverse      bool
 }
 
 // New loads the route allow-list from contractPath and starts an ephemeral
@@ -133,19 +140,25 @@ func New(t testing.TB, contractPath string, options Options) *Server {
 		{Name: "zulu", TopologyVersion: "v1.31.2+vmware.1"},
 		{Name: "Alpha", TopologyVersion: "v1.30.6+vmware.1"},
 	}
+	if options.BeforeClusters != nil {
+		before = append([]ClusterFixture(nil), options.BeforeClusters...)
+	}
 	after := append([]ClusterFixture(nil), before...)
 	if options.AfterClusters != nil {
 		after = append([]ClusterFixture(nil), options.AfterClusters...)
 	}
 
 	server := &Server{
-		t:               t,
-		routes:          routes,
-		taskStatuses:    statuses,
-		namespaceStatus: namespaceStatus,
-		beforeClusters:  before,
-		afterClusters:   after,
-		initialReverse:  options.InitialReverse,
+		t:                   t,
+		routes:              routes,
+		taskStatuses:        statuses,
+		namespaceStatus:     namespaceStatus,
+		namespaceHTTPStatus: options.NamespaceHTTPStatus,
+		backupHTTPStatus:    options.BackupHTTPStatus,
+		errorBody:           options.ErrorBody,
+		beforeClusters:      before,
+		afterClusters:       after,
+		initialReverse:      options.InitialReverse,
 	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err == nil {
@@ -277,6 +290,10 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.log = append(s.log, record)
 		status := s.namespaceStatus
 		s.mu.Unlock()
+		if s.namespaceHTTPStatus != 0 && s.namespaceHTTPStatus != http.StatusOK {
+			writeFailure(w, s.namespaceHTTPStatus, s.errorBody)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"supervisor":    "supervisor/blue zone",
 			"config_status": status,
@@ -332,6 +349,10 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case "createSupervisorBackup":
 		s.log = append(s.log, record)
 		s.mu.Unlock()
+		if s.backupHTTPStatus != 0 && s.backupHTTPStatus != http.StatusOK {
+			writeFailure(w, s.backupHTTPStatus, s.errorBody)
+			return
+		}
 		writeJSON(w, http.StatusOK, "task/ 91")
 	case "getTask":
 		index := s.taskReads
@@ -366,6 +387,15 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		http.Error(w, "route is outside the pinned contract", http.StatusNotFound)
 	}
+}
+
+func writeFailure(w http.ResponseWriter, status int, body string) {
+	if body == "" {
+		body = `{"error":"fixture failure"}`
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, body)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

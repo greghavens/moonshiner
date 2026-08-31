@@ -113,11 +113,11 @@ class WireAndLifecycleTests(unittest.TestCase):
             server.script(
                 "getTask",
                 [
-                    (200, task("IN_PROGRESS")),
+                    (200, task("In Progress")),
                     (
                         200,
                         task(
-                            "SUCCESSFUL",
+                            "Successful",
                             completionTimestamp="2026-07-28T15:20:03.000Z",
                             resources=[{"resourceId": "sddc-1", "type": "SDDC_MANAGER"}],
                         ),
@@ -128,7 +128,7 @@ class WireAndLifecycleTests(unittest.TestCase):
             result = self._client(server, sleeps).update_backup_and_wait(make_patch())
 
         self.assertEqual(result.id, TASK_ID)
-        self.assertEqual(result.status, "SUCCESSFUL")
+        self.assertEqual(result.status, "Successful")
         self.assertEqual(result.raw["resources"][0]["resourceId"], "sddc-1")
         self.assertEqual(sleeps, [0.125])
 

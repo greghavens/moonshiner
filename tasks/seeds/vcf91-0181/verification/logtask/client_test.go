@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"moonshiner/vcf91-0181/internal/contractmock"
+	"vcflogtask/internal/contractmock"
 )
 
 func TestWaitForOperationPollsToTerminalAndMatchesWire(t *testing.T) {

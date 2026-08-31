@@ -14,10 +14,10 @@ from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parents[1]
 PROTECTED_HASHES = {
-    "docs/contract.json": "37a0225a80ffe62ae6d30cc9c80d5e93df32f1fdd666cc8fbca09917fda06ca3",
+    "docs/contract.json": "f9f5a47a154283a66d4e8036e860e1ee0d09b0d27b18305b78fe3f582d62a041",
     "docs/official_sources.json": "07afa483d817f86508ad3d46b66c0f195b2c8b53016ae487357a01cb920ba91f",
-    "tests/TestMain.java": "020992949c624fea5c943eed278c7c817c4f664022d6fed1eee1e92e7ed4dc28",
-    "tests/mock_server.py": "46d030281e341fd60b009b9eb1754d16fbf10fb3ba2ecc5125319ccc4101cc56",
+    "tests/TestMain.java": "517d0211c054c0814404ef8da74905b74df3d6a947ddc158e23c6d8706e6aba5",
+    "tests/mock_server.py": "ab890396a83a1ebdd620a2280b088609defe0858b1c57d777821e1904c06ea54",
 }
 
 
@@ -101,6 +101,20 @@ def check_contract_metadata() -> None:
         "fedIdpSpec",
     ]:
         fail("IdentityProviderSpec optional field projection changed")
+    federated = contract["schemas"]["FederatedIdentityProviderSpec"]
+    if federated["required"] != ["directory", "name", "oidcSpec"]:
+        fail("FederatedIdentityProviderSpec required fields changed")
+    directory = contract["schemas"]["IdentityProviderDirectory"]
+    if directory["required"] != [
+        "defaultDomain",
+        "domains",
+        "federatedIdpSourceType",
+        "name",
+    ]:
+        fail("IdentityProviderDirectory required fields changed")
+    oidc = contract["schemas"]["OidcSpec"]
+    if oidc["required"] != ["clientId", "clientSecret", "discoveryEndpoint"]:
+        fail("OidcSpec required fields changed")
 
 
 def wait_for_server(port_file: Path, process: subprocess.Popen[str]) -> dict:
@@ -176,12 +190,31 @@ def check_wire_log(log_path: Path, server_info: dict) -> None:
         "",
     ):
         fail(f"mutation has the wrong request target: {mutation}")
-    expected_body = (
-        '{"name":'
-        + json.dumps(server_info["allowed_name"], ensure_ascii=False)
-        + ',"type":'
-        + json.dumps(server_info["provider_type"], ensure_ascii=False)
-        + "}"
+    expected_provider = {
+        "name": server_info["allowed_name"],
+        "type": server_info["provider_type"],
+        "fedIdpSpec": {
+            "name": "Broker federation",
+            "directory": {
+                "name": "Corporate Directory",
+                "defaultDomain": "corp.example",
+                "domains": ["corp.example", "example.org"],
+                "federatedIdpSourceType": "MICROSOFT_ENTRA_ID",
+            },
+            "oidcSpec": {
+                "clientId": "vcf-client",
+                "clientSecret": "client-secret-value",
+                "discoveryEndpoint": (
+                    "https://login.example.org/.well-known/"
+                    "openid-configuration"
+                ),
+            },
+        },
+    }
+    expected_body = json.dumps(
+        expected_provider,
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
     if mutation["body"] != expected_body:
         fail(
@@ -192,12 +225,9 @@ def check_wire_log(log_path: Path, server_info: dict) -> None:
         decoded = json.loads(mutation["body"])
     except json.JSONDecodeError as error:
         fail(f"mutation body is not valid JSON: {error}")
-    if decoded != {
-        "name": server_info["allowed_name"],
-        "type": server_info["provider_type"],
-    }:
+    if decoded != expected_provider:
         fail("mutation JSON values were not escaped or decoded correctly")
-    optional = {"certChain", "ldap", "oidc", "fedIdpSpec"}
+    optional = {"certChain", "ldap", "oidc"}
     if optional.intersection(decoded):
         fail("unset IdentityProviderSpec optionals must be omitted")
     if not mutation["mutationApplied"] or mutation["mutationCountAfter"] != 1:

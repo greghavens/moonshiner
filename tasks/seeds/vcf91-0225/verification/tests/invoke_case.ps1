@@ -113,6 +113,10 @@ try {
     $validationResults['blankDepotCertificate'] = Test-RejectedInvocation $candidate
 
     $candidate = $validArguments.Clone()
+    $candidate['CorrelationId'] = 'not-a-uuid'
+    $validationResults['invalidCorrelationId'] = Test-RejectedInvocation $candidate
+
+    $candidate = $validArguments.Clone()
     $candidate['Component'] = [object[]] @()
     $validationResults['emptyComponentList'] = Test-RejectedInvocation $candidate
 

@@ -202,7 +202,7 @@ def verify_contract() -> dict[str, Any]:
         and kop[1]["body"]["metadataRequiredOrder"]
         == ["name", "namespace"]
         and kop[1]["body"]["topologyRequiredOrder"]
-        == ["classRef", "version", "controlPlane", "workers"],
+        == ["classRef", "version", "controlPlane", "workers", "variables"],
         "Cluster create body projection changed",
     )
     require(
@@ -402,17 +402,21 @@ def expected_manifest(config: dict[str, Any]) -> dict[str, Any]:
                 },
                 "version": config["kubernetes_version"],
                 "controlPlane": {
-                    "replicas": 1,
+                    "replicas": config["control_plane_replicas"],
                 },
                 "workers": {
                     "machineDeployments": [
                         {
-                            "class": "node-pool",
-                            "name": "primary",
-                            "replicas": 1,
+                            "class": config["worker_class"],
+                            "name": config["worker_name"],
+                            "replicas": config["worker_replicas"],
                         }
                     ]
                 },
+                "variables": [
+                    {"name": name, "value": config["topology_variables"][name]}
+                    for name in config["topology_variable_order"]
+                ],
             }
         },
     }
@@ -475,7 +479,22 @@ def verify_report(report: dict[str, Any], config: dict[str, Any]) -> None:
 def verify_requests(
     records: list[dict[str, Any]], config: dict[str, Any]
 ) -> None:
-    require(len(records) == 7, "expected exactly seven requests")
+    require(len(records) == 8, "expected exactly eight requests")
+    live_gap = records[0]
+    require(
+        live_gap["operation"] == "namespace.listAuthorized"
+        and live_gap["method"] == "GET"
+        and live_gap["raw_target"]
+        == "/api/vcenter/namespaces-user/namespaces",
+        "exact live namespace-discovery failure was not exercised first",
+    )
+    require(
+        one_header(live_gap, "vmware-api-session-id")
+        == config["vcenter_session_id"]
+        and "authorization" not in live_gap["headers"],
+        "exact live namespace-discovery credential boundary changed",
+    )
+    records = records[1:]
     require(
         [item["operation"] for item in records]
         == [
@@ -528,7 +547,7 @@ def verify_requests(
         require(record["body"] is None, "bodyless request decoded a body")
         require(
             "content-type" not in record["headers"],
-            "bodyless request sent Content-Type",
+            f"{record['operation']} bodyless request sent Content-Type",
         )
 
     expected_body = expected_manifest(config)
@@ -640,21 +659,41 @@ def main() -> int:
         with tempfile.TemporaryDirectory(prefix="vcf91-0137-") as temp_name:
             temp = Path(temp_name)
             suffix = secrets.token_hex(5)
-            existing_names = [
-                "accounts-" + suffix,
-                "warehouse-" + suffix,
-                "payments-" + suffix,
-            ]
-            cluster_name = "orders-" + suffix
+            existing_names = ["vcf-msr01", "warehouse-" + suffix]
+            cluster_name = "moonshiner-live-0137"
             all_names = [*existing_names, cluster_name]
+            topology_variable_order = [
+                "datastore",
+                "dnsImageTag",
+                "imageRepository",
+                "infraServerThumbprint",
+                "network",
+                "infraServerURL",
+                "resourcePool",
+                "vmTemplate",
+                "datacenter",
+                "etcdImageTag",
+                "folder",
+                "controlPlaneIpAddr",
+                "credsSecretName",
+                "kubeVipPodManifest",
+            ]
+            topology_variables = {
+                name: {"liveValidated": True, "name": name}
+                for name in topology_variable_order
+            }
             config: dict[str, Any] = {
                 "suffix": suffix,
-                "namespace": "team-" + suffix,
+                "namespace": "vmsp-platform",
                 "cluster_name": cluster_name,
-                "cluster_class": "builtin-generic-" + suffix,
-                "kubernetes_version": "v1.33." + str(
-                    secrets.randbelow(8) + 1
-                ),
+                "cluster_class": "vsphere-9.1.2668",
+                "kubernetes_version": "v1.34.2",
+                "topology_variable_order": topology_variable_order,
+                "topology_variables": topology_variables,
+                "worker_class": "vsphere-9.1.2668-worker",
+                "worker_name": "workers",
+                "control_plane_replicas": 3,
+                "worker_replicas": 3,
                 "existing_cluster_names": existing_names,
                 "cluster_uids": {
                     name: str(uuid.uuid4())
@@ -663,7 +702,7 @@ def main() -> int:
                 "resource_version": str(
                     secrets.randbelow(8_000_000) + 1_000_000
                 ),
-                "vcenter_session_id": "vc-" + secrets.token_urlsafe(24),
+                "vcenter_session_id": secrets.token_hex(16),
                 "kubernetes_bearer_token": "k8s-" + secrets.token_urlsafe(28),
             }
             config_path = temp / "config.json"

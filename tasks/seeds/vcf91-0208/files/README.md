@@ -9,5 +9,3 @@ Run the acceptance check with:
 ```sh
 python3 tests/verify.py
 ```
-
-The test uses only a loopback HTTP server and the Python standard library.

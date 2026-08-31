@@ -1,10 +1,4 @@
-"""Contract-pinned loopback NSX Policy service for the acceptance verifier.
-
-The service reads the allowed method/path templates from docs/contract.json,
-binds only to 127.0.0.1 on an ephemeral port, and appends every attempted
-contract request to a JSON-lines file.  It intentionally exposes no log or
-control route over HTTP.
-"""
+"""NSX Policy request fixture for the acceptance verifier."""
 
 from __future__ import annotations
 
@@ -42,6 +36,7 @@ class ContractServer(HTTPServer):
         self.routes = routes
         self.log_path = log_path
         self.completed = []
+        self.expected_authorization = "Basic bnN4LXVzZXI6bnN4LXBhc3N3b3Jk"
 
     def append_log(self, entry):
         with self.log_path.open("a", encoding="utf-8") as stream:
@@ -82,16 +77,18 @@ class Handler(BaseHTTPRequestHandler):
         authorization = self.headers.get("Authorization")
 
         if operation_id == "PatchGroupForDomain":
-            status = route["success"] if authorization == "Bearer access-1" else 401
+            status = (
+                route["success"]
+                if authorization == self.server.expected_authorization
+                else 401
+            )
             if status == route["success"]:
                 self.server.completed.append(operation_id)
         elif operation_id == "PatchSecurityPolicyForDomain":
             ready = self.server.completed == ["PatchGroupForDomain"]
-            status = (
-                route["success"]
-                if ready and authorization == "Bearer access-2"
-                else 401
-            )
+            status = route["success"] if (
+                ready and authorization == self.server.expected_authorization
+            ) else 401
             if status == route["success"]:
                 self.server.completed.append(operation_id)
         else:

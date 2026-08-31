@@ -66,12 +66,16 @@ is whether a value goes into it.
 Start-VcfOpsReportGeneration -Session $s -ReportDefinitionId $d -ResourceId $r
   => {"reportDefinitionId":"...","resourceId":"..."}          # and nothing else
 
-Save-VcfOpsReport -Session $s -ReportId $id -Path out.csv
+Save-VcfOpsReport -Session $s -ReportId $id -Path out.pdf
   => GET /suite-api/api/reports/<id>/download                 # no query string at all
 
 Save-VcfOpsReport -Session $s -ReportId $id -Path out.csv -Format CSV
   => GET /suite-api/api/reports/<id>/download?format=CSV
 ```
+
+The deployed VCF 9.1 appliance defaults an omitted `format` to PDF and returns
+`Content-Type: application/pdf`. An explicit `format=CSV` returns CSV bytes with
+`Content-Type: application/octet-stream`.
 
 This applies to nested models too: a `traversalSpec` built from a name alone must serialise to
 `{"name":"..."}` and must not carry the other optional `traversal-spec` properties.

@@ -49,8 +49,8 @@ class CloneBatchClient:
         session_token: str,
         *,
         timeout: float = 10.0,
-        poll_interval: float = 0.0,
-        max_polls: int = 8,
+        poll_interval: float = 2.0,
+        max_polls: int = 30,
     ) -> None:
         raise NotImplementedError("Implement the contract-backed client.")
 

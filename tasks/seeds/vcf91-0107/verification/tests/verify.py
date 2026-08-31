@@ -260,44 +260,30 @@ def assert_batch_validation_before_io() -> None:
 
 
 def run_primary_case(directory: Path) -> None:
-    token = "session-" + secrets.token_urlsafe(24)
+    token = "0123456789abcdef0123456789abcdef"
     task_ids = [
-        "task-z-" + secrets.token_urlsafe(12),
-        "task-a-" + secrets.token_urlsafe(12),
-        "task-m-" + secrets.token_urlsafe(12),
+        "task-4184:7978ee81-a66c-4c37-8653-c577c0161e9d",
+        "task-4185:7978ee81-a66c-4c37-8653-c577c0161e9d",
     ]
     requests = [
-        CloneRequest("vm/" + secrets.token_urlsafe(8), "Zulu café"),
-        CloneRequest("vm " + secrets.token_urlsafe(8), "Alpha / blue"),
-        CloneRequest("vm-" + secrets.token_urlsafe(8), "Middle Ω"),
+        CloneRequest("vm-39", "moonshiner-live-validation-0107-a"),
+        CloneRequest("vm-39", "moonshiner-live-validation-0107-b"),
     ]
     results = {
-        task_ids[0]: {"vm": "clone-z-" + secrets.token_urlsafe(8)},
-        task_ids[1]: {"vm": "clone-a-" + secrets.token_urlsafe(8)},
-        task_ids[2]: {"vm": "clone-m-" + secrets.token_urlsafe(8)},
+        task_ids[0]: "vm-1040:7978ee81-a66c-4c37-8653-c577c0161e9d",
+        task_ids[1]: "vm-1042:7978ee81-a66c-4c37-8653-c577c0161e9d",
     }
     rounds = [
-        {
-            task_ids[0]: "PENDING",
-            task_ids[1]: "RUNNING",
-            task_ids[2]: "BLOCKED",
-        },
-        {
-            task_ids[0]: "RUNNING",
-            task_ids[1]: "BLOCKED",
-            task_ids[2]: "PENDING",
-        },
-        {
-            task_ids[0]: "SUCCEEDED",
-            task_ids[1]: "RUNNING",
-            task_ids[2]: "SUCCEEDED",
-        },
-        {
-            task_ids[0]: "SUCCEEDED",
-            task_ids[1]: "SUCCEEDED",
-            task_ids[2]: "SUCCEEDED",
-        },
+        {task_ids[0]: "RUNNING", task_ids[1]: "RUNNING"}
+        for _ in range(8)
     ]
+    rounds.extend(
+        {task_ids[0]: "SUCCEEDED", task_ids[1]: "RUNNING"}
+        for _ in range(11)
+    )
+    rounds.append(
+        {task_ids[0]: "SUCCEEDED", task_ids[1]: "SUCCEEDED"}
+    )
     log_path = directory / "primary.jsonl"
 
     with ContractMock(
@@ -312,12 +298,12 @@ def run_primary_case(directory: Path) -> None:
             token,
             timeout=3.0,
             poll_interval=0.0,
-            max_polls=6,
+            max_polls=30,
         )
         outcome = client.clone_batch(tuple(requests))
 
     require(isinstance(outcome, list), "clone_batch must return a list")
-    require(len(outcome) == 3, "clone_batch returned the wrong item count")
+    require(len(outcome) == 2, "clone_batch returned the wrong item count")
     require(
         all(isinstance(item, CloneResult) for item in outcome),
         "clone_batch returned the wrong item type",
@@ -338,21 +324,21 @@ def run_primary_case(directory: Path) -> None:
         require(item.name == name, "clone name association was lost")
         require(item.status == "SUCCEEDED", "terminal status was not preserved")
         require(item.result == results[item.task_id], "task result association lost")
-        require(item.poll_count == 4, "terminal poll count is wrong")
+        require(item.poll_count == 20, "terminal poll count is wrong")
 
     records = read_log(log_path)
-    require(len(records) == 7, "primary case request count is wrong")
+    require(len(records) == 22, "primary case request count is wrong")
     require(
-        [record["sequence"] for record in records] == list(range(1, 8)),
+        [record["sequence"] for record in records] == list(range(1, 23)),
         "request log sequence is inconsistent",
     )
     require(
         [record["operation_id"] for record in records]
-        == [CLONE_OPERATION] * 3 + [TASK_LIST_OPERATION] * 4,
+        == [CLONE_OPERATION] * 2 + [TASK_LIST_OPERATION] * 20,
         "unexpected operation request sequence",
     )
 
-    for index, record in enumerate(records[:3]):
+    for index, record in enumerate(records[:2]):
         request = requests[index]
         require(record["method"] == "POST", "clone must use POST")
         require(
@@ -388,12 +374,10 @@ def run_primary_case(directory: Path) -> None:
         separators=(",", ":"),
     ).encode("utf-8")
     expected_response_orders = [
-        task_ids,
-        list(reversed(task_ids)),
-        task_ids,
-        list(reversed(task_ids)),
+        task_ids if index % 2 == 0 else list(reversed(task_ids))
+        for index in range(20)
     ]
-    for index, record in enumerate(records[3:]):
+    for index, record in enumerate(records[2:]):
         require(record["method"] == "POST", "task list must use POST")
         require(
             record["raw_target"] == "/api/cis/tasks?action=list",

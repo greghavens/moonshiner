@@ -10,8 +10,7 @@ Set-StrictMode -Version Latest
 .DESCRIPTION
     NOT IMPLEMENTED.
 
-    See README.md for the required behaviour and docs/contract.json for the
-    operations this module is allowed to use.
+    See README.md for the required behaviour.
 
 .OUTPUTS
     [pscustomobject] with the properties:
@@ -33,8 +32,11 @@ function Invoke-VcfOpsCredentialRotation {
         [Parameter(Mandatory)] [string] $AdapterKind,
         [Parameter(Mandatory)] [string] $CredentialName,
         [Parameter(Mandatory)] [string] $NewCredentialName,
+        [Parameter(Mandatory)] [ValidateNotNull()]
+        [System.Collections.Specialized.OrderedDictionary] $CredentialField,
         [Parameter(Mandatory)] [string] $NewSecret,
         [Parameter(Mandatory)] [string] $SecretFieldName,
+        [switch] $SkipCertificateCheck,
         [int] $MaxAttempts = 3
     )
 

@@ -77,6 +77,7 @@ try {
                 MinuteOfTheHour = 30
                 DurationMinutes = 120
                 Recurrence      = 1
+                ExpireRuns      = 5
             }
             Add-Result 'first' (Set-VcfOpsMaintenanceWindow @common)
             Add-Result 'retry' (Set-VcfOpsMaintenanceWindow @common)
@@ -91,6 +92,7 @@ try {
                 MinuteOfTheHour = 30
                 DurationMinutes = 120
                 Recurrence      = 1
+                ExpireRuns      = 5
             }
             Add-Result 'create' (Set-VcfOpsMaintenanceWindow @common)
 
@@ -108,6 +110,7 @@ try {
                 Hour            = 23
                 MinuteOfTheHour = 15
                 DurationMinutes = 90
+                Recurrence      = 1
                 DaysOfTheWeek   = @('SATURDAY', 'SUNDAY')
                 ExpirationDate  = '11/30/2027'
             }
@@ -133,7 +136,7 @@ try {
             $desired = @{
                 Server          = $server
                 Key             = $key
-                ScheduleType    = 'DAILY'
+                ScheduleType    = 'WEEKLY'
                 Hour            = 1
                 MinuteOfTheHour = 5
                 DurationMinutes = 30
@@ -146,7 +149,6 @@ try {
             Add-Result 'create' (Set-VcfOpsMaintenanceWindow @desired)
 
             $changes = [ordered]@{
-                'schedule-type' = @{ ScheduleType = 'WEEKLY' }
                 'hour'          = @{ Hour = 4 }
                 'minute'        = @{ MinuteOfTheHour = 45 }
                 'duration'      = @{ DurationMinutes = 75 }
@@ -166,17 +168,23 @@ try {
             # Omit one stored optional field at a time. Each omission is drift,
             # and each update must project every still-bound field while
             # clearing the newly unbound one.
-            $removals = [ordered]@{
-                'remove-recurrence' = 'Recurrence'
-                'remove-days'       = 'DaysOfTheWeek'
-                'remove-expiration' = 'ExpirationDate'
-                'remove-expire-runs'= 'ExpireRuns'
-                'remove-time-zone'  = 'TimeZone'
-            }
-            foreach ($removal in $removals.GetEnumerator()) {
-                [void] $desired.Remove($removal.Value)
-                Add-Result $removal.Key (Set-VcfOpsMaintenanceWindow @desired)
-            }
+            [void] $desired.Remove('TimeZone')
+            Add-Result 'remove-time-zone' (Set-VcfOpsMaintenanceWindow @desired)
+
+            [void] $desired.Remove('ExpirationDate')
+            Add-Result 'remove-expiration' (Set-VcfOpsMaintenanceWindow @desired)
+
+            $desired['ExpirationDate'] = '01/31/2029'
+            Add-Result 'restore-expiration' (Set-VcfOpsMaintenanceWindow @desired)
+
+            [void] $desired.Remove('ExpireRuns')
+            Add-Result 'remove-expire-runs' (Set-VcfOpsMaintenanceWindow @desired)
+
+            # DAILY rejects daysOfTheWeek. Change the type and omit the days in
+            # the same request so every request remains valid against VCF 9.1.
+            $desired['ScheduleType'] = 'DAILY'
+            [void] $desired.Remove('DaysOfTheWeek')
+            Add-Result 'daily-without-days' (Set-VcfOpsMaintenanceWindow @desired)
             Add-Result 'settle' (Set-VcfOpsMaintenanceWindow @desired)
         }
     }

@@ -21,10 +21,11 @@ be changed.
 
 `docs/contract.json` is derived from `vcf-operations-openapi.json` in the
 `vmware/vcf-api-specs` repository at the revision named in
-`docs/official_sources.json`. Two operations are used:
+`docs/official_sources.json`. Three operations are used:
 
 - `acquireToken` — `POST /api/auth/token/acquire`
 - `getSymptomDefinitions` — `GET /api/symptomdefinitions`
+- `releaseToken` — `POST /api/auth/token/release`
 
 The `clientRules` section of the contract states how this client must use them:
 the transport headers, the rule for omitting unset optional fields, how
@@ -36,5 +37,5 @@ pagination terminates, and the order entries must be emitted in.
 go test -race ./verifier/...
 ```
 
-The mock listens on 127.0.0.1 and serves only the two operations above. No
+The mock listens on 127.0.0.1 and serves only the three operations above. No
 VMware endpoint is contacted.

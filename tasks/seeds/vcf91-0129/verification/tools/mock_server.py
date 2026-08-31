@@ -149,6 +149,21 @@ class Handler(BaseHTTPRequestHandler):
         self.server.counters[name] = count
 
         if name == "namespace.createV2":
+            if self.server.scenario == "no_supervisor":
+                self._json_response(
+                    404,
+                    {
+                        "error_type": "NOT_FOUND",
+                        "messages": [
+                            {
+                                "id": "vcenter.wcp.supervisor.notfound",
+                                "default_message": "The Supervisor with identifier supervisor-21 was not found.",
+                                "args": ["supervisor-21"],
+                            }
+                        ],
+                    },
+                )
+                return
             self._empty_response(204)
             return
         if name == "namespace.getV2":
@@ -205,7 +220,17 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "apiVersion": "cluster.x-k8s.io/v1beta1",
                     "kind": "Cluster",
-                    "metadata": {"name": cluster, "namespace": namespace},
+                    "metadata": {
+                        "name": cluster,
+                        "namespace": namespace,
+                        "uid": "fcccd77e-e4fa-4ab8-a6a2-4dadf2b34212",
+                    },
+                    "spec": {
+                        "topology": {
+                            "class": "vsphere-9.1.2668",
+                            "version": "v1.34.2",
+                        }
+                    },
                     "status": {
                         "phase": phase,
                         "conditions": [
@@ -244,7 +269,7 @@ def main() -> int:
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--ready", type=Path, required=True)
     parser.add_argument(
-        "--scenario", choices=("ready", "cluster_failed"), default="ready"
+        "--scenario", choices=("ready", "cluster_failed", "no_supervisor"), default="ready"
     )
     args = parser.parse_args()
 

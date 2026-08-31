@@ -41,6 +41,7 @@ type PollReply struct {
 // Plan controls responses without placing scenario state in the mock itself.
 type Plan struct {
 	ProxySubmitStatus int
+	ProxyTaskStatus   string
 	ProxySubmitError  VCFError
 	ProxyPolls        []PollReply
 	CeipSubmitStatus  int
@@ -262,7 +263,11 @@ func (s *Server) submitProxy(w http.ResponseWriter) {
 		writeJSON(w, status, defaultError(s.plan.ProxySubmitError, "PROXY_REJECTED"))
 		return
 	}
-	writeJSON(w, status, task(s.runtime.ProxyTaskID, "Update proxy configuration", "PENDING", nil))
+	taskStatus := s.plan.ProxyTaskStatus
+	if taskStatus == "" {
+		taskStatus = "PENDING"
+	}
+	writeJSON(w, status, task(s.runtime.ProxyTaskID, "Update proxy configuration", taskStatus, nil))
 }
 
 func (s *Server) submitCeip(w http.ResponseWriter) {

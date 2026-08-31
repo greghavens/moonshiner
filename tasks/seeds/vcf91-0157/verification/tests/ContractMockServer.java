@@ -53,6 +53,11 @@ final class ContractMockServer implements AutoCloseable {
     static final String KUBERNETES_OPERATION =
             "cluster.x-k8s.io/v1beta2:namespaced-clusters:list";
 
+    enum Scenario {
+        STANDARD,
+        LIVE_BLANK_DISCOVERY
+    }
+
     record Fixture(
             String oldVcenterSession,
             String newVcenterSession,
@@ -115,6 +120,7 @@ final class ContractMockServer implements AutoCloseable {
             Pattern.DOTALL);
 
     private final Fixture fixture;
+    private final Scenario scenario;
     private final ContractRoutes routes;
     private final HttpServer server;
     private final ExecutorService executor;
@@ -127,7 +133,13 @@ final class ContractMockServer implements AutoCloseable {
     private int namespaceListSuccesses;
 
     ContractMockServer(Path contract, Fixture fixture) throws IOException {
+        this(contract, fixture, Scenario.STANDARD);
+    }
+
+    ContractMockServer(Path contract, Fixture fixture, Scenario scenario)
+            throws IOException {
         this.fixture = fixture;
+        this.scenario = scenario;
         this.routes = loadRoutes(contract);
         this.validVcenterSession = fixture.oldVcenterSession();
         HttpServer started = null;
@@ -253,6 +265,12 @@ final class ContractMockServer implements AutoCloseable {
                 && exchange.getRequestHeaders().get("Content-Type") == null;
         if (!valid) {
             return unauthenticated();
+        }
+
+        if (scenario == Scenario.LIVE_BLANK_DISCOVERY) {
+            return new Response(200, jsonBytes(
+                    "[{\"master_host\":\"\",\"namespace\":\"\","
+                            + "\"control_plane_api_server_port\":6443}]"));
         }
 
         namespaceListSuccesses++;

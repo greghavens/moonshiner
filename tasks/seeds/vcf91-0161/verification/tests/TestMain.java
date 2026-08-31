@@ -123,6 +123,14 @@ public final class TestMain {
                             required(values, "supervisorNamespace"))),
                     "fallback namespace capture");
             String scenario = required(values, "scenario");
+            if (scenario.equals("live_namespace_404")) {
+                return response(404,
+                        "{\"error_type\":\"NOT_FOUND\","
+                                + "\"messages\":[{\"id\":"
+                                + "\"vcenter.wcp.workload.notfound\","
+                                + "\"default_message\":"
+                                + "\"Workload not found.\"}]}");
+            }
             String status = scenario.equals("namespace_not_ready")
                     ? "ERROR" : "RUNNING";
             String supervisor = scenario.equals("supervisor_mismatch")
@@ -150,6 +158,14 @@ public final class TestMain {
                             required(values, "supervisorNamespace"))),
                     "fallback create capture");
             String scenario = required(values, "scenario");
+            if (scenario.equals("live_admission_422")) {
+                return response(422,
+                        "{\"apiVersion\":\"v1\",\"kind\":\"Status\","
+                                + "\"status\":\"Failure\","
+                                + "\"reason\":\"Invalid\",\"code\":422,"
+                                + "\"message\":\"Cluster failed strict "
+                                + "server-side admission\"}");
+            }
             if (scenario.equals("create_rejected")) {
                 return response(
                         409,
@@ -302,19 +318,20 @@ public final class TestMain {
 
     private static VksClusterProvisionClient.ClusterRequest request(
             Properties values, String scenario) {
-        String classNamespace = null;
         Integer controlPlaneReplicas = null;
+        String workerClass = null;
         String workerPoolName = null;
         Integer workerReplicas = null;
         String serviceDomain = null;
         if (scenario.equals("full")) {
-            classNamespace = required(values, "classNamespace");
             controlPlaneReplicas =
                     Integer.valueOf(required(values, "controlPlaneReplicas"));
+            workerClass = required(values, "workerClass");
             workerPoolName = required(values, "workerPoolName");
             workerReplicas = Integer.valueOf(required(values, "workerReplicas"));
             serviceDomain = required(values, "serviceDomain");
         } else if (scenario.equals("invalid_request")) {
+            workerClass = required(values, "workerClass");
             workerPoolName = required(values, "workerPoolName");
         }
         return new VksClusterProvisionClient.ClusterRequest(
@@ -323,13 +340,32 @@ public final class TestMain {
                 required(values, "clusterName"),
                 required(values, "clusterClass"),
                 required(values, "kubernetesVersion"),
-                required(values, "vmClass"),
-                required(values, "storageClass"),
-                classNamespace,
+                liveTopologyVariables(),
                 controlPlaneReplicas,
+                workerClass,
                 workerPoolName,
                 workerReplicas,
                 serviceDomain);
+    }
+
+    private static List<VksClusterProvisionClient.TopologyVariable>
+            liveTopologyVariables() {
+        List<String> names = List.of(
+                "datastore", "dnsImageTag", "imageRepository",
+                "infraServerThumbprint", "network", "infraServerURL",
+                "resourcePool", "vmTemplate", "datacenter", "etcdImageTag",
+                "folder", "controlPlaneIpAddr", "credsSecretName",
+                "kubeVipPodManifest");
+        return names.stream()
+                .map(name -> {
+                    java.util.LinkedHashMap<String, Object> value =
+                            new java.util.LinkedHashMap<>();
+                    value.put("liveValidated", Boolean.TRUE);
+                    value.put("name", name);
+                    return new VksClusterProvisionClient.TopologyVariable(
+                            name, value);
+                })
+                .toList();
     }
 
     public static void main(String[] args) throws Exception {
@@ -383,6 +419,25 @@ public final class TestMain {
                 throw new AssertionError("unready namespace was accepted");
             } catch (VksClusterProvisionClient.NamespaceNotReadyException expected) {
                 System.out.println("EXPECTED namespace_not_ready");
+                return;
+            }
+        }
+
+        if (scenario.equals("live_namespace_404")
+                || scenario.equals("live_admission_422")) {
+            try {
+                client.createIfNamespaceReady(request(values, scenario));
+                throw new AssertionError("live failure was accepted");
+            } catch (VksClusterProvisionClient.ApiException expected) {
+                int wanted = scenario.equals("live_namespace_404") ? 404 : 422;
+                check(expected.statusCode() == wanted,
+                        "wrong live failure status");
+                String operation = scenario.equals("live_namespace_404")
+                        ? "Vcenter.Namespaces.Instances_getV2"
+                        : "cluster.x-k8s.io/v1beta2:namespaced-clusters:create";
+                check(expected.operation().equals(operation),
+                        "wrong live failure operation");
+                System.out.println("EXPECTED " + scenario);
                 return;
             }
         }

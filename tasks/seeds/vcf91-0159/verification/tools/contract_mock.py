@@ -195,6 +195,15 @@ class Handler(BaseHTTPRequestHandler):
             if captures != [config["namespace"]]:
                 self._respond(404, {"error": "namespace not found"})
                 return
+            if scenario == "live_namespace_404":
+                self._respond(404, {
+                    "error_type": "NOT_FOUND",
+                    "messages": [{
+                        "id": "vcenter.wcp.workload.notfound",
+                        "default_message": "Workload not found.",
+                    }],
+                })
+                return
             if scenario == "redirect":
                 self.send_response(307)
                 self.send_header(
@@ -227,6 +236,16 @@ class Handler(BaseHTTPRequestHandler):
         if operation == "applyVksCluster":
             if captures != [config["namespace"], config["cluster"]]:
                 self._respond(404, {"error": "Cluster not found"})
+                return
+            if scenario == "live_admission_422":
+                self._respond(422, {
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "reason": "Invalid",
+                    "code": 422,
+                    "message": "Cluster failed strict server-side admission",
+                })
                 return
             attempt = self.server.state.commit_apply(
                 captures, split.query, body

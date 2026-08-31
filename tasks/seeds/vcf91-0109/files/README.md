@@ -1,14 +1,7 @@
 # Asynchronous vCenter clone client
 
-Implement package `example.com/vcfasync/vcenter` using only the Go standard
-library. The authoritative, reduced VCF 9.1 API contract is
-[`docs/contract.json`](docs/contract.json); its provenance is recorded in
-[`docs/official_sources.json`](docs/official_sources.json).
-
-The supplied `internal/mockvcenter` package is a loopback-only vCenter fixture.
-It serves exactly the two operations named by the contract and exposes a
-race-safe request log. No live VMware endpoint is needed or permitted by the
-tests.
+Implement package `example.com/vcfasync/vcenter` for the VCF 9.1 vSphere
+Automation API using only the Go standard library.
 
 ## Required API
 
@@ -52,7 +45,7 @@ func (c *Client) CloneAndWait(
 ) (string, error)
 ```
 
-Use the JSON names from the contract. Optional fields must use omission
+Use the JSON names documented by the API. Optional fields must use omission
 semantics:
 
 - a nil optional pointer is absent from JSON;

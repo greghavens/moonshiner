@@ -19,7 +19,7 @@ try {
     $arguments = @{
         VCenterBaseUri = "$BaseUri/api"
         KubernetesBaseUri = $BaseUri
-        VCenterSessionId = 'vc-session-token'
+        VCenterSessionId = '0123456789abcdef0123456789abcdef'
         KubernetesBearerToken = 'k8s-bearer-token'
         Supervisor = $config.supervisor
         Namespace = $config.namespace

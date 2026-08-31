@@ -365,11 +365,6 @@ func TestOptionalRefreshMemberWireShapeTableDriven(t *testing.T) {
 			tail: "}",
 		},
 		{
-			name:  "explicit false",
-			force: boolPointer(false),
-			tail:  `,"hostsRefreshSpec":{"forceRefresh":false}}`,
-		},
-		{
 			name:  "explicit true",
 			force: boolPointer(true),
 			tail:  `,"hostsRefreshSpec":{"forceRefresh":true}}`,
@@ -747,6 +742,14 @@ func TestValidationIsLocalAndTableDriven(t *testing.T) {
 			ctx:  context.Background(),
 			request: hr.RefreshRequest{
 				HostIDs: []string{" " + runtime.HostAlphaID},
+			},
+		},
+		{
+			name: "explicit false force refresh",
+			ctx:  context.Background(),
+			request: hr.RefreshRequest{
+				HostIDs:     []string{runtime.HostAlphaID},
+				ForceRefresh: boolPointer(false),
 			},
 		},
 		{

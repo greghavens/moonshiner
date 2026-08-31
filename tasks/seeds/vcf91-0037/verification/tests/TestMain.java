@@ -23,11 +23,15 @@ public final class TestMain {
                         "SFTP",
                         "svc-vcf-\"backup\"",
                         "/exports/vcf\\nightly",
-                        null,
+                        "Backup-Secret-42!",
                         null);
+
+        VcfBackupClient.Encryption encryption =
+                new VcfBackupClient.Encryption("Encryption-Passphrase-42!");
 
         VcfBackupClient.Task result = client.updateBackupConfigurationAndWait(
                 location,
+                encryption,
                 5,
                 Duration.ofMillis(10));
 
@@ -37,11 +41,11 @@ public final class TestMain {
 
         expectIllegalArgument(
                 () -> client.updateBackupConfigurationAndWait(
-                        location, 0, Duration.ZERO),
+                        location, encryption, 0, Duration.ZERO),
                 "maxPolls must be validated before traffic");
         expectIllegalArgument(
                 () -> client.updateBackupConfigurationAndWait(
-                        location, 1, Duration.ofMillis(-1)),
+                        location, encryption, 1, Duration.ofMillis(-1)),
                 "negative pollInterval must be validated before traffic");
         System.out.println("SUCCESSFUL");
     }

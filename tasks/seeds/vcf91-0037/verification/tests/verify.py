@@ -15,10 +15,10 @@ from urllib.parse import quote
 
 PROJECT = Path(__file__).resolve().parents[1]
 PROTECTED_HASHES = {
-    "docs/contract.json": "d30b4c999b21627059979a08342f9f402f0fd4ded1f80c24fb1c2ec04b765f48",
+    "docs/contract.json": "99a50805803395a6ce0c8436c3913d08ef6883a5bb3f6145c1c4d3913727f366",
     "docs/official_sources.json": "acbb84a28e8e2baaf58a638f5a0254f6c05f23be94dc2b7815e4b0e1df081f70",
-    "tests/TestMain.java": "77ffbc50b59ccb0295bb715ac28a5b0d41fe12a60ca379d5da056f81ede730dc",
-    "tests/mock_server.py": "9f19a3430f2737ab3aced7a84fba1ba6726fdc629b5460bdb57ad916058524b8",
+    "tests/TestMain.java": "70592b3fd6eae5662f6d3e1f34b43a68757f5995a6b8a37a673a28b6c6c8f400",
+    "tests/mock_server.py": "c97109dbd6d81a769e2b6f01e31affafa7ff2ad3dedeab06597c6627e2bae945",
 }
 
 
@@ -104,6 +104,7 @@ def check_wire_log(log_path: Path, server_info: dict) -> None:
         fail(f"wrong update request target: {patch}")
 
     expected_body = {
+        "encryption": {"passphrase": "Encryption-Passphrase-42!"},
         "backupLocations": [
             {
                 "server": "backup01.lab.example",
@@ -111,8 +112,10 @@ def check_wire_log(log_path: Path, server_info: dict) -> None:
                 "protocol": "SFTP",
                 "username": "svc-vcf-\"backup\"",
                 "directoryPath": "/exports/vcf\\nightly",
+                "password": "Backup-Secret-42!",
             }
-        ]
+        ],
+        "backupSchedules": [],
     }
     try:
         body = json.loads(patch["body"])
@@ -121,11 +124,15 @@ def check_wire_log(log_path: Path, server_info: dict) -> None:
     if body != expected_body:
         fail(f"PATCH JSON shape differs from the contract scenario: {body!r}")
     location = body["backupLocations"][0]
-    forbidden = {"password", "sshFingerprint"}
+    forbidden = {"sshFingerprint"}
     if forbidden.intersection(location):
         fail("unset BackupLocation optionals must be omitted")
-    if {"encryption", "backupSchedules"}.intersection(body):
-        fail("unset BackupConfigurationSpec optionals must be omitted")
+    if body.get("encryption") != {
+        "passphrase": "Encryption-Passphrase-42!"
+    }:
+        fail("backup encryption passphrase is missing")
+    if body.get("backupSchedules") != []:
+        fail("the no-schedule workflow must send an explicit empty schedule list")
 
     expected_task_path = "/v1/tasks/" + quote(server_info["task_id"], safe="")
     for index, entry in enumerate((first_poll, second_poll), start=1):

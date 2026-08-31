@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the repository's checks. Offline: everything talks to the loopback
+# Runs the task's checks.
 # appliance stand-in in tools/vcfops_mock.py.
 set -euo pipefail
 

@@ -1,3 +1,3 @@
-module moonshiner.local/vcf91/logupdate
+module vcflogupdate
 
 go 1.22

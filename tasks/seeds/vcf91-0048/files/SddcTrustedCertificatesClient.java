@@ -7,7 +7,7 @@ import java.util.Objects;
 /**
  * Minimal VCF 9.1 SDDC Manager trusted-certificate client.
  *
- * <p>Implement this file against the protected contract in docs/contract.json.
+ * <p>Implement this file against the documented API contract.
  */
 public final class SddcTrustedCertificatesClient {
     public record TrustedCertificate(String alias, String certificate) {
@@ -30,7 +30,7 @@ public final class SddcTrustedCertificatesClient {
 
     public List<TrustedCertificate> listTrustedCertificates()
             throws IOException, InterruptedException {
-        throw new UnsupportedOperationException("TODO: implement from docs/contract.json");
+        throw new UnsupportedOperationException("TODO: implement the documented list operation");
     }
 
     public List<TrustedCertificate> ensureTrustedCertificate(String pemCertificate)

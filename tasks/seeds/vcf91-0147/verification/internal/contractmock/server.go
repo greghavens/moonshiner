@@ -41,6 +41,8 @@ type Scenario struct {
 	ClusterCreateStatus int
 	ClusterGetStatus    int
 	ErrorBody           string
+	ErrorPayload        any
+	ResourceVersion     string
 }
 
 // RequestRecord is one durable JSONL request-log entry.
@@ -407,18 +409,22 @@ func (s *Server) writeObservation(writer http.ResponseWriter, status, index int)
 		index = len(s.scenario.Observations) - 1
 	}
 	observation := s.scenario.Observations[index]
+	resourceVersion := s.scenario.ResourceVersion
+	if resourceVersion == "" {
+		resourceVersion = fmt.Sprintf("%d", index+1)
+	}
 	writeJSON(writer, status, map[string]any{
 		"apiVersion": "cluster.x-k8s.io/v1beta2",
 		"kind":       "Cluster",
 		"metadata": map[string]any{
 			"name":            s.scenario.ClusterName,
 			"namespace":       s.scenario.Namespace,
-			"resourceVersion": fmt.Sprintf("%d", index+1),
+			"resourceVersion": resourceVersion,
 		},
 		"spec": map[string]any{
 			"topology": map[string]any{
-				"class":   s.scenario.ClusterClass,
-				"version": s.scenario.KubernetesVersion,
+				"classRef": map[string]any{"name": s.scenario.ClusterClass},
+				"version":  s.scenario.KubernetesVersion,
 			},
 		},
 		"status": map[string]any{
@@ -435,6 +441,10 @@ func (s *Server) writeObservation(writer http.ResponseWriter, status, index int)
 }
 
 func (s *Server) writeError(writer http.ResponseWriter, status int) {
+	if s.scenario.ErrorPayload != nil {
+		writeJSON(writer, status, s.scenario.ErrorPayload)
+		return
+	}
 	body := s.scenario.ErrorBody
 	if body == "" {
 		body = "fixture API error"

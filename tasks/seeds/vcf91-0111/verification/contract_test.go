@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -191,11 +192,11 @@ func TestListAllCategoriesCompletesPaginationAndStabilizesOrder(t *testing.T) {
 	client := newClient(t, server)
 
 	want := []vc.Category{
-		category("cat-a1", "Alpha/β"),
-		category("cat-a2", "Alpha/β"),
-		category("cat-db", "DB + Tier"),
-		category("cat-z", "Zeta"),
-		category("cat-e", "éclair"),
+		category("urn:vmomi:InventoryServiceCategory:11111111-1111-4111-8111-111111111111:GLOBAL", "Alpha/β"),
+		category("urn:vmomi:InventoryServiceCategory:22222222-2222-4222-8222-222222222222:GLOBAL", "Alpha/β"),
+		category("urn:vmomi:InventoryServiceCategory:33333333-3333-4333-8333-333333333333:GLOBAL", "DB + Tier"),
+		category("urn:vmomi:InventoryServiceCategory:44444444-4444-4444-8444-444444444444:GLOBAL", "Zeta"),
+		category("urn:vmomi:InventoryServiceCategory:55555555-5555-4555-8555-555555555555:GLOBAL", "éclair"),
 	}
 	for run := 0; run < 2; run++ {
 		got, err := client.ListAllCategories(context.Background(), vc.ListOptions{})
@@ -213,6 +214,11 @@ func TestListAllCategoriesCompletesPaginationAndStabilizesOrder(t *testing.T) {
 		t.Fatalf("request count = %d, want 6: %#v", len(requests), requests)
 	}
 	secrets := server.Secrets()
+	for index, marker := range secrets.Markers {
+		if len(marker) != 613 {
+			t.Fatalf("marker %d length = %d, want live-shaped 613", index, len(marker))
+		}
+	}
 	wantQueries := []string{
 		"",
 		url.Values{"marker": {secrets.Markers[0]}}.Encode(),
@@ -288,6 +294,56 @@ func TestExplodedFilterAndIterationWireShape(t *testing.T) {
 	}
 }
 
+func TestPageSizeUsesFullInt64Domain(t *testing.T) {
+	for _, pageSize := range []int64{0, -1, 9223372036854775807} {
+		t.Run(strconv.FormatInt(pageSize, 10), func(t *testing.T) {
+			server := startServer(t, contractmock.Plan{
+				Categories: fixtureCategories(),
+				PageWidth:  len(fixtureCategories()),
+			})
+			client := newClient(t, server)
+			got, err := client.ListAllCategories(context.Background(), vc.ListOptions{
+				PageSize: &pageSize,
+			})
+			if err != nil {
+				t.Fatalf("ListAllCategories: %v", err)
+			}
+			if len(got) != len(fixtureCategories()) {
+				t.Fatalf("returned %d categories", len(got))
+			}
+			requests := readRequests(t, server)
+			if len(requests) != 1 || requests[0].RawQuery != "page_size="+strconv.FormatInt(pageSize, 10) {
+				t.Fatalf("page-size wire request = %#v", requests)
+			}
+		})
+	}
+}
+
+func TestInvalidMarkerUsesObservedServerFailure(t *testing.T) {
+	server := startServer(t, contractmock.Plan{
+		Categories: fixtureCategories(),
+		PageWidth:  2,
+		MutatePage: func(pageIndex int, payload map[string]any) {
+			if pageIndex == 0 {
+				payload["marker"] = "definitely-invalid-marker"
+			}
+		},
+	})
+	client := newClient(t, server)
+	got, err := client.ListAllCategories(context.Background(), vc.ListOptions{})
+	if err == nil || got != nil {
+		t.Fatalf("invalid marker returned collection %#v with error %v", got, err)
+	}
+	var apiError *vc.APIError
+	if !errors.As(err, &apiError) ||
+		apiError.StatusCode != http.StatusInternalServerError ||
+		apiError.ErrorType != "INTERNAL_SERVER_ERROR" ||
+		len(apiError.Messages) != 1 ||
+		apiError.Messages[0].ID != "vapi.bindings.method.impl.unexpected" {
+		t.Fatalf("invalid-marker error = %#v", err)
+	}
+}
+
 func TestEmptyPageWithMarkerDoesNotTerminateTraversal(t *testing.T) {
 	server := startServer(t, contractmock.Plan{
 		Categories: fixtureCategories(),
@@ -350,8 +406,6 @@ func TestLocalValidationOccursBeforeTraffic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("valid NewClient: %v", err)
 	}
-	zero := int64(0)
-	negative := int64(-1)
 	optionCases := []struct {
 		name    string
 		ctx     context.Context
@@ -361,8 +415,6 @@ func TestLocalValidationOccursBeforeTraffic(t *testing.T) {
 		{name: "empty names", ctx: context.Background(), options: vc.ListOptions{Names: []string{}}},
 		{name: "blank name", ctx: context.Background(), options: vc.ListOptions{Names: []string{"ok", " "}}},
 		{name: "duplicate name", ctx: context.Background(), options: vc.ListOptions{Names: []string{"same", "same"}}},
-		{name: "zero page size", ctx: context.Background(), options: vc.ListOptions{PageSize: &zero}},
-		{name: "negative page size", ctx: context.Background(), options: vc.ListOptions{PageSize: &negative}},
 	}
 	for _, test := range optionCases {
 		t.Run("options/"+test.name, func(t *testing.T) {
@@ -604,11 +656,11 @@ func assertWireRequest(
 
 func fixtureCategories() []map[string]any {
 	return []map[string]any{
-		categoryObject("cat-z", "Zeta"),
-		categoryObject("cat-a2", "Alpha/β"),
-		categoryObject("cat-db", "DB + Tier"),
-		categoryObject("cat-a1", "Alpha/β"),
-		categoryObject("cat-e", "éclair"),
+		categoryObject("urn:vmomi:InventoryServiceCategory:44444444-4444-4444-8444-444444444444:GLOBAL", "Zeta"),
+		categoryObject("urn:vmomi:InventoryServiceCategory:22222222-2222-4222-8222-222222222222:GLOBAL", "Alpha/β"),
+		categoryObject("urn:vmomi:InventoryServiceCategory:33333333-3333-4333-8333-333333333333:GLOBAL", "DB + Tier"),
+		categoryObject("urn:vmomi:InventoryServiceCategory:11111111-1111-4111-8111-111111111111:GLOBAL", "Alpha/β"),
+		categoryObject("urn:vmomi:InventoryServiceCategory:55555555-5555-4555-8555-555555555555:GLOBAL", "éclair"),
 	}
 }
 
@@ -617,9 +669,9 @@ func categoryObject(id, name string) map[string]any {
 		"category_id": id,
 		"info": map[string]any{
 			"name":             name,
-			"description":      "description for " + id,
-			"cardinality":      "MULTIPLE",
-			"associable_types": []string{"VirtualMachine", "Datastore"},
+			"description":      "VCF live validation category " + name,
+			"cardinality":      "SINGLE",
+			"associable_types": []string{"urn:vim25:VirtualMachine"},
 			"used_by":          []string{},
 		},
 	}
@@ -630,9 +682,9 @@ func category(id, name string) vc.Category {
 		CategoryID: id,
 		Info: vc.CategoryInfo{
 			Name:            name,
-			Description:     "description for " + id,
-			Cardinality:     "MULTIPLE",
-			AssociableTypes: []string{"VirtualMachine", "Datastore"},
+			Description:     "VCF live validation category " + name,
+			Cardinality:     "SINGLE",
+			AssociableTypes: []string{"urn:vim25:VirtualMachine"},
 			UsedBy:          []string{},
 		},
 	}

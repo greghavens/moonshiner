@@ -134,6 +134,13 @@ public final class TestMain {
                 case "getSupervisorNamespace" -> {
                     check(captures.equals(List.of(supervisorNamespace)),
                             "in-memory namespace capture");
+                    if ("live_namespace_404".equals(scenario)) {
+                        yield response(404,
+                                "{\"error_type\":\"NOT_FOUND\",\"messages\":[{"
+                                        + "\"args\":[],\"default_message\":"
+                                        + "\"Namespace was not found.\",\"id\":"
+                                        + "\"vcenter.wcp.workload.notfound\"}]}");
+                    }
                     String status = "namespace_not_ready".equals(scenario)
                             ? "ERROR" : "RUNNING";
                     yield response(
@@ -173,6 +180,13 @@ public final class TestMain {
                 case "createSupervisorBackup" -> {
                     check(captures.equals(List.of(supervisor)),
                             "in-memory supervisor capture");
+                    if ("live_backup_unavailable".equals(scenario)) {
+                        yield response(404,
+                                "{\"error_type\":\"NOT_FOUND\",\"messages\":[{"
+                                        + "\"args\":[],\"default_message\":"
+                                        + "\"Supervisor was not found.\",\"id\":"
+                                        + "\"vcenter.wcp.supervisor.notfound\"}]}");
+                    }
                     yield response(200, quote(taskId));
                 }
                 case "getTask" -> {
@@ -438,6 +452,16 @@ public final class TestMain {
                     throw new AssertionError("expected PollLimitException");
                 } catch (VksSupervisorBackupClient.PollLimitException expected) {
                     // expected
+                }
+            }
+            case "live_namespace_404", "live_backup_unavailable" -> {
+                try {
+                    client.backupWhenDeploymentStable(request);
+                    throw new AssertionError("expected live ApiException");
+                } catch (VksSupervisorBackupClient.ApiException expected) {
+                    check(expected.statusCode() == 404, "live HTTP status");
+                    check(!expected.getMessage().contains(session), "session leaked");
+                    check(!expected.getMessage().contains(token), "token leaked");
                 }
             }
             default -> throw new IllegalArgumentException("unknown scenario");

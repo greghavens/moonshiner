@@ -26,7 +26,7 @@ const (
 	testToken   = "bearer-secret-vcf91-0147"
 	testTimeout = 2 * time.Second
 
-	contractSHA = "deb4263987f2edd01ee36fe9ac31519e2c455bec8d968b3f033674d13d1200cb"
+	contractSHA = "4a288552d27ddfa2c80ccc0f0f3d5e81471db7e61b95ee8880e0364a6eae7538"
 	sourcesSHA  = "e96f515ab56d09aaf3875a2c900cf6fc8b54a589b003c795b0c40315e2571cdb"
 )
 
@@ -52,7 +52,11 @@ type expectedClusterNetwork struct {
 
 type expectedVariable struct {
 	Name  string `json:"name"`
-	Value string `json:"value"`
+	Value any    `json:"value"`
+}
+
+type expectedClassReference struct {
+	Name string `json:"name"`
 }
 
 type expectedControlPlane struct {
@@ -70,11 +74,11 @@ type expectedWorkers struct {
 }
 
 type expectedTopology struct {
-	Class        string               `json:"class"`
-	Version      string               `json:"version"`
-	Variables    []expectedVariable   `json:"variables"`
-	ControlPlane expectedControlPlane `json:"controlPlane"`
-	Workers      *expectedWorkers     `json:"workers,omitempty"`
+	ClassRef     expectedClassReference `json:"classRef"`
+	Version      string                 `json:"version"`
+	ControlPlane expectedControlPlane   `json:"controlPlane"`
+	Workers      *expectedWorkers       `json:"workers,omitempty"`
+	Variables    []expectedVariable     `json:"variables"`
 }
 
 type expectedClusterSpec struct {
@@ -111,6 +115,101 @@ func TestProtectedContractAndProvenance(t *testing.T) {
 	}
 }
 
+func TestLiveValidatedBoundaries(t *testing.T) {
+	request := validRequest()
+	request.Namespace = "vmsp-platform"
+	request.ClusterName = "vcf-msr01"
+
+	t.Run("absent Supervisor namespace create", func(t *testing.T) {
+		server := contractmock.Start(t, contractmock.Scenario{
+			Namespace:         request.Namespace,
+			Supervisor:        "absent-supervisor",
+			ClusterName:       request.ClusterName,
+			ClusterClass:      request.ClusterClass,
+			KubernetesVersion: request.KubernetesVersion,
+			NamespaceStatus:   http.StatusNotFound,
+			ErrorPayload: map[string]any{
+				"error_type": "NOT_FOUND",
+				"messages": []any{map[string]any{
+					"args":            []any{},
+					"default_message": "Supervisor was not found.",
+					"id":              "vcenter.wcp.supervisor.notfound",
+				}},
+			},
+			Observations: []contractmock.Observation{
+				{Status: "True", Reason: "Available"},
+			},
+		})
+		client := mustClient(t, server.URL(), server.HTTPClient(), 0, 3)
+		_, err := client.Provision(context.Background(), request)
+		var apiError *vksprovision.APIError
+		if !errors.As(err, &apiError) ||
+			apiError.Operation != vksprovision.NamespaceCreateOperation ||
+			apiError.StatusCode != http.StatusNotFound {
+			t.Fatalf("error = %#v, want live namespace-create 404", err)
+		}
+		if records := server.Records(); len(records) != 1 {
+			t.Fatalf("namespace 404 made %d requests, want 1", len(records))
+		}
+	})
+
+	t.Run("strict admission rejection", func(t *testing.T) {
+		server := contractmock.Start(t, contractmock.Scenario{
+			Namespace:           request.Namespace,
+			Supervisor:          "supervisor-101",
+			ClusterName:         request.ClusterName,
+			ClusterClass:        request.ClusterClass,
+			KubernetesVersion:   request.KubernetesVersion,
+			ClusterCreateStatus: http.StatusUnprocessableEntity,
+			ErrorPayload: map[string]any{
+				"apiVersion": "v1",
+				"code":       422,
+				"kind":       "Status",
+				"reason":     "Invalid",
+				"status":     "Failure",
+			},
+			Observations: []contractmock.Observation{
+				{Status: "True", Reason: "Available"},
+			},
+		})
+		client := mustClient(t, server.URL(), server.HTTPClient(), 0, 3)
+		_, err := client.Provision(context.Background(), request)
+		var apiError *vksprovision.APIError
+		if !errors.As(err, &apiError) ||
+			apiError.Operation != vksprovision.ClusterCreateOperation ||
+			apiError.StatusCode != http.StatusUnprocessableEntity {
+			t.Fatalf("error = %#v, want live Kubernetes admission 422", err)
+		}
+		if records := server.Records(); len(records) != 2 {
+			t.Fatalf("admission rejection made %d requests, want 2", len(records))
+		}
+	})
+
+	t.Run("terminal Available response", func(t *testing.T) {
+		server := contractmock.Start(t, contractmock.Scenario{
+			Namespace:         request.Namespace,
+			Supervisor:        "supervisor-101",
+			ClusterName:       request.ClusterName,
+			ClusterClass:      "vsphere-9.1.2668",
+			KubernetesVersion: "v1.34.2",
+			ResourceVersion:   "2545994",
+			Observations: []contractmock.Observation{
+				{Status: "True", Reason: "Available", Message: ""},
+			},
+		})
+		client := mustClient(t, server.URL(), server.HTTPClient(), 0, 3)
+		result, err := client.Provision(context.Background(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.ResourceVersion != "2545994" ||
+			result.AvailableReason != "Available" ||
+			result.AvailableMessage != "" || result.PollCount != 0 {
+			t.Fatalf("terminal result = %#v", result)
+		}
+	})
+}
+
 func TestProvisionWireShapeAndTerminalPollingAreTableDriven(t *testing.T) {
 	zeroWorkers := int32(0)
 	threeWorkers := int32(3)
@@ -124,10 +223,9 @@ func TestProvisionWireShapeAndTerminalPollingAreTableDriven(t *testing.T) {
 				Supervisor:           "supervisor-domain-c8",
 				Namespace:            "payments-prod",
 				ClusterName:          "payments-vks",
-				ClusterClass:         "builtin-generic-v3.5.0",
-				KubernetesVersion:    "v1.34.1+vmware.1-vkr.4",
-				VMClass:              "guaranteed-medium",
-				StorageClass:         "vsan-default-storage-policy",
+				ClusterClass:         "vsphere-9.1.2668",
+				KubernetesVersion:    "v1.34.2",
+				TopologyVariables:    liveTopologyVariables(),
 				ControlPlaneReplicas: 3,
 			},
 		},
@@ -138,11 +236,12 @@ func TestProvisionWireShapeAndTerminalPollingAreTableDriven(t *testing.T) {
 				Namespace:            "team blue/β",
 				NamespaceDescription: "edge team — primary",
 				ClusterName:          "edge/vks + β?",
-				ClusterClass:         "builtin-generic-v3.5.0",
-				KubernetesVersion:    "v1.34.1+vmware.1-vkr.4",
-				VMClass:              "guaranteed-large",
-				StorageClass:         "vsan-esa-default-policy-raid5",
+				ClusterClass:         "vsphere-9.1.2668",
+				KubernetesVersion:    "v1.34.2",
+				TopologyVariables:    liveTopologyVariables(),
 				ControlPlaneReplicas: 3,
+				WorkerClass:          "vsphere-9.1.2668-worker",
+				WorkerName:           "workers",
 				WorkerReplicas:       &zeroWorkers,
 				PodCIDRs:             []string{"10.244.0.0/16"},
 				ServiceCIDRs:         []string{"10.96.0.0/12"},
@@ -154,11 +253,12 @@ func TestProvisionWireShapeAndTerminalPollingAreTableDriven(t *testing.T) {
 				Supervisor:           "supervisor-zone-2",
 				Namespace:            "research",
 				ClusterName:          "research-vks",
-				ClusterClass:         "builtin-generic-v3.5.0",
-				KubernetesVersion:    "v1.34.1+vmware.1-vkr.4",
-				VMClass:              "best-effort-medium",
-				StorageClass:         "gold-policy",
+				ClusterClass:         "vsphere-9.1.2668",
+				KubernetesVersion:    "v1.34.2",
+				TopologyVariables:    liveTopologyVariables(),
 				ControlPlaneReplicas: 1,
+				WorkerClass:          "vsphere-9.1.2668-worker",
+				WorkerName:           "workers",
 				WorkerReplicas:       &threeWorkers,
 				PodCIDRs:             []string{"172.16.0.0/16"},
 			},
@@ -420,13 +520,29 @@ func TestValidationAndCancellationHappenBeforeTraffic(t *testing.T) {
 		{"blank Cluster name", context.Background(), func(request *vksprovision.ProvisionRequest) { request.ClusterName = " " }},
 		{"blank Cluster class", context.Background(), func(request *vksprovision.ProvisionRequest) { request.ClusterClass = "" }},
 		{"blank Kubernetes version", context.Background(), func(request *vksprovision.ProvisionRequest) { request.KubernetesVersion = "" }},
-		{"blank VM class", context.Background(), func(request *vksprovision.ProvisionRequest) { request.VMClass = "" }},
-		{"blank storage class", context.Background(), func(request *vksprovision.ProvisionRequest) { request.StorageClass = "" }},
+		{"missing topology variables", context.Background(), func(request *vksprovision.ProvisionRequest) { request.TopologyVariables = nil }},
+		{"wrong topology variable order", context.Background(), func(request *vksprovision.ProvisionRequest) {
+			request.TopologyVariables[0], request.TopologyVariables[1] = request.TopologyVariables[1], request.TopologyVariables[0]
+		}},
 		{"zero control plane", context.Background(), func(request *vksprovision.ProvisionRequest) { request.ControlPlaneReplicas = 0 }},
+		{"blank worker class", context.Background(), func(request *vksprovision.ProvisionRequest) {
+			replicas := int32(3)
+			request.WorkerReplicas = &replicas
+			request.WorkerClass = ""
+		}},
+		{"blank worker name", context.Background(), func(request *vksprovision.ProvisionRequest) {
+			replicas := int32(3)
+			request.WorkerReplicas = &replicas
+			request.WorkerName = ""
+		}},
 	}
 	for _, test := range requestTests {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := request
+			candidate.TopologyVariables = append(
+				[]vksprovision.TopologyVariable(nil),
+				request.TopologyVariables...,
+			)
 			test.mutate(&candidate)
 			if _, err := client.Provision(test.context, candidate); err == nil {
 				t.Fatal("Provision() error = nil")
@@ -553,8 +669,12 @@ func expectedBody(request vksprovision.ProvisionRequest) expectedClusterBody {
 	var workers *expectedWorkers
 	if request.WorkerReplicas != nil {
 		workers = &expectedWorkers{MachineDeployments: []expectedMachineDeployment{
-			{Class: "node-pool", Name: "workers", Replicas: *request.WorkerReplicas},
+			{Class: request.WorkerClass, Name: request.WorkerName, Replicas: *request.WorkerReplicas},
 		}}
+	}
+	variables := make([]expectedVariable, len(request.TopologyVariables))
+	for index, variable := range request.TopologyVariables {
+		variables[index] = expectedVariable{Name: variable.Name, Value: variable.Value}
 	}
 	return expectedClusterBody{
 		APIVersion: "cluster.x-k8s.io/v1beta2",
@@ -566,14 +686,11 @@ func expectedBody(request vksprovision.ProvisionRequest) expectedClusterBody {
 		Spec: expectedClusterSpec{
 			ClusterNetwork: network,
 			Topology: expectedTopology{
-				Class:   request.ClusterClass,
-				Version: request.KubernetesVersion,
-				Variables: []expectedVariable{
-					{Name: "vmClass", Value: request.VMClass},
-					{Name: "storageClass", Value: request.StorageClass},
-				},
+				ClassRef:     expectedClassReference{Name: request.ClusterClass},
+				Version:      request.KubernetesVersion,
 				ControlPlane: expectedControlPlane{Replicas: request.ControlPlaneReplicas},
 				Workers:      workers,
+				Variables:    variables,
 			},
 		},
 	}
@@ -707,12 +824,28 @@ func validRequest() vksprovision.ProvisionRequest {
 		Supervisor:           "supervisor-1",
 		Namespace:            "team-a",
 		ClusterName:          "team-a-vks",
-		ClusterClass:         "builtin-generic-v3.5.0",
-		KubernetesVersion:    "v1.34.1+vmware.1-vkr.4",
-		VMClass:              "guaranteed-medium",
-		StorageClass:         "vsan-default-storage-policy",
+		ClusterClass:         "vsphere-9.1.2668",
+		KubernetesVersion:    "v1.34.2",
+		TopologyVariables:    liveTopologyVariables(),
 		ControlPlaneReplicas: 3,
 	}
+}
+
+func liveTopologyVariables() []vksprovision.TopologyVariable {
+	names := []string{
+		"datastore", "dnsImageTag", "imageRepository", "infraServerThumbprint",
+		"network", "infraServerURL", "resourcePool", "vmTemplate", "datacenter",
+		"etcdImageTag", "folder", "controlPlaneIpAddr", "credsSecretName",
+		"kubeVipPodManifest",
+	}
+	variables := make([]vksprovision.TopologyVariable, len(names))
+	for index, name := range names {
+		variables[index] = vksprovision.TopologyVariable{
+			Name:  name,
+			Value: map[string]any{"liveValidated": true, "name": name},
+		}
+	}
+	return variables
 }
 
 func assertFileSHA(t *testing.T, path, want string) {

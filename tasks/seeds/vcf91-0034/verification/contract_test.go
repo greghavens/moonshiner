@@ -217,7 +217,7 @@ func TestSnapshotRefreshesOnlyInterruptedOperationAndSortsEveryResponse(
 			operationID:   "getDomains",
 			method:        http.MethodGet,
 			path:          "/v1/domains",
-			rawQuery:      "pageNumber=0&pageSize=100",
+			rawQuery:      "pageNumber=1&pageSize=100",
 			authorization: "Bearer " + runtime.AccessToken,
 		},
 		{
@@ -245,7 +245,7 @@ func TestSnapshotRefreshesOnlyInterruptedOperationAndSortsEveryResponse(
 			operationID:   "getDomains",
 			method:        http.MethodGet,
 			path:          "/v1/domains",
-			rawQuery:      "pageNumber=0&pageSize=100",
+			rawQuery:      "pageNumber=1&pageSize=100",
 			authorization: "Bearer " + runtime.NewAccessToken,
 		},
 		{

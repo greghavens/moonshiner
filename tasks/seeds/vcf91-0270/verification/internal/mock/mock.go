@@ -18,8 +18,8 @@
 // make retry safety observable, and are not derived from the contract:
 //
 //   - createCustomGroup rejects a group whose resource key duplicates one that
-//     already exists with 409 Conflict. A real appliance likewise refuses to
-//     hold two custom groups under the same resource key.
+//     already exists with 500 Internal Server Error, matching the deployed VCF
+//     9.1 appliance.
 //   - The fault injectors below simulate a lost response and a competing
 //     writer. They are test scaffolding, not API surface.
 package mock
@@ -205,7 +205,9 @@ func (s *Server) InsertBeforeNextCreate(name, adapterKindKey, resourceKindKey st
 			"adapterKindKey":  adapterKindKey,
 			"resourceKindKey": resourceKindKey,
 		},
-		"membershipDefinition": map[string]any{},
+		"membershipDefinition": map[string]any{
+			"includedResources": []any{"00000000-0000-4000-8000-000000000001"},
+		},
 	})
 }
 
@@ -341,6 +343,15 @@ func (s *Server) createCustomGroup(w http.ResponseWriter, r *http.Request, rec *
 			return
 		}
 	}
+	membership, _ := decoded["membershipDefinition"].(map[string]any)
+	included, _ := membership["includedResources"].([]any)
+	if len(included) == 0 {
+		rec.Status = http.StatusBadRequest
+		s.record(*rec)
+		s.fail(w, http.StatusBadRequest,
+			"membershipDefinition requires at least one included resource")
+		return
+	}
 
 	key, err := resourceKeyOf(decoded)
 	if err != nil {
@@ -360,9 +371,9 @@ func (s *Server) createCustomGroup(w http.ResponseWriter, r *http.Request, rec *
 	for _, g := range s.groups {
 		if k, err := resourceKeyOf(g); err == nil && k == key {
 			s.mu.Unlock()
-			rec.Status = http.StatusConflict
+			rec.Status = http.StatusInternalServerError
 			s.record(*rec)
-			s.fail(w, http.StatusConflict, fmt.Sprintf(
+			s.fail(w, http.StatusInternalServerError, fmt.Sprintf(
 				"a custom group with resource key %s already exists", key))
 			return
 		}

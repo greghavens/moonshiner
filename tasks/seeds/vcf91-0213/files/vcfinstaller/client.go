@@ -21,29 +21,29 @@ type ProxyConfiguration struct {
 	IsAuthenticated  *bool   `json:"isAuthenticated,omitempty"`
 }
 
-// DepotAccount contains only writable DepotAccount credential members.
-type DepotAccount struct {
-	Username               *string `json:"username,omitempty"`
-	Password               *string `json:"password,omitempty"`
-	DownloadToken          *string `json:"downloadToken,omitempty"`
-	DownloadActivationCode *string `json:"downloadActivationCode,omitempty"`
+// ServiceNodeAddress identifies one supported external-service endpoint.
+type ServiceNodeAddress struct {
+	Type  string `json:"type"`
+	Value string `json:"value"`
 }
 
-// DepotConfiguration selects online or offline depot access. IsOfflineDepot
-// is required by the specification, so false is serialized when this object is
-// present.
-type DepotConfiguration struct {
-	IsOfflineDepot bool    `json:"isOfflineDepot"`
-	Hostname       *string `json:"hostname,omitempty"`
-	Port           *int32  `json:"port,omitempty"`
-	URL            *string `json:"url,omitempty"`
+// ServiceNode contains one node and its addresses.
+type ServiceNode struct {
+	Name      string               `json:"name"`
+	Addresses []ServiceNodeAddress `json:"addresses"`
 }
 
-// DepotSettings is the writable subset of the DepotSettings request schema.
-type DepotSettings struct {
-	VMwareAccount      *DepotAccount       `json:"vmwareAccount,omitempty"`
-	OfflineAccount     *DepotAccount       `json:"offlineAccount,omitempty"`
-	DepotConfiguration *DepotConfiguration `json:"depotConfiguration,omitempty"`
+// ServiceConfig contains one external service configuration.
+type ServiceConfig struct {
+	Name  string        `json:"name"`
+	Type  string        `json:"type"`
+	Key   string        `json:"key"`
+	Nodes []ServiceNode `json:"nodes"`
+}
+
+// ServicesConfig is the supported external-services replacement body.
+type ServicesConfig struct {
+	Services []ServiceConfig `json:"services"`
 }
 
 // Outcome summarizes the three-step workflow without claiming that an HTTP
@@ -136,6 +136,6 @@ func NewClient(baseURL, accessToken string, httpClient *http.Client) (*Client, e
 
 // ConfigureDepotAccess applies the three contract operations in order and
 // returns an exact partial-progress report on failure.
-func (c *Client) ConfigureDepotAccess(ctx context.Context, proxy ProxyConfiguration, depot DepotSettings) (ChangeReport, error) {
+func (c *Client) ConfigureDepotAccess(ctx context.Context, proxy ProxyConfiguration, services ServicesConfig) (ChangeReport, error) {
 	return ChangeReport{}, ErrNotImplemented
 }

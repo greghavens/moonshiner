@@ -118,7 +118,7 @@ class Handler(BaseHTTPRequestHandler):
             self._not_found()
             return
         self._json(
-            201,
+            200,
             {
                 "accessToken": "loopback-access-token",
                 "refreshToken": {"id": "loopback-refresh-token"},

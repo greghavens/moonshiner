@@ -64,10 +64,8 @@ class ContractMock(ThreadingHTTPServer):
             operation=named["ListTraceflowObservations"],
         )
 
+        self.alarms = alarms
         self.responses = {
-            "ListAlarms": json.dumps(
-                alarms, ensure_ascii=False, separators=(",", ":")
-            ).encode("utf-8"),
             "ListTraceflowObservations": json.dumps(
                 observations, ensure_ascii=False, separators=(",", ":")
             ).encode("utf-8"),
@@ -123,10 +121,17 @@ class ContractMock(ThreadingHTTPServer):
 
     def operation_for(self, raw_target: str) -> str | None:
         split = urlsplit(raw_target)
-        if split.query or split.fragment:
+        if split.fragment:
             return None
         if split.path == self.alarm_target:
-            return "ListAlarms"
+            if not split.query:
+                return "ListAlarmsFirst"
+            if split.query == "cursor=alarm-cursor-two":
+                return "ListAlarmsSecond"
+            return None
+
+        if split.query:
+            return None
 
         prefix, suffix = self.observation_template.split("{traceflow-id}")
         if not split.path.startswith(prefix) or not split.path.endswith(suffix):
@@ -134,7 +139,9 @@ class ContractMock(ThreadingHTTPServer):
         encoded_id = split.path[len(prefix) : len(split.path) - len(suffix)]
         if not encoded_id or "/" in encoded_id:
             return None
-        if unquote(encoded_id) != "tf incident/42":
+        if "%2f" in encoded_id.lower():
+            return "EncodedSlash"
+        if unquote(encoded_id) != "tf-incident-42":
             return None
         return "ListTraceflowObservations"
 
@@ -166,6 +173,28 @@ class MockHandler(BaseHTTPRequestHandler):
         if self.command != "GET" or operation is None:
             payload = b'{"error":"route is not in the pinned contract"}'
             self.send_response(404)
+        elif operation == "EncodedSlash":
+            payload = (
+                b'{"error_code":512,"error_message":"Encoded slash character '
+                b'is not allowed in the URI.","module_name":"common-services"}'
+            )
+            self.send_response(400)
+        elif operation == "ListAlarmsFirst":
+            page = dict(self.server.alarms)
+            page["results"] = self.server.alarms["results"][:2]
+            page["cursor"] = "alarm-cursor-two"
+            payload = json.dumps(
+                page, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            self.send_response(200)
+        elif operation == "ListAlarmsSecond":
+            page = dict(self.server.alarms)
+            page["results"] = self.server.alarms["results"][2:]
+            page.pop("cursor", None)
+            payload = json.dumps(
+                page, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            self.send_response(200)
         else:
             payload = self.server.responses[operation]
             self.send_response(200)

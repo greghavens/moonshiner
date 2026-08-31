@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -20,6 +21,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 final class ContractMockServer implements AutoCloseable {
+    private static final String OLD_AUTH = basic("group-user-old", "group-password-old");
+    private static final String FRESH_AUTH = basic("group-user-fresh", "group-password-fresh");
     record Operation(String operationId, String method, String path) {}
 
     record LoggedRequest(
@@ -128,10 +131,22 @@ final class ContractMockServer implements AutoCloseable {
             return;
         }
 
+        if (rawPath.contains("%20")) {
+            reply(exchange, 400,
+                    "{\"error_code\":500195,\"error_message\":\"The identifier contains invalid characters.\",\"module_name\":\"Policy\"}");
+            return;
+        }
+        if (rawPath.toUpperCase().contains("%2F")) {
+            reply(exchange, 400,
+                    "{\"error_code\":512,\"error_message\":\"Encoded slash character is not allowed in the URI.\",\"module_name\":\"common-services\"}");
+            return;
+        }
+
         String authorization = exchange.getRequestHeaders().getFirst("Authorization");
         if ("PatchGroupForDomain".equals(operationId)) {
-            if (!"Bearer token-old".equals(authorization)) {
-                reply(exchange, 403, "{\"error\":\"unexpected authorization\"}");
+            if (!OLD_AUTH.equals(authorization)) {
+                reply(exchange, 403,
+                        "{\"error_code\":403,\"error_message\":\"The credentials were incorrect or the account specified has been locked.\",\"module_name\":\"common-services\"}");
                 return;
             }
             storedGroup = body.clone();
@@ -139,33 +154,35 @@ final class ContractMockServer implements AutoCloseable {
             return;
         }
 
-        if ("Bearer token-old".equals(authorization)) {
-            reply(exchange, 401, "{\"error\":\"access token expired\"}");
-        } else if ("Bearer token-fresh".equals(authorization) && storedGroup != null) {
+        if (OLD_AUTH.equals(authorization)) {
+            reply(exchange, 403,
+                    "{\"error_code\":403,\"error_message\":\"The credentials were incorrect or the account specified has been locked.\",\"module_name\":\"common-services\"}");
+        } else if (FRESH_AUTH.equals(authorization) && storedGroup != null) {
             reply(exchange, 200,
-                    "{\"id\":\"web/apps\",\"display_name\":\"Web workloads\","
+                    "{\"id\":\"web-apps\",\"display_name\":\"Web workloads\","
                             + "\"resource_type\":\"Group\","
-                            + "\"path\":\"/infra/domains/tenant a/groups/web/apps\"}");
+                            + "\"path\":\"/infra/domains/tenant-a/groups/web-apps\"}");
         } else {
             reply(exchange, 403, "{\"error\":\"unexpected authorization or missing group\"}");
         }
     }
 
     private String identify(String method, String rawPath) {
-        String expectedPath = route(
-                "PatchGroupForDomain",
-                "tenant%20a",
-                "web%2Fapps");
         List<String> matches = new ArrayList<>();
         for (Operation operation : operations.values()) {
-            if (operation.method().equals(method)
-                    && (basePath + operation.path()
-                    .replace("{domain-id}", "tenant%20a")
-                    .replace("{group-id}", "web%2Fapps")).equals(rawPath)) {
-                matches.add(operation.operationId());
+            for (String[] ids : List.of(
+                    new String[] {"tenant-a", "web-apps"},
+                    new String[] {"tenant%20a", "web-apps"},
+                    new String[] {"tenant-a", "web%2Fapps"})) {
+                String candidate = basePath + operation.path()
+                        .replace("{domain-id}", ids[0])
+                        .replace("{group-id}", ids[1]);
+                if (operation.method().equals(method) && candidate.equals(rawPath)) {
+                    matches.add(operation.operationId());
+                }
             }
         }
-        if (matches.size() == 1 && expectedPath.equals(rawPath)) {
+        if (matches.size() == 1) {
             return matches.get(0);
         }
         return null;
@@ -208,6 +225,11 @@ final class ContractMockServer implements AutoCloseable {
             exchange.getResponseBody().write(bytes);
         }
         exchange.close();
+    }
+
+    private static String basic(String username, String password) {
+        return "Basic " + Base64.getEncoder().encodeToString(
+                (username + ":" + password).getBytes(StandardCharsets.UTF_8));
     }
 
     @Override

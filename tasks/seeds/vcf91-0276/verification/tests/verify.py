@@ -25,10 +25,10 @@ EXPECTED_OPERATIONS = [
     ("releaseToken", "POST", "/api/auth/token/release"),
 ]
 PROTECTED_HASHES = {
-    "docs/contract.json": "43dc3ffefeee803ca8c75d31d6065c20a581a0def7c1f23ff18a191a9fc5021a",
+    "docs/contract.json": "47c08b4f0be46096a236202e770b46de6d4650386c386fb70c356036485a3b85",
     "docs/official_sources.json": "16406c6baf665bbbc54f64d6b617a7305d684736524828037e8f5f12917f636f",
     "tests/TestMain.java": "ad806f7e77b70c455e5dc9ba4aea81f033c336700c71bfab45c43c6a7ef390d5",
-    "tests/mock_server.py": "69ddd31ab84bb27f860250e6e63a55965a324bd23657ca6883bf27e7501bab1d",
+    "tests/mock_server.py": "79a80a26ef64d715e3ce15484d8eaf7fe104758d62426689924ef55786ef2db2",
 }
 ACQUIRE = BASE_PATH + "/api/auth/token/acquire"
 RESOURCES = BASE_PATH + "/api/resources"

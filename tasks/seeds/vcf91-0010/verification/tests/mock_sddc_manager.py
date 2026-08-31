@@ -291,7 +291,7 @@ class ContractHandler(BaseHTTPRequestHandler):
             return 400, self._error(
                 "INVALID_CONTENT_TYPE", "JSON content type required", "content-type"
             )
-        return 201, {
+        return 200, {
             "accessToken": self.server.state.old_access_token,
             "refreshToken": {"id": self.server.state.refresh_token_id},
         }

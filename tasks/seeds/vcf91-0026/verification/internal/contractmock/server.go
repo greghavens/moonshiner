@@ -167,7 +167,7 @@ func operationFor(method, path string) string {
 func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 	status := s.plan.CreateStatus
 	if status == 0 {
-		status = http.StatusCreated
+		status = http.StatusOK
 	}
 	if r.URL.RawQuery != "" {
 		writeJSON(w, http.StatusBadRequest, errorEnvelope("TOKEN_QUERY"))
@@ -211,7 +211,7 @@ func (s *Server) getDomains(w http.ResponseWriter, r *http.Request) {
 	}
 	pageNumber, pageErr := strconv.Atoi(query.Get("pageNumber"))
 	pageSize, sizeErr := strconv.Atoi(query.Get("pageSize"))
-	if pageErr != nil || sizeErr != nil || pageNumber < 0 || pageSize < 1 {
+	if pageErr != nil || sizeErr != nil || pageNumber < 1 || pageSize < 1 {
 		writeJSON(w, http.StatusBadRequest, errorEnvelope("DOMAIN_PAGE"))
 		return
 	}
@@ -225,8 +225,8 @@ func (s *Server) getDomains(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	switch {
-	case authorization == oldAuthorization && pageNumber == 0 && !refreshed:
-		// Page zero succeeds before the initial access token expires.
+	case authorization == oldAuthorization && pageNumber == 1 && !refreshed:
+		// Page one succeeds before the initial access token expires.
 	case authorization == newAuthorization && refreshed && !s.plan.RejectRefreshedToken:
 		// The interrupted and remaining pages use the refreshed access token.
 	default:
@@ -243,7 +243,7 @@ func (s *Server) getDomains(w http.ResponseWriter, r *http.Request) {
 	if totalElements > 0 {
 		totalPages = (totalElements + pageSize - 1) / pageSize
 	}
-	start := pageNumber * pageSize
+	start := (pageNumber - 1) * pageSize
 	if start > totalElements {
 		start = totalElements
 	}

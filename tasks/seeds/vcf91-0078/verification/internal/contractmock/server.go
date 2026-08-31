@@ -35,12 +35,10 @@ type queryParameter struct {
 	Type string `json:"type"`
 }
 
-// Scenario controls the access-token transition. All collection response data
-// remains a deterministic property of this protected loopback fixture.
+// Scenario supplies the Basic credentials accepted by the protected fixture.
 type Scenario struct {
-	ExpiredToken string
-	FreshToken   string
-	ExpireOnce   bool
+	Username string
+	Password string
 }
 
 // LoggedRequest is the synchronized assertion surface used by the verifier.
@@ -80,7 +78,6 @@ type Server struct {
 
 	mu                  sync.Mutex
 	requests            []LoggedRequest
-	tokenExpired        bool
 	successfulResponses int
 }
 
@@ -120,10 +117,9 @@ func New(contractPath string, scenario Scenario) (*Server, error) {
 	if !equalStrings(gotParameters, wantParameters) {
 		return nil, fmt.Errorf("unexpected contract query parameters")
 	}
-	if !validFixtureToken(scenario.ExpiredToken) ||
-		!validFixtureToken(scenario.FreshToken) ||
-		scenario.ExpiredToken == scenario.FreshToken {
-		return nil, fmt.Errorf("scenario requires two distinct safe tokens")
+	if !validFixtureCredential(scenario.Username) || !validFixtureCredential(scenario.Password) ||
+		strings.Contains(scenario.Username, ":") {
+		return nil, fmt.Errorf("scenario requires safe Basic credentials")
 	}
 
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -179,9 +175,6 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 
 	w.Header().Set("Content-Type", "application/json")
-	if status == http.StatusUnauthorized {
-		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
-	}
 	w.WriteHeader(status)
 	_, _ = w.Write(response)
 }
@@ -191,9 +184,9 @@ func (s *Server) response(opID string, r *http.Request) (int, []byte) {
 		return http.StatusNotFound, []byte(`{"error_message":"undeclared route"}`)
 	}
 
-	token, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if !bearer || token == "" {
-		return http.StatusUnauthorized, []byte(`{"error_code":40101,"error_message":"access token required","module_name":"common-services"}`)
+	username, password, basic := r.BasicAuth()
+	if !basic || username != s.scenario.Username || password != s.scenario.Password {
+		return http.StatusForbidden, []byte(`{"error_code":403,"error_message":"The credentials were incorrect or the account specified has been locked.","module_name":"common-services","details":"Authentication failed"}`)
 	}
 
 	cursor := r.URL.Query().Get("cursor")
@@ -204,18 +197,6 @@ func (s *Server) response(opID string, r *http.Request) (int, []byte) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if token != s.scenario.ExpiredToken && token != s.scenario.FreshToken {
-		return http.StatusForbidden, []byte(`{"error_code":40301,"error_message":"token not recognized","module_name":"common-services","details":"credential rejected"}`)
-	}
-	if s.tokenExpired && token == s.scenario.ExpiredToken {
-		return http.StatusUnauthorized, []byte(`{"error_code":40102,"error_message":"access token expired","module_name":"common-services"}`)
-	}
-	if s.scenario.ExpireOnce && cursor == "cursor-two" &&
-		token == s.scenario.ExpiredToken {
-		s.tokenExpired = true
-		return http.StatusUnauthorized, []byte(`{"error_code":40102,"error_message":"access token expired","module_name":"common-services"}`)
-	}
-
 	s.successfulResponses++
 	results := append([]segment(nil), currentPage.Results...)
 	// Odd responses are reversed and even responses use fixture order. Because
@@ -284,9 +265,9 @@ func declaredQueryOnly(target *url.URL, parameters []queryParameter) bool {
 	return true
 }
 
-func validFixtureToken(token string) bool {
-	return token != "" && token == strings.TrimSpace(token) &&
-		!strings.ContainsAny(token, "\r\n")
+func validFixtureCredential(value string) bool {
+	return value != "" && value == strings.TrimSpace(value) &&
+		!strings.ContainsAny(value, "\r\n")
 }
 
 func (s *Server) appendLog(entry LoggedRequest) {

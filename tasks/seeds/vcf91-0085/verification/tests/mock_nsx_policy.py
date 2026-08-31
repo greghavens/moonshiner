@@ -167,8 +167,8 @@ class Handler(BaseHTTPRequestHandler):
         ):
             self._respond(
                 operation_id,
-                401,
-                b'{"error_message":"credential rejected"}',
+                403,
+                b'{"error_code":403,"error_message":"The credentials were incorrect or the account specified has been locked.","module_name":"common-services"}',
             )
             return
 
@@ -201,8 +201,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.server.retired_path.exists():
                 self._respond(
                     operation_id,
-                    401,
-                    b'{"error_message":"old credential retired too early"}',
+                    403,
+                    b'{"error_code":403,"error_message":"The credentials were incorrect or the account specified has been locked.","module_name":"common-services"}',
                 )
                 return
             self._respond(operation_id, 200, self._page_body("central-old"))

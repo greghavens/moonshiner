@@ -89,16 +89,7 @@ class FixtureState:
             if self.reverse_next:
                 elements.reverse()
             self.reverse_next = not self.reverse_next
-        count = len(elements)
-        return {
-            "elements": elements,
-            "pageMetadata": {
-                "pageNumber": 0,
-                "pageSize": count,
-                "totalElements": count,
-                "totalPages": 0 if count == 0 else 1,
-            },
-        }
+        return {"elements": elements}
 
 
 class FixtureServer(ThreadingHTTPServer):
@@ -204,7 +195,7 @@ class Handler(BaseHTTPRequestHandler):
             item.get("id") for item in payload["elements"]
         ]
         if state.scenario["fault"] == "bad_page":
-            payload["pageMetadata"]["pageSize"] += 1
+            payload["elements"] = "not-an-array"
         status = 201 if state.scenario["fault"] == "get_201" else 200
         self._send_json(entry, status, payload)
 

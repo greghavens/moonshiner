@@ -29,8 +29,8 @@ LOG_OPERATION = "core/v1:namespaced-pod-log:read"
 
 # verify.py is protected by the harness. These hashes protect every other fixture.
 PROTECTED_SHA256 = {
-    "tests/TestMain.java": "4917bc9df91d2cc14c57514801a9d9d32fa0bbefad36690dfaa511e5266e540b",
-    "tools/contract_mock.py": "2b3b8ea536d973ac6d45fce4b2638406ac1fbe473ba4a9e6c50f28eb996a074b",
+    "tests/TestMain.java": "dd2bec786217fb569a3084167830cf40963867e5a59a6ee65a546d82e342e7c4",
+    "tools/contract_mock.py": "be587c64c8c9b08d1bfb47589c94ccd271e28f3973bd78e0255c95fb54032fec",
     "docs/contract.json": "b473ed9eb2f66656dccfaa086c3cf0eb665a07e02e22a2b0c6be789cee97734b",
     "docs/official_sources.json": "a63b66713359cf62a08b33af023e7d7d822e8dd600430d99c9817f5d0a3837ec",
 }
@@ -330,7 +330,7 @@ def assert_log_wire(
     require(entry["method"] == "GET", "log method mismatch")
     require(entry["rawTarget"] == expected, "log raw target mismatch")
     require(
-        header_values(entry, "Accept") == ["text/plain"],
+        header_values(entry, "Accept") == ["application/json"],
         "log Accept mismatch",
     )
     require(
@@ -375,6 +375,8 @@ def verify_log(
         values: dict[str, str],
 ) -> None:
     expected_count = {
+        "blank_discovery": 1,
+        "live_empty": 3,
         "correlated": 3,
         "event_only": 3,
         "log_only": 3,
@@ -554,6 +556,8 @@ def main() -> int:
                 "compilation failed:\n" + compile_result.stderr[-3000:],
             )
             for scenario in (
+                "blank_discovery",
+                "live_empty",
                 "correlated",
                 "event_only",
                 "log_only",

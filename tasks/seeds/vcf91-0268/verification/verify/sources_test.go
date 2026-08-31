@@ -26,7 +26,7 @@ const (
 )
 
 // contractedOperationIDs are the operationIds this integration is built on.
-var contractedOperationIDs = []string{"acquireToken", "addResourcesProperties", "getResources"}
+var contractedOperationIDs = []string{"acquireToken", "addResourcesProperties", "getResources", "releaseToken"}
 
 // specQueryParams is the complete set of query parameter names the
 // specification declares for getResources. A contract may name a subset.
@@ -102,6 +102,7 @@ func TestContractMatchesSpecification(t *testing.T) {
 		{"acquireToken", "POST", "/api/auth/token/acquire", false, 200, "username-password", "auth-token"},
 		{"getResources", "GET", "/api/resources", true, 200, "", "resources"},
 		{"addResourcesProperties", "POST", "/api/resources/properties", true, 200, "resources-property-contents", ""},
+		{"releaseToken", "POST", "/api/auth/token/release", true, 200, "", ""},
 	}
 	for _, want := range routes {
 		t.Run("operation_"+want.operationID, func(t *testing.T) {
@@ -128,7 +129,7 @@ func TestContractMatchesSpecification(t *testing.T) {
 	}
 
 	t.Run("query_parameters", func(t *testing.T) {
-		for _, id := range []string{"acquireToken", "addResourcesProperties"} {
+		for _, id := range []string{"acquireToken", "addResourcesProperties", "releaseToken"} {
 			op, _ := c.Operation(id)
 			if len(op.QueryParams) != 0 {
 				t.Errorf("operation %s declares queryParams %v, want none", id, op.QueryParams)

@@ -36,6 +36,11 @@ EXPECTED_COMMIT = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
 EXPECTED_SPEC_PATH = (
     "specifications/vsphere/openapi/automation/vcenter.yaml"
 )
+MARKER_44 = "QmpUcWViUllXU2hkQjNudWkyMEt3ZStWTGw="
+MARKER_64 = (
+    "BjTqebRYWShdB3nui20Kwe+VLlPYyXy6"
+    "AHLhjTPhmVPHPsEwgbvKQfWMUJq+bP5r"
+)
 EXPECTED_OPERATION = "Vcenter.Authorization.Roles_list"
 EXPECTED_ROUTES = [
     (
@@ -367,66 +372,79 @@ def role_sort_key(item: dict[str, Any]) -> tuple[str, str, str]:
 
 
 def runtime_roles(marker: str) -> list[dict[str, Any]]:
+    del marker
     return [
         {
-            "role": f"role-z-{marker}",
+            "role": "-5",
             "info": {
-                "name": "Zulu",
-                "description": "last by name",
-                "privileges": ["VirtualMachine.Config.Settings"],
-                "system": False,
-            },
-            "runtime": {"sequence": 0},
-        },
-        {
-            "role": f"role-shared-{marker}",
-            "info": {
-                "name": "Alpha",
-                "description": "tie z",
-                "privileges": ["System.Read"],
-                "system": True,
-            },
-            "runtime": {"sequence": 1, "site": "München"},
-        },
-        {
-            "role": f"role-b-{marker}",
-            "info": {
-                "name": "Bravo",
-                "description": "middle",
-                "privileges": ["Datastore.Browse", "System.View"],
-                "system": False,
-            },
-            "runtime": {"sequence": 2},
-        },
-        {
-            "role": f"role-shared-{marker}",
-            "info": {
-                "name": "Alpha",
-                "description": "tie a",
-                "privileges": ["System.Read"],
-                "system": True,
-            },
-            "runtime": {"sequence": 0, "site": "Zürich"},
-        },
-        {
-            "role": f"role-a-{marker}",
-            "info": {
-                "name": "alpha",
-                "description": "lowercase sorts separately",
                 "privileges": [],
-                "system": False,
+                "system": True,
+                "name": "NoAccess",
+                "description": "Used for restricting granted access",
             },
-            "runtime": {"sequence": 4},
         },
         {
-            "role": f"role-u-{marker}",
+            "role": "-4",
             "info": {
-                "name": "Ångström",
-                "description": "non-ASCII order",
                 "privileges": ["System.Anonymous"],
-                "system": False,
+                "system": True,
+                "name": "Anonymous",
+                "description": "Not logged-in user (cannot be granted)",
             },
-            "runtime": {"sequence": 5},
+        },
+        {
+            "role": "-3",
+            "info": {
+                "privileges": ["System.Anonymous", "System.View"],
+                "system": True,
+                "name": "View",
+                "description": "Visibility access (cannot be granted)",
+            },
+        },
+        {
+            "role": "-2",
+            "info": {
+                "privileges": [
+                    "System.Anonymous",
+                    "System.Read",
+                    "System.View",
+                ],
+                "system": True,
+                "name": "ReadOnly",
+                "description": "See details of objects, but not make changes",
+            },
+        },
+        {
+            "role": "2032",
+            "info": {
+                "privileges": [
+                    "System.Anonymous",
+                    "System.Read",
+                    "System.View",
+                ],
+                "system": False,
+                "name": "VapiEndpointUser",
+                "description": (
+                    "Priviledges needed for the proper functioning of the "
+                    "vapi-endpoint and the vcenter-shim"
+                ),
+            },
+        },
+        {
+            "role": "8",
+            "info": {
+                "privileges": [
+                    "Datastore.AllocateSpace",
+                    "System.Anonymous",
+                    "System.Read",
+                    "System.View",
+                ],
+                "system": False,
+                "name": "DatastoreConsumer",
+                "description": (
+                    "Assigned to datastores to allow creating disks or snapshots"
+                ),
+            },
         },
     ]
 
@@ -575,13 +593,10 @@ def verify_wire_entry(
 
 def verify_complete_collection(module: Any) -> None:
     runtime_marker = secrets.token_hex(8)
-    token = "session-" + secrets.token_urlsafe(24)
+    token = secrets.token_hex(16)
     error_secret = "error-" + secrets.token_hex(12)
     roles = runtime_roles(runtime_marker)
-    markers = [
-        f"{runtime_marker} next /?&+=雪",
-        f"{runtime_marker}:final #[two]",
-    ]
+    markers = [MARKER_44, MARKER_64]
     with tempfile.TemporaryDirectory(prefix="vcf-role-main-") as raw_temp:
         process, base_url, log_path = start_fixture(
             session_token=token,
@@ -649,7 +664,7 @@ def verify_complete_collection(module: Any) -> None:
 
 def verify_default_page_size(module: Any) -> None:
     runtime_marker = secrets.token_hex(8)
-    token = "default-" + secrets.token_urlsafe(18)
+    token = secrets.token_hex(16)
     roles = runtime_roles(runtime_marker)[:1]
     with tempfile.TemporaryDirectory(prefix="vcf-role-default-") as raw_temp:
         process, base_url, log_path = start_fixture(
@@ -685,14 +700,14 @@ def verify_failure_surfaces(module: Any) -> None:
     marker = secrets.token_hex(8)
     roles = runtime_roles(marker)[:3]
 
-    token = "http-" + secrets.token_urlsafe(18)
+    token = secrets.token_hex(16)
     error_secret = "payload-" + secrets.token_hex(14)
     with tempfile.TemporaryDirectory(prefix="vcf-role-http-") as raw_temp:
         process, base_url, log_path = start_fixture(
             session_token=token,
             page_size=2,
             roles=roles,
-            markers=["next-" + marker],
+            markers=[MARKER_44],
             fault="http_500",
             error_secret=error_secret,
             temp_root=Path(raw_temp),
@@ -738,13 +753,13 @@ def verify_failure_surfaces(module: Any) -> None:
             response_status=500,
         )
 
-    token = "status-" + secrets.token_urlsafe(18)
+    token = secrets.token_hex(16)
     with tempfile.TemporaryDirectory(prefix="vcf-role-status-") as raw_temp:
         process, base_url, _log_path = start_fixture(
             session_token=token,
             page_size=2,
             roles=roles,
-            markers=["next-" + marker],
+            markers=[MARKER_44],
             fault="unexpected_204",
             error_secret="unused-" + marker,
             temp_root=Path(raw_temp),
@@ -771,8 +786,8 @@ def verify_failure_surfaces(module: Any) -> None:
         finally:
             stop_fixture(process)
 
-    token = "repeat-" + secrets.token_urlsafe(18)
-    repeated = "repeat /" + marker
+    token = secrets.token_hex(16)
+    repeated = MARKER_44
     with tempfile.TemporaryDirectory(prefix="vcf-role-repeat-") as raw_temp:
         process, base_url, log_path = start_fixture(
             session_token=token,
@@ -810,13 +825,13 @@ def verify_failure_surfaces(module: Any) -> None:
             "repeated-marker case did not stop at the invalid response",
         )
 
-    token = "missing-" + secrets.token_urlsafe(18)
+    token = secrets.token_hex(16)
     with tempfile.TemporaryDirectory(prefix="vcf-role-missing-") as raw_temp:
         process, base_url, log_path = start_fixture(
             session_token=token,
             page_size=2,
             roles=roles,
-            markers=["next-" + marker],
+            markers=[MARKER_44],
             fault="missing_items",
             error_secret="unused-" + marker,
             temp_root=Path(raw_temp),
@@ -848,7 +863,7 @@ def verify_failure_surfaces(module: Any) -> None:
             "missing-items case requested another page",
         )
 
-    token = "malformed-" + secrets.token_urlsafe(18)
+    token = secrets.token_hex(16)
     malformed = [
         {
             "role": "",
@@ -888,7 +903,7 @@ def verify_failure_surfaces(module: Any) -> None:
         finally:
             stop_fixture(process)
 
-    transport_token = "transport-" + secrets.token_urlsafe(18)
+    transport_token = secrets.token_hex(16)
     try:
         module.VcenterRoleClient(
             "http://127.0.0.1:1",

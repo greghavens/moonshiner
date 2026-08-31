@@ -25,6 +25,11 @@ type Config struct {
 	Timeout         time.Duration
 }
 
+type TopologyVariable struct {
+	Name  string
+	Value any
+}
+
 // ApplyRequest is the supported VKS Cluster desired-state projection.
 type ApplyRequest struct {
 	Supervisor           string
@@ -33,9 +38,10 @@ type ApplyRequest struct {
 	FieldManager         string
 	ClusterClass         string
 	KubernetesVersion    string
-	VMClass              string
-	StorageClass         string
+	TopologyVariables    []TopologyVariable
 	ControlPlaneReplicas int32
+	WorkerClass          string
+	WorkerName           string
 	WorkerReplicas       *int32
 	PodCIDRs             []string
 	ServiceCIDRs         []string

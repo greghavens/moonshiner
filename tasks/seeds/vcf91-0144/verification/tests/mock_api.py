@@ -66,6 +66,7 @@ class ContractMockServer(ThreadingHTTPServer):
         namespace: str,
         cluster_name: str,
         topology_version: str,
+        blank_namespace_once: bool = False,
         master_host_override: str | None = None,
     ) -> None:
         contract = json.loads(contract_path.read_text(encoding="utf-8"))
@@ -105,6 +106,8 @@ class ContractMockServer(ThreadingHTTPServer):
         self.namespace = namespace
         self.cluster_name = cluster_name
         self.topology_version = topology_version
+        self.blank_namespace_once = blank_namespace_once
+        self.blank_namespace_served = False
         self.master_host_override = master_host_override
 
         self.old_namespace_started = threading.Event()
@@ -282,6 +285,25 @@ class ContractRequestHandler(BaseHTTPRequestHandler):
             session = self.headers.get("vmware-api-session-id")
             if session == server.old_session:
                 with server.state_lock:
+                    serve_blank = (
+                        server.blank_namespace_once
+                        and not server.blank_namespace_served
+                    )
+                    if serve_blank:
+                        server.blank_namespace_served = True
+                if serve_blank:
+                    self._send_json(
+                        200,
+                        [
+                            {
+                                "control_plane_api_server_port": 6443,
+                                "master_host": "",
+                                "namespace": "",
+                            }
+                        ],
+                    )
+                    return
+                with server.state_lock:
                     server.old_namespace_count += 1
                 server.old_namespace_started.set()
                 if not server.new_cluster_seen.wait(timeout=8):
@@ -339,6 +361,7 @@ class ContractRequestHandler(BaseHTTPRequestHandler):
                     },
                     "spec": {
                         "topology": {
+                            "classRef": {"name": "vsphere-9.1.2668"},
                             "version": server.topology_version,
                         }
                     },

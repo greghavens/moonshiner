@@ -147,6 +147,11 @@ public final class TestMain {
                                 + quote(required(values, "vcenterSession"))
                                 + "}");
             }
+            if (required(values, "scenario").equals("blank_discovery")) {
+                return response(200,
+                        "[{\"master_host\":\"\",\"namespace\":\"\","
+                                + "\"control_plane_api_server_port\":6443}]");
+            }
             StringBuilder body = new StringBuilder("[{\"namespace\":")
                     .append(quote(required(
                             values, "otherSupervisorNamespace")))
@@ -182,6 +187,12 @@ public final class TestMain {
                                         "wrong Pod identity",
                                         quote("not-an-integer"),
                                         required(values, "otherPodName"))));
+            }
+            if (required(values, "scenario").equals("live_empty")) {
+                return response(200,
+                        "{\"apiVersion\":\"v1\",\"kind\":\"EventList\","
+                                + "\"metadata\":{\"resourceVersion\":"
+                                + "\"2545994\"},\"items\":[]}");
             }
             String first = event(
                     "Unhealthy",
@@ -242,7 +253,8 @@ public final class TestMain {
                             required(values, "podName"))),
                     "fallback log capture");
             String text;
-            if (required(values, "scenario").equals("event_only")) {
+            if (Set.of("event_only", "live_empty").contains(
+                    required(values, "scenario"))) {
                 text = "2026-07-30T12:04:09Z java.net.ConnectException: "
                         + "Connection refused\n";
             } else {
@@ -453,20 +465,23 @@ public final class TestMain {
                         ? VksFailureEvidenceClient.Cause.UPSTREAM_DNS
                         : VksFailureEvidenceClient.Cause.INCONCLUSIVE;
         check(result.cause() == expected, "wrong correlated cause");
-        int expectedEvents = scenario.equals("log_only") ? 1 : 2;
+        int expectedEvents = scenario.equals("live_empty")
+                ? 0 : scenario.equals("log_only") ? 1 : 2;
         check(
                 result.warningEvents().size() == expectedEvents,
                 "wrong event evidence count");
-        check(
-                result.warningEvents().get(0).reason().equals("Unhealthy"),
-                "event service order changed");
+        if (expectedEvents > 0) {
+            check(
+                    result.warningEvents().get(0).reason().equals("Unhealthy"),
+                    "event service order changed");
+        }
         if (expectedEvents == 2) {
             check(
                     result.warningEvents().get(1).reason().equals("BackOff")
                             && result.warningEvents().get(1).count() == 7,
                     "BackOff evidence missing");
         }
-        if (!scenario.equals("event_only")) {
+        if (!Set.of("event_only", "live_empty").contains(scenario)) {
             check(
                     result.previousContainerLog().contains(
                             "java.net.UnknownHostException: "
@@ -491,8 +506,19 @@ public final class TestMain {
         VksFailureEvidenceClient client =
                 newClient(origin, values, exchange);
         switch (scenario) {
-            case "correlated", "event_only", "log_only" -> {
+            case "correlated", "event_only", "log_only", "live_empty" -> {
                 verifyDiagnosis(scenario, diagnose(client, values), values);
+            }
+            case "blank_discovery" -> {
+                try {
+                    diagnose(client, values);
+                    throw new AssertionError("live blank discovery accepted");
+                } catch (VksFailureEvidenceClient.ProtocolException expected) {
+                    check(expected.operation().equals(
+                                    VksFailureEvidenceClient.VCENTER_OPERATION),
+                            "wrong blank discovery operation");
+                    checkRedacted(expected, values);
+                }
             }
             case "unauthorized_namespace" -> {
                 try {

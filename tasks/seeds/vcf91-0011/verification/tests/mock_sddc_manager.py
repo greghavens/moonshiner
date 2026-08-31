@@ -170,7 +170,7 @@ class Handler(BaseHTTPRequestHandler):
                 400, "INVALID_CREDENTIALS", "Dummy credentials do not match")
             return
         self.send_json(
-            201,
+            200,
             {
                 "accessToken": ACCESS_TOKEN,
                 "refreshToken": {"id": "fixture-refresh-token"},

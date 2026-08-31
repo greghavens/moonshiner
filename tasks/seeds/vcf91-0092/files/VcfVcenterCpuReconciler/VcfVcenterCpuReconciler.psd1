@@ -7,12 +7,7 @@
     Copyright = '(c) Platform Engineering'
     Description = 'Retry-safe vCenter VM CPU reconciliation for VCF 9.1.'
     PowerShellVersion = '7.4'
-    RequiredModules = @(
-        @{
-            ModuleName = 'VMware.Sdk.Vcf.SddcManager'
-            ModuleVersion = '13.5.0.25380678'
-        }
-    )
+    RequiredModules = @()
     FunctionsToExport = @(
         'New-VcfVcenterCpuClient'
         'Set-VcfVmCpuCount'

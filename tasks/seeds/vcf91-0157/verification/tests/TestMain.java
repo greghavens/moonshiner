@@ -19,6 +19,7 @@ public final class TestMain {
     public static void main(String[] args) throws Exception {
         validateProtectedProvenance();
         validateConstructorBoundary();
+        validateLiveBlankDiscoveryFailsBeforeKubernetes();
         validateExpiryResumeAndStableOrdering();
         System.out.println(
                 "PASS: contract-pinned Supervisor token refresh preserves work");
@@ -151,6 +152,57 @@ public final class TestMain {
             require(refreshes.get() == 1,
                     "replacement credentials were not retained");
             assertCompleteLog(server, fixture);
+        }
+    }
+
+    private static void validateLiveBlankDiscoveryFailsBeforeKubernetes()
+            throws Exception {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        ContractMockServer.Fixture fixture = new ContractMockServer.Fixture(
+                "vc-session-" + suffix,
+                "vc-session-new-" + suffix,
+                "k8s-token-" + suffix,
+                "k8s-token-new-" + suffix,
+                "unused-a",
+                "unused-z",
+                suffix);
+
+        try (ContractMockServer server = new ContractMockServer(
+                CONTRACT,
+                fixture,
+                ContractMockServer.Scenario.LIVE_BLANK_DISCOVERY)) {
+            VcfVksInventoryClient client = new VcfVksInventoryClient(
+                    server.vcenterApiBase(),
+                    new VcfVksInventoryClient.Credentials(
+                            fixture.oldVcenterSession(),
+                            fixture.oldAccessToken()),
+                    expired -> {
+                        throw new AssertionError(
+                                "blank discovery must not refresh credentials");
+                    },
+                    Duration.ofSeconds(3),
+                    server.client());
+
+            try {
+                client.listInventory();
+                throw new AssertionError(
+                        "live blank namespace discovery must be rejected");
+            } catch (java.io.IOException expected) {
+                require(!expected.getMessage().contains(
+                                fixture.oldVcenterSession()),
+                        "failure leaked the vCenter session id");
+                require(!expected.getMessage().contains(
+                                fixture.oldAccessToken()),
+                        "failure leaked the Kubernetes bearer token");
+            }
+
+            List<ContractMockServer.RequestLog> log = server.requests();
+            require(log.size() == 1,
+                    "blank discovery must stop before Kubernetes");
+            assertVcenterRequest(
+                    log.get(0), server.vcenterPath(), fixture.oldVcenterSession());
+            require(log.get(0).responseStatus() == 200,
+                    "blank live discovery fixture must return HTTP 200");
         }
     }
 

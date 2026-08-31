@@ -32,12 +32,12 @@ PROTECTED_SHA256 = {
         "94249dd472610694213b650da502d243"
     ),
     "grader/MockVcenterServer.java": (
-        "65ff0056c7b4553d38b7d1b0109926b0"
-        "d8579c874b6b4735d98d54cb9b077aea"
+        "b9ace06fbf7bde63419cbbaaa11c5afa"
+        "8b8a80811491eabf9ccb05de54d240b6"
     ),
     "grader/TestMain.java": (
-        "48b13d4e08c7955b5d6f4988dc7f3d48"
-        "d524e7984dd76149804538b52c75ad32"
+        "f787baffe8b25d559e24de8d48163b45"
+        "19596926868a96dc07db503f2f785664"
     ),
 }
 

@@ -9,10 +9,9 @@ import (
 	"time"
 )
 
-// DeleteOptions controls one idempotent delete workflow. DepotType is a
-// pointer so an omitted query option differs from an explicitly empty value.
+// DeleteOptions controls one idempotent service-configuration delete workflow.
 type DeleteOptions struct {
-	DepotType   *string
+	ServiceKey  string
 	MaxAttempts int
 	RetryDelay  time.Duration
 }
@@ -56,8 +55,8 @@ func NewClient(baseURL, accessToken string, httpClient *http.Client) (*Client, e
 	return &Client{baseURL: baseURL, accessToken: accessToken, httpClient: httpClient}, nil
 }
 
-// DeleteDepotSettings removes the selected depot settings with bounded,
-// context-aware retries.
+// DeleteDepotSettings removes the selected depot service configuration with
+// bounded, context-aware retries.
 func (c *Client) DeleteDepotSettings(ctx context.Context, options DeleteOptions) error {
 	return ErrNotImplemented
 }

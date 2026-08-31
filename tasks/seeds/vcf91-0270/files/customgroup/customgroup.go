@@ -37,12 +37,12 @@ type ResourceKey struct {
 // MembershipDefinition describes which resources belong to a custom group.
 //
 // The contract marks this property required on custom-group, so it is always
-// part of a create request even when no members are named.
+// part of a create request. IncludedResources must name at least one resource.
 //
 // TODO: give these fields the JSON encoding the contract's
 // custom-group-membership schema requires.
 type MembershipDefinition struct {
-	// IncludedResources holds resource identifiers to place in the group.
+	// IncludedResources holds the required resource identifiers to place in the group.
 	IncludedResources []string
 	// ExcludedResources holds resource identifiers to keep out of the group.
 	ExcludedResources []string

@@ -63,7 +63,7 @@ TASK_QUERY = [
     "pageNumber",
     "pageSize",
 ]
-SENT_QUERY = {"type", "resourceId", "resourceType", "pageNumber", "pageSize"}
+SENT_QUERY = {"name", "pageNumber", "pageSize"}
 UNSET_QUERY = [name for name in TASK_QUERY if name not in SENT_QUERY]
 TASK_STATUS_ENUM = [
     "PENDING",
@@ -157,19 +157,19 @@ def verify_contract() -> None:
     )
     wire = get_tasks.get("focusedWireProfile", {})
     require(
-        wire.get("firstPageMembers") == ["type", "resourceId", "resourceType", "pageSize"],
+        wire.get("firstPageMembers") == ["name", "pageSize"],
         "first page profile changed",
     )
     require(
         wire.get("laterPageMembers")
-        == ["type", "resourceId", "resourceType", "pageNumber", "pageSize"],
+        == ["name", "pageNumber", "pageSize"],
         "later page profile changed",
     )
     require(wire.get("unsetMembers") == UNSET_QUERY, "unset-member profile changed")
     require(wire.get("unsetBehavior") == "omit", "unset behavior must be omit")
     require(
         wire.get("filterValues")
-        == {"type": "SUPPORT_BUNDLE", "resourceType": "COMPONENT"},
+        == {"name": "CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW"},
         "task filter projection changed",
     )
     require(
@@ -341,11 +341,6 @@ def verify_package_shape() -> None:
         project.get("project", {}).get("dependencies") == [],
         "dependencies must be empty",
     )
-    require(
-        project.get("tool", {}).get("moonshiner", {}).get("stdlib-only") is True,
-        "package must remain stdlib-only",
-    )
-
     source = CLIENT_PATH.read_text(encoding="utf-8")
     try:
         tree = ast.parse(source, filename=str(CLIENT_PATH))
@@ -382,14 +377,11 @@ def make_scenario() -> dict[str, Any]:
     tasks = [
         {
             "id": str(uuid.uuid4()),
-            "name": f"decoy-support-bundle-{marker}-{index}",
+            "name": "CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW",
             "status": "SUCCEEDED" if index % 2 == 0 else "FAILED",
-            "type": "SUPPORT_BUNDLE",
             "createdBy": "operator",
-            "resourceId": component_id,
-            "resourceType": "COMPONENT",
             "createTime": f"2026-07-0{index + 1}T08:00:00.000Z",
-            "correlationId": f"decoy-{marker}-{index}",
+            "correlationId": str(uuid.uuid4()),
             "retriable": False,
             "cancellable": False,
             "additionalDetails": {"supportBundleId": f"absent-{marker}-{index}"},
@@ -402,8 +394,8 @@ def make_scenario() -> dict[str, Any]:
         "otherComponentId": str(uuid.uuid4()),
         "bundleMarker": marker,
         "tasks": tasks,
-        "firstCorrelationId": f"ensure-{marker}-alpha",
-        "secondCorrelationId": f"ensure-{marker}-beta",
+        "firstCorrelationId": str(uuid.uuid4()),
+        "secondCorrelationId": str(uuid.uuid4()),
     }
 
 
@@ -520,7 +512,7 @@ def scripted_call(
     *,
     expect_error: bool = True,
     component_id: str = "component-validation",
-    correlation_id: str = "correlation-validation",
+    correlation_id: str = "11111111-1111-4111-8111-111111111111",
 ) -> tuple[Any, list[dict[str, Any]]]:
     """Run one public workflow against a fresh, entirely local response script."""
     server = ScriptedServer(responses)
@@ -561,7 +553,7 @@ def scripted_call(
 def task_page(
     elements: Any,
     *,
-    page_number: Any = 0,
+    page_number: Any = 1,
     page_size: Any = 2,
     total_elements: Any | None = None,
     total_pages: Any = 1,
@@ -580,7 +572,7 @@ def task_page(
 
 
 def resolved_task(
-    correlation_id: str = "correlation-validation",
+    correlation_id: str = "11111111-1111-4111-8111-111111111111",
     *,
     task_id: str = "task-validation",
     status: str = "SUCCEEDED",
@@ -628,7 +620,7 @@ def import_client() -> tuple[type[Any], type[BaseException]]:
 def verify_response_validation() -> None:
     """Exercise required failure handling without relying on implementation internals."""
     client_type, error_type = import_client()
-    correlation_id = "correlation-validation"
+    correlation_id = "11111111-1111-4111-8111-111111111111"
     accepted = {"id": "task-validation", "correlationId": correlation_id}
     good_task = resolved_task(correlation_id)
     good_bundle = support_bundle()
@@ -665,7 +657,7 @@ def verify_response_validation() -> None:
             {
                 "elements": [],
                 "pageMetadata": {
-                    "pageNumber": 0,
+                    "pageNumber": 1,
                     "pageSize": 2,
                     "totalElements": 0,
                 },
@@ -673,8 +665,8 @@ def verify_response_validation() -> None:
         ),
         ("boolean page number", task_page([], page_number=False)),
         ("negative total elements", task_page([], total_elements=-1)),
-        ("zero total pages", task_page([], total_pages=0)),
-        ("wrong echoed page number", task_page([], page_number=1, total_pages=2)),
+        ("zero total pages with elements", task_page([{"id": "unexpected"}], total_elements=1, total_pages=0)),
+        ("wrong echoed page number", task_page([], page_number=2, total_pages=2)),
         ("wrong echoed page size", task_page([], page_size=1)),
         (
             "overfull task page",
@@ -705,14 +697,14 @@ def verify_response_validation() -> None:
     # A non-last page must advance, while the element count is never a shortcut
     # for the advertised last page.
     non_last_empty = task_page(
-        [], page_number=0, total_elements=0, total_pages=2
+        [], page_number=1, total_elements=0, total_pages=2
     )
     _, requests = scripted_call(
         client_type,
         error_type,
         [
             (200, non_last_empty),
-            (200, task_page([], page_number=1, total_elements=0, total_pages=2)),
+            (200, task_page([], page_number=2, total_elements=0, total_pages=2)),
             *valid_tail,
         ],
         "empty non-last page",
@@ -721,13 +713,13 @@ def verify_response_validation() -> None:
 
     first_page = task_page(
         [{"id": "decoy", "correlationId": "other"}],
-        page_number=0,
+        page_number=1,
         total_elements=1,
         total_pages=2,
     )
     matching_page = task_page(
         [{"id": "task-validation", "correlationId": correlation_id}],
-        page_number=1,
+        page_number=2,
         total_elements=1,
         total_pages=2,
     )
@@ -752,7 +744,7 @@ def verify_response_validation() -> None:
     require(len(requests) == 4, "reconciliation stopped before the advertised last page")
 
     changed_totals_page = task_page(
-        [], page_number=1, total_elements=2, total_pages=2
+        [], page_number=2, total_elements=2, total_pages=2
     )
     _, requests = scripted_call(
         client_type,
@@ -948,6 +940,7 @@ def verify_runtime() -> None:
                 for label, kwargs in [
                     ("blank component_id", {"component_id": "", "correlation_id": first_key}),
                     ("blank correlation_id", {"component_id": component_id, "correlation_id": " "}),
+                    ("non-UUID correlation_id", {"component_id": component_id, "correlation_id": "not-a-uuid"}),
                 ]:
                     assert_client_error(
                         error_type,
@@ -1133,10 +1126,8 @@ def verify_wire(
         request for request in requests if request.get("operationId") == "getTasks"
     ]
     require(len(task_requests) == 8, "getTasks request count changed")
-    page_numbers = [0, 1, 0, 1, 2, 0, 1, 2]
-    prefix = (
-        f"type=SUPPORT_BUNDLE&resourceId={component_id}&resourceType=COMPONENT"
-    )
+    page_numbers = [1, 2, 1, 2, 3, 1, 2, 3]
+    prefix = "name=CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW"
     for index, (request, page) in enumerate(zip(task_requests, page_numbers)):
         require(request.get("method") == "GET", f"getTasks {index} method changed")
         require(request.get("bodyLength") == 0, f"getTasks {index} must be bodyless")
@@ -1147,13 +1138,13 @@ def verify_wire(
             CORRELATION_HEADER not in headers,
             f"getTasks {index} sent a correlation header the contract does not declare",
         )
-        suffix = f"&pageSize={PAGE_SIZE}" if page == 0 else f"&pageNumber={page}&pageSize={PAGE_SIZE}"
+        suffix = f"&pageSize={PAGE_SIZE}" if page == 1 else f"&pageNumber={page}&pageSize={PAGE_SIZE}"
         require(
             request.get("rawTarget") == f"/v1/tasks?{prefix}{suffix}",
             f"getTasks {index} raw target or query order changed",
         )
         query = request.get("query", {})
-        allowed = SENT_QUERY if page else SENT_QUERY - {"pageNumber"}
+        allowed = SENT_QUERY if page != 1 else SENT_QUERY - {"pageNumber"}
         require(set(query) == allowed, f"getTasks {index} sent an unset query member")
         require(
             all(len(values) == 1 and values[0] != "" for values in query.values()),

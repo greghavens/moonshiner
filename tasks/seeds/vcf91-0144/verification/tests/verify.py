@@ -432,11 +432,11 @@ def main() -> None:
     validate_python_shape()
 
     suffix = secrets.token_hex(7)
-    namespace = f"team blue/ñ-{suffix}"
-    cluster_name = f"payments #1/{suffix}"
-    topology_version = f"v1.33.{secrets.randbelow(8) + 1}+vmware.2"
-    old_session = secrets.token_urlsafe(29)
-    new_session = secrets.token_urlsafe(31)
+    namespace = "vmsp-platform"
+    cluster_name = "vcf-msr01"
+    topology_version = "v1.34.2"
+    old_session = secrets.token_hex(16)
+    new_session = secrets.token_hex(16)
     kubernetes_token = secrets.token_urlsafe(37)
     username = f"rotation-{secrets.token_hex(8)}"
     password = secrets.token_urlsafe(28)
@@ -459,6 +459,7 @@ def main() -> None:
             namespace=namespace,
             cluster_name=cluster_name,
             topology_version=topology_version,
+            blank_namespace_once=True,
         )
         server_thread = threading.Thread(
             target=server.serve_forever,
@@ -507,6 +508,25 @@ def main() -> None:
                 read_log(request_log) == [],
                 "input validation was not completed before traffic",
             )
+
+            try:
+                client.get_cluster(namespace, cluster_name)
+            except ProtocolError as error:
+                require(
+                    error.operation_id
+                    == "Vcenter.Namespaces.User.Instances_list",
+                    "live blank namespace used the wrong operation",
+                )
+            else:
+                fail("live blank namespace unexpectedly reached Kubernetes")
+            primary_records = read_log(request_log)
+            require(
+                len(primary_records) == 1
+                and primary_records[0]["operation"]
+                == "listSupervisorNamespaces",
+                "live blank namespace did not stop before Kubernetes",
+            )
+            request_log.write_text("", encoding="utf-8")
 
             old_thread = threading.Thread(
                 target=capture,

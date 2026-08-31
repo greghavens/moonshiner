@@ -103,7 +103,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if operation_id == "createToken":
             self._json(
-                201,
+                200,
                 {
                     "accessToken": ACCESS_TOKEN,
                     "refreshToken": {"id": "loopback-refresh-token"},
@@ -121,13 +121,16 @@ class _Handler(BaseHTTPRequestHandler):
         if task_name == "MOONSHINER_MISSING_METADATA":
             self._json(200, {"elements": []})
             return
+        if task_name == "MOONSHINER_EMPTY":
+            self._json(200, {"elements": [], "pageMetadata": {}})
+            return
         if task_name == "MOONSHINER_WRONG_PAGE":
             self._json(
                 200,
                 {
                     "elements": [],
                     "pageMetadata": {
-                        "pageNumber": 1,
+                        "pageNumber": 2,
                         "pageSize": 0,
                         "totalElements": 0,
                         "totalPages": 1,
@@ -136,14 +139,14 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         try:
-            page_number = int(query.get("pageNumber", ["0"])[0])
+            page_number = int(query.get("pageNumber", ["1"])[0])
             page_size = int(query.get("pageSize", ["100"])[0])
-            if page_number < 0 or page_size < 1 or page_size > 100:
+            if page_number < 1 or page_size < 1 or page_size > 100:
                 raise ValueError
         except (TypeError, ValueError):
             self._json(400, {"error": "invalid pagination"})
             return
-        first = page_number * page_size
+        first = (page_number - 1) * page_size
         elements = self.server.tasks[first : first + page_size]
         total_pages = math.ceil(len(self.server.tasks) / page_size)
         self._json(

@@ -25,9 +25,9 @@ PROTECTED_SHA256 = {
     "docs/official_sources.json":
         "d38581d63fc56a08a407592fe131560109debd71ae968f86516af76f08a80d03",
     "tests/ContractMockServer.java":
-        "30596686b156a3939eec0450c0b3e1b9ea1308df9e6e40d29663e4472a75f4b7",
+        "576cfcd67903ae4e624a727d879d2a03811d7c15a3e769c3cd4f28d5b850304d",
     "tests/TestMain.java":
-        "4b0615f7b693e7f6b9a738fd3ff84bff8d4c7f08854a6394929db53b6d022373",
+        "aa02793a84d05da422e81d5c4481c8c0bae48e23d91ae3ec98fbe2a165f3b2e9",
 }
 
 

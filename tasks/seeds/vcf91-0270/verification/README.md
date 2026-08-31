@@ -37,7 +37,9 @@ may be called.
 Two details the contract states but that are easy to miss:
 
 - The `custom-group` schema marks **`resourceKey` and `membershipDefinition`
-  required**. Both belong in every create request, even an empty membership.
+  required**. The deployed VCF 9.1 appliance additionally rejects an empty
+  membership definition and one containing only exclusions, so this client
+  requires at least one `includedResources` entry.
 - `getCustomGroups` declares `groupId` and `includePolicy` as optional query
   parameters, and gives `includePolicy` the default `false`. Neither carries a
   `style` or `explode` annotation, so the OpenAPI 3 default applies: `form` with
@@ -69,9 +71,10 @@ The OpenAPI document describes wire shape, not the appliance's conflict
 handling. The mock adds two behaviours so that retry safety is observable, and
 they are documented on the package rather than in the contract:
 
-- `createCustomGroup` answers **409 Conflict** when a group already exists with
-  the same `resourceKey` triple of name, adapter kind and resource kind. A real
-  appliance likewise refuses to hold two custom groups under one resource key.
+- `createCustomGroup` answers **500 Internal Server Error** when a group already
+  exists with the same `resourceKey` triple of name, adapter kind and resource
+  kind, matching the deployed VCF 9.1 appliance. The client must re-list once
+  after this response and adopt the matching group when one exists.
 - `FailNextCreateAfterStore()` stores the group and *then* fails with 503,
   modelling a response lost after the write committed.
   `InsertBeforeNextCreate(...)` slips a group in just before the next create,

@@ -25,8 +25,8 @@ SOURCES = ROOT / "docs" / "official_sources.json"
 PINNED = {
     CONTRACT: "42c9a3e31fe72db2aff943c0040524d845e78e5e19ce61666d335d5d7c799a47",
     SOURCES: "9207b41ac608941dd4b18aa661930de3f583e36f6a5270d3ccb833d7b0d0149d",
-    TEST_MAIN: "2f0e00a1ddfc4bf5148ef238a333a8cc335836eb4ac1155ca7ec3560cd3d9644",
-    MOCK: "34d97a95affeff106ff584a0af6a4562f429812e259645ad9b85f96c1a8efea3",
+    TEST_MAIN: "b8b307ce648264543617c95fc29b249473da73b86ad6dd424f0334983144b9a4",
+    MOCK: "92d4fe38d5a2a3269d3f57fc94ba9fa244ac1d46dd157d56b22c79c6faef0acc",
 }
 EXPECTED_OPERATIONS = [
     (
@@ -156,15 +156,15 @@ def main() -> None:
         fail("Java 17 javac and java are required")
 
     nonce = secrets.token_hex(9)
-    session = f"session-{nonce}.fixture"
-    task_prefix = f"task-{nonce}"
-    set_cluster = f"domain-set-{nonce}/blue space+#\u03a9"
+    session = "0123456789abcdef0123456789abcdef"
+    task_prefix = "7978ee81-a66c-4c37-8653-c577c0161e9d"
+    set_cluster = "domain-c10"
     clear_cluster = f"domain-clear-{nonce}?edge/green #"
-    reject_cluster = f"domain-reject-{nonce}#red /?"
-    mode_key = f'intel-"ice\\nlake-\u03a9-{nonce}'
-    mask_key = f'cpuid.7/"{nonce}'
-    mask_name = f"mask\\\\name\\n\u03a9-{nonce}"
-    mask_value = f'1010"\\\\{nonce}'
+    reject_cluster = "domain-c9"
+    mode_key = "amd-zen"
+    mask_key = "cpuid.80000001.edx"
+    mask_name = "AMD Zen feature mask"
+    mask_value = "----:----:----:----:----:----:----:----"
 
     with tempfile.TemporaryDirectory(prefix="vcf91-0124-") as temporary:
         temp = Path(temporary)

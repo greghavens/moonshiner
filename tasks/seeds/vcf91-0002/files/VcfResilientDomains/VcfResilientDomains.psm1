@@ -16,7 +16,7 @@ function Export-VcfResilientDomainInventory {
     )
 
     throw [System.NotImplementedException]::new(
-        'Implement the contract-pinned resilient domain export.'
+        'Implement the focused resilient domain export.'
     )
 }
 

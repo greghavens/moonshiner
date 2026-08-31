@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 
 EXPECTED_OPERATIONS = {
@@ -133,7 +133,23 @@ class MockVCenter:
                 if list_match:
                     self._json_response(200, fixture._state.tpms)
                 elif event_match and not target.query:
-                    self._json_response(200, fixture._state.event_log)
+                    tpm_segment = target.path.rsplit("/", 2)[-2]
+                    if unquote(tpm_segment) == "tpm-exact":
+                        self._json_response(
+                            404,
+                            {
+                                "error_type": "NOT_FOUND",
+                                "messages": [
+                                    {
+                                        "args": ["tpm-exact"],
+                                        "default_message": "TPM tpm-exact not found.",
+                                        "id": "com.vmware.esx.trusted_infrastructure.hardware.tpm.not_found",
+                                    }
+                                ],
+                            },
+                        )
+                    else:
+                        self._json_response(200, fixture._state.event_log)
                 else:
                     self._not_found()
 

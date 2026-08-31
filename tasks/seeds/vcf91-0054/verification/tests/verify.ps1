@@ -154,27 +154,36 @@ function Assert-UpdateWireShape {
 
     $Body = $Entry.body | ConvertFrom-Json
     $ActualMembers = @($Body.PSObject.Properties.Name | Sort-Object)
-    $ExpectedMembers = if ($HasDescription) {
-        @('_revision', 'description', 'display_name')
-    }
-    else {
-        @('_revision', 'display_name')
-    }
+    $ExpectedMembers = @(
+        '_revision', 'description', 'display_name', 'expression', 'id',
+        'resource_type', 'tags'
+    ) | Sort-Object
     Assert-Equal ($ActualMembers -join ',') ($ExpectedMembers -join ',') `
         "$($Case.Name) exact JSON member set"
     Assert-Equal ([int] $Body._revision) $Case.CurrentRevision `
         "$($Case.Name) update revision"
     Assert-Equal $Body.display_name $Case.DesiredDisplayName `
         "$($Case.Name) update display_name"
-    if ($HasDescription) {
-        Assert-Equal $Body.description $Case.Description `
-            "$($Case.Name) update description"
+    $ExpectedDescription = if ($HasDescription) {
+        $Case.Description
+    } else {
+        $Case.CurrentDescription
     }
-    else {
-        Assert-True (
-            $Body.PSObject.Properties.Name -cnotcontains 'description'
-        ) "$($Case.Name) omits unbound description"
-    }
+    Assert-Equal $Body.description $ExpectedDescription `
+        "$($Case.Name) update description"
+    Assert-Equal $Body.id $Case.GroupId "$($Case.Name) preserves id"
+    Assert-Equal $Body.resource_type 'Group' `
+        "$($Case.Name) preserves resource_type"
+    Assert-Equal @($Body.expression).Count 1 `
+        "$($Case.Name) preserves membership expression"
+    Assert-Equal $Body.expression[0].resource_type 'IPAddressExpression' `
+        "$($Case.Name) preserves expression type"
+    Assert-Equal $Body.expression[0].ip_addresses[0] '198.18.54.10' `
+        "$($Case.Name) preserves expression address"
+    Assert-Equal $Body.tags[0].scope 'fixture' `
+        "$($Case.Name) preserves tag scope"
+    Assert-Equal $Body.tags[0].tag 'preserve' `
+        "$($Case.Name) preserves tag value"
 }
 
 function Invoke-GuardCase {
@@ -232,6 +241,7 @@ function Invoke-GuardCase {
         group_id = $GroupId
         current_revision = $CurrentRevision
         current_display_name = $CurrentDisplayName
+        current_description = "membership-$Name"
     }
     [System.IO.File]::WriteAllText(
         $ScenarioPath,
@@ -312,6 +322,7 @@ function Invoke-GuardCase {
             GroupId = $GroupId
             CurrentRevision = $CurrentRevision
             CurrentDisplayName = $CurrentDisplayName
+            CurrentDescription = "membership-$Name"
             ExpectedRevision = $ExpectedRevision
             ExpectedDisplayName = $ExpectedDisplayName
             DesiredDisplayName = $DesiredDisplayName
@@ -514,8 +525,9 @@ try {
         'returned group display name'
     Assert-Equal ([int] $OmittedDescription.Result.Revision) `
         ($BaseRevision + 1) 'returned group revision'
-    Assert-True ($null -eq $OmittedDescription.Result.Description) `
-        'returned group leaves omitted description unset'
+    Assert-Equal $OmittedDescription.Result.Description `
+        $OmittedDescription.CurrentDescription `
+        'returned group preserves the existing description'
 
     $ExplicitDescription = 'description-café-' + $RunId.Substring(4, 12)
     $WithDescription = Invoke-GuardCase `

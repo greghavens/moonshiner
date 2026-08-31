@@ -152,7 +152,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"errorCode": "INVALID_TOKEN_SPEC"})
                 return
             self._send_json(
-                201,
+                200,
                 {
                     "accessToken": ACCESS_TOKEN,
                     "refreshToken": {"id": "refresh-token-001"},
@@ -202,12 +202,6 @@ class Handler(BaseHTTPRequestHandler):
                 200,
                 {
                     "elements": bundles,
-                    "pageMetadata": {
-                        "pageNumber": 0,
-                        "pageSize": 3,
-                        "totalElements": 3,
-                        "totalPages": 1,
-                    },
                 },
             )
             return

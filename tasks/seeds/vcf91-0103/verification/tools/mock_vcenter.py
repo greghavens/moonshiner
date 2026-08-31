@@ -72,7 +72,7 @@ def contract_routes(contract: dict, scenario: dict) -> list[dict]:
             {"count": scenario["cpu_count"]}
         ),
         "Vcenter.Vm.Hardware.Memory_update": compact_json(
-            {"size_mib": scenario["memory_mib"]}
+            {"size_MiB": scenario["memory_mib"]}
         ),
     }
     routes: list[dict] = []
@@ -127,10 +127,13 @@ def main() -> int:
 
     token = scenario.get("session_token")
     vm = scenario.get("vm")
+    behavior = scenario.get("behavior")
     if not isinstance(token, str) or not token:
         raise ValueError("scenario session_token must be a non-empty string")
     if not isinstance(vm, str) or not vm:
         raise ValueError("scenario vm must be a non-empty string")
+    if behavior not in {"success", "power_503"}:
+        raise ValueError("scenario behavior is invalid")
     scenario["cpu_count"] = positive_integer(
         scenario.get("cpu_count"), "cpu_count"
     )
@@ -138,7 +141,10 @@ def main() -> int:
         scenario.get("memory_mib"), "memory_mib"
     )
     failure_message = scenario.get("power_error_message")
-    if not isinstance(failure_message, str) or not failure_message:
+    if (
+        behavior == "power_503"
+        and (not isinstance(failure_message, str) or not failure_message)
+    ):
         raise ValueError("scenario power_error_message must be non-empty")
 
     routes = contract_routes(contract, scenario)
@@ -224,7 +230,10 @@ def main() -> int:
                             "error_type": "INVALID_ARGUMENT",
                             "messages": [],
                         }
-                    elif route["operationId"] == "Vcenter.Vm.Power_start":
+                    elif (
+                        route["operationId"] == "Vcenter.Vm.Power_start"
+                        and behavior == "power_503"
+                    ):
                         status = 503
                         response = {
                             "error_type": "SERVICE_UNAVAILABLE",

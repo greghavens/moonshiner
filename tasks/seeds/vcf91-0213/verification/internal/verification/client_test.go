@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -21,8 +22,9 @@ import (
 )
 
 const (
-	wantCommit = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
-	wantSpec   = "specifications/vcf-installer/vcf-installer-openapi.json"
+	wantCommit        = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
+	wantInstallerSpec = "specifications/vcf-installer/vcf-installer-openapi.json"
+	wantManagerSpec   = "specifications/sddc-manager/sddc-manager-openapi.json"
 )
 
 func repositoryRoot(t *testing.T) string {
@@ -54,94 +56,91 @@ func TestOfficialSourceRecordsEveryContractOperation(t *testing.T) {
 	type source struct {
 		RepositoryCommitSHA string `json:"repositoryCommitSha"`
 		SpecPath            string `json:"specPath"`
-		OpenAPI             string `json:"openapi"`
-		InfoVersion         string `json:"infoVersion"`
-	}
-	type response struct {
-		Description string  `json:"description"`
-		SchemaRef   *string `json:"schemaRef"`
 	}
 	type operation struct {
-		OperationID string              `json:"operationId"`
-		Method      string              `json:"method"`
-		Path        string              `json:"path"`
-		RequestBody json.RawMessage     `json:"requestBody"`
-		Responses   map[string]response `json:"responses"`
+		OperationID   string         `json:"operationId"`
+		Method        string         `json:"method"`
+		Path          string         `json:"path"`
+		SuccessStatus int            `json:"successStatus"`
+		Responses     map[string]any `json:"responses"`
 	}
 	var contract struct {
-		Source     source      `json:"source"`
+		Sources    []source    `json:"sources"`
 		Operations []operation `json:"operations"`
 	}
 	var official struct {
-		RepositoryCommitSHA string   `json:"repositoryCommitSha"`
-		SpecPath            string   `json:"specPath"`
-		OperationIDs        []string `json:"operationIds"`
-		Operations          []struct {
-			OperationID         string `json:"operationId"`
-			Method              string `json:"method"`
-			Path                string `json:"path"`
-			RepositoryCommitSHA string `json:"repositoryCommitSha"`
-			SpecPath            string `json:"specPath"`
-			SourcePointer       string `json:"sourcePointer"`
-		} `json:"operations"`
+		Sources []struct {
+			RepositoryCommitSHA string      `json:"repositoryCommitSha"`
+			SpecPath            string      `json:"specPath"`
+			Operations          []operation `json:"operations"`
+		} `json:"sources"`
 	}
 	readJSON(t, "docs/contract.json", &contract)
 	readJSON(t, "docs/official_sources.json", &official)
 
-	if contract.Source.RepositoryCommitSHA != wantCommit || contract.Source.SpecPath != wantSpec || contract.Source.OpenAPI != "3.0.1" || contract.Source.InfoVersion != "9.1.0.0" {
-		t.Fatalf("contract source = %+v", contract.Source)
-	}
-	if official.RepositoryCommitSHA != wantCommit || official.SpecPath != wantSpec {
-		t.Fatalf("official source = %s %s", official.RepositoryCommitSHA, official.SpecPath)
+	wantPaths := map[string]bool{wantInstallerSpec: true, wantManagerSpec: true}
+	for _, sources := range [][]source{contract.Sources} {
+		if len(sources) != 2 {
+			t.Fatalf("contract sources = %+v", sources)
+		}
+		for _, got := range sources {
+			if got.RepositoryCommitSHA != wantCommit || !wantPaths[got.SpecPath] {
+				t.Fatalf("contract source = %+v", got)
+			}
+		}
 	}
 	want := []struct {
-		id      string
-		method  string
-		path    string
-		pointer string
+		id     string
+		method string
+		path   string
+		status int
 	}{
-		{"updateProxyConfiguration", http.MethodPatch, "/v1/system/proxy-configuration", "/paths/~1v1~1system~1proxy-configuration/patch"},
-		{"updateDepotSettings", http.MethodPut, "/v1/system/settings/depot", "/paths/~1v1~1system~1settings~1depot/put"},
-		{"syncDepotMetadata", http.MethodPatch, "/v1/system/settings/depot/depot-sync-info", "/paths/~1v1~1system~1settings~1depot~1depot-sync-info/patch"},
+		{"updateProxyConfiguration", http.MethodPatch, "/v1/system/proxy-configuration", 202},
+		{"updateServicesConfig", http.MethodPut, "/v1/services-config", 200},
+		{"syncDepotMetadata", http.MethodPatch, "/v1/system/settings/depot/depot-sync-info", 202},
 	}
-	if len(contract.Operations) != len(want) || len(official.Operations) != len(want) || len(official.OperationIDs) != len(want) {
-		t.Fatalf("operation counts contract=%d official=%d ids=%d", len(contract.Operations), len(official.Operations), len(official.OperationIDs))
+	if len(contract.Operations) != len(want) {
+		t.Fatalf("contract operation count=%d", len(contract.Operations))
 	}
 	for index, expected := range want {
 		got := contract.Operations[index]
-		if got.OperationID != expected.id || got.Method != expected.method || got.Path != expected.path {
+		if got.OperationID != expected.id || got.Method != expected.method || got.Path != expected.path || got.SuccessStatus != expected.status {
 			t.Fatalf("contract operation %d = %+v", index, got)
 		}
-		if len(got.Responses) != 3 || got.Responses["202"].Description != "Accepted" {
+		if _, ok := got.Responses[fmt.Sprint(expected.status)]; !ok {
 			t.Fatalf("contract responses for %s = %+v", got.OperationID, got.Responses)
 		}
-		if expected.id == "syncDepotMetadata" {
-			if string(got.RequestBody) != "null" {
-				t.Fatalf("sync requestBody = %s, want null projection", got.RequestBody)
-			}
-		} else if string(got.RequestBody) == "null" || len(got.RequestBody) == 0 {
-			t.Fatalf("%s request body projection is missing", expected.id)
+	}
+	seen := map[string]bool{}
+	for _, source := range official.Sources {
+		if source.RepositoryCommitSHA != wantCommit || !wantPaths[source.SpecPath] {
+			t.Fatalf("official source = %+v", source)
 		}
-		recorded := official.Operations[index]
-		if official.OperationIDs[index] != expected.id || recorded.OperationID != expected.id || recorded.Method != expected.method || recorded.Path != expected.path || recorded.RepositoryCommitSHA != wantCommit || recorded.SpecPath != wantSpec || recorded.SourcePointer != expected.pointer {
-			t.Fatalf("official operation %d = %+v ids=%v", index, recorded, official.OperationIDs)
+		for _, operation := range source.Operations {
+			seen[operation.OperationID] = true
 		}
+	}
+	if len(seen) != 3 {
+		t.Fatalf("official operations = %v", seen)
 	}
 }
 
 func pointer[T any](value T) *T { return &value }
 
-func bootstrapInputs() (vcfinstaller.ProxyConfiguration, vcfinstaller.DepotSettings) {
+func bootstrapInputs() (vcfinstaller.ProxyConfiguration, vcfinstaller.ServicesConfig) {
 	return vcfinstaller.ProxyConfiguration{
 			IsEnabled:        pointer(true),
 			Host:             pointer("proxy.bootstrap.example"),
 			Port:             pointer[int32](8443),
 			TransferProtocol: pointer("HTTPS"),
-		}, vcfinstaller.DepotSettings{
-			VMwareAccount: &vcfinstaller.DepotAccount{
-				DownloadActivationCode: pointer("activation-0213"),
-			},
-			DepotConfiguration: &vcfinstaller.DepotConfiguration{IsOfflineDepot: false},
+		}, vcfinstaller.ServicesConfig{
+			Services: []vcfinstaller.ServiceConfig{{
+				Name: "VCF Depot", Type: "VCF_DEPOT", Key: "depot-service-key",
+				Nodes: []vcfinstaller.ServiceNode{{
+					Name:      "VCF Depot",
+					Addresses: []vcfinstaller.ServiceNodeAddress{{Type: "Fqdn", Value: "vcf-flt01.vcf.lab"}},
+				}},
+			}},
 		}
 }
 
@@ -155,14 +154,14 @@ func TestLaterSyncFailurePreservesAcceptedStepsAndExactWire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	proxy, depot := bootstrapInputs()
-	report, err := client.ConfigureDepotAccess(context.Background(), proxy, depot)
+	proxy, services := bootstrapInputs()
+	report, err := client.ConfigureDepotAccess(context.Background(), proxy, services)
 
 	wantReport := vcfinstaller.ChangeReport{
 		Outcome: vcfinstaller.OutcomePartialFailure,
 		Steps: []vcfinstaller.StepResult{
 			{OperationID: "updateProxyConfiguration", Status: vcfinstaller.StepAccepted, HTTPStatus: 202, TaskID: "task-proxy-0213"},
-			{OperationID: "updateDepotSettings", Status: vcfinstaller.StepAccepted, HTTPStatus: 202},
+			{OperationID: "updateServicesConfig", Status: vcfinstaller.StepAccepted, HTTPStatus: 200},
 			{OperationID: "syncDepotMetadata", Status: vcfinstaller.StepFailed, HTTPStatus: 500, ErrorCode: "VCF_DEPOT_SYNC_FAILED", ErrorMessage: "Depot metadata index could not be refreshed"},
 		},
 	}
@@ -192,16 +191,16 @@ func TestLaterSyncFailurePreservesAcceptedStepsAndExactWire(t *testing.T) {
 	}
 	wantBodies := [][]byte{
 		[]byte(`{"isEnabled":true,"host":"proxy.bootstrap.example","port":8443,"transferProtocol":"HTTPS"}`),
-		[]byte(`{"vmwareAccount":{"downloadActivationCode":"activation-0213"},"depotConfiguration":{"isOfflineDepot":false}}`),
+		[]byte(`{"services":[{"name":"VCF Depot","type":"VCF_DEPOT","key":"depot-service-key","nodes":[{"name":"VCF Depot","addresses":[{"type":"Fqdn","value":"vcf-flt01.vcf.lab"}]}]}]}`),
 		nil,
 	}
 	wantMethods := []string{http.MethodPatch, http.MethodPut, http.MethodPatch}
 	wantTargets := []string{
 		"/v1/system/proxy-configuration",
-		"/v1/system/settings/depot",
+		"/v1/services-config",
 		"/v1/system/settings/depot/depot-sync-info",
 	}
-	wantIDs := []string{"updateProxyConfiguration", "updateDepotSettings", "syncDepotMetadata"}
+	wantIDs := []string{"updateProxyConfiguration", "updateServicesConfig", "syncDepotMetadata"}
 	for index, request := range requests {
 		if request.OperationID != wantIDs[index] || request.Method != wantMethods[index] || request.RawTarget != wantTargets[index] {
 			t.Fatalf("request %d = %+v", index+1, request)
@@ -247,13 +246,14 @@ func TestOptionalFieldsOmittedAndExplicitZeroValuesPreserved(t *testing.T) {
 		Host:            &empty,
 		IsAuthenticated: pointer(false),
 	}
-	depot := vcfinstaller.DepotSettings{
-		VMwareAccount: &vcfinstaller.DepotAccount{DownloadToken: &empty},
-		DepotConfiguration: &vcfinstaller.DepotConfiguration{
-			IsOfflineDepot: false,
-		},
-	}
-	report, err := client.ConfigureDepotAccess(context.Background(), proxy, depot)
+	services := vcfinstaller.ServicesConfig{Services: []vcfinstaller.ServiceConfig{{
+		Name: empty, Type: "VCF_DEPOT", Key: empty,
+		Nodes: []vcfinstaller.ServiceNode{{
+			Name:      empty,
+			Addresses: []vcfinstaller.ServiceNodeAddress{{Type: "Fqdn", Value: empty}},
+		}},
+	}}}
+	report, err := client.ConfigureDepotAccess(context.Background(), proxy, services)
 	if err != nil || report.Outcome != vcfinstaller.OutcomeAccepted {
 		t.Fatalf("report=%#v error=%v", report, err)
 	}
@@ -262,14 +262,14 @@ func TestOptionalFieldsOmittedAndExplicitZeroValuesPreserved(t *testing.T) {
 		t.Fatalf("request count = %d, want 3", len(requests))
 	}
 	wantProxy := `{"isEnabled":false,"host":"","isAuthenticated":false}`
-	wantDepot := `{"vmwareAccount":{"downloadToken":""},"depotConfiguration":{"isOfflineDepot":false}}`
+	wantServices := `{"services":[{"name":"","type":"VCF_DEPOT","key":"","nodes":[{"name":"","addresses":[{"type":"Fqdn","value":""}]}]}]}`
 	if string(requests[0].Body) != wantProxy {
 		t.Fatalf("proxy body = %s, want %s", requests[0].Body, wantProxy)
 	}
-	if string(requests[1].Body) != wantDepot {
-		t.Fatalf("depot body = %s, want %s", requests[1].Body, wantDepot)
+	if string(requests[1].Body) != wantServices {
+		t.Fatalf("services body = %s, want %s", requests[1].Body, wantServices)
 	}
-	for _, forbidden := range []string{"transferProtocol", "username", "password", "offlineAccount", "hostname", "port", "url", "isConfigured", "status", "message", "null"} {
+	for _, forbidden := range []string{"transferProtocol", "username", "password", "version", "port", "baseUrl", "certificates", "isConfigured", "status", "message", "null"} {
 		if strings.Contains(string(requests[0].Body), forbidden) || strings.Contains(string(requests[1].Body), forbidden) {
 			t.Errorf("unset or response-only member %q was serialized: %s %s", forbidden, requests[0].Body, requests[1].Body)
 		}
@@ -297,19 +297,19 @@ func TestFailurePositionReportTable(t *testing.T) {
 		},
 		{
 			name:          "second mutation rejected",
-			scenario:      contractmock.Scenario{FailOperation: "updateDepotSettings", FailStatus: 500},
+			scenario:      contractmock.Scenario{FailOperation: "updateServicesConfig", FailStatus: 500},
 			wantOutcome:   vcfinstaller.OutcomePartialFailure,
 			wantStatuses:  []vcfinstaller.StepStatus{vcfinstaller.StepAccepted, vcfinstaller.StepFailed, vcfinstaller.StepNotRun},
 			wantHTTP:      []int{202, 500, 0},
 			wantCalls:     2,
-			wantErrorCode: "VCF_DEPOT_SETTINGS_FAILED",
+			wantErrorCode: "VCF_SERVICES_CONFIG_FAILED",
 		},
 		{
 			name:         "all calls accepted",
 			scenario:     contractmock.Scenario{},
 			wantOutcome:  vcfinstaller.OutcomeAccepted,
 			wantStatuses: []vcfinstaller.StepStatus{vcfinstaller.StepAccepted, vcfinstaller.StepAccepted, vcfinstaller.StepAccepted},
-			wantHTTP:     []int{202, 202, 202},
+			wantHTTP:     []int{202, 200, 202},
 			wantCalls:    3,
 		},
 	}
@@ -320,8 +320,8 @@ func TestFailurePositionReportTable(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			proxy, depot := bootstrapInputs()
-			report, err := client.ConfigureDepotAccess(context.Background(), proxy, depot)
+			proxy, services := bootstrapInputs()
+			report, err := client.ConfigureDepotAccess(context.Background(), proxy, services)
 			if report.Outcome != test.wantOutcome || len(report.Steps) != 3 {
 				t.Fatalf("report = %#v", report)
 			}
@@ -379,8 +379,8 @@ func TestProxyAcceptedResponseProtocolTable(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			proxy, depot := bootstrapInputs()
-			report, err := client.ConfigureDepotAccess(context.Background(), proxy, depot)
+			proxy, services := bootstrapInputs()
+			report, err := client.ConfigureDepotAccess(context.Background(), proxy, services)
 			var protocolError *vcfinstaller.ProtocolError
 			if !errors.As(err, &protocolError) || protocolError.OperationID != "updateProxyConfiguration" {
 				t.Fatalf("error = %T %v, want proxy ProtocolError", err, err)
@@ -402,8 +402,8 @@ func TestExactAcceptedStatusRequired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy, depot := bootstrapInputs()
-	report, err := client.ConfigureDepotAccess(context.Background(), proxy, depot)
+	proxy, services := bootstrapInputs()
+	report, err := client.ConfigureDepotAccess(context.Background(), proxy, services)
 	var apiError *vcfinstaller.APIError
 	if !errors.As(err, &apiError) || apiError.OperationID != "updateProxyConfiguration" || apiError.StatusCode != 200 {
 		t.Fatalf("error = %T %#v", err, err)
@@ -425,8 +425,8 @@ func TestTransportFailureIsSecretSafeAndReportsPosition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy, depot := bootstrapInputs()
-	report, err := client.ConfigureDepotAccess(context.Background(), proxy, depot)
+	proxy, services := bootstrapInputs()
+	report, err := client.ConfigureDepotAccess(context.Background(), proxy, services)
 	var transportError *vcfinstaller.TransportError
 	if !errors.As(err, &transportError) || transportError.OperationID != "updateProxyConfiguration" {
 		t.Fatalf("error = %T %v, want TransportError", err, err)
@@ -451,8 +451,8 @@ func TestRedirectIsRejectedWithoutFollowing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy, depot := bootstrapInputs()
-	report, err := client.ConfigureDepotAccess(context.Background(), proxy, depot)
+	proxy, services := bootstrapInputs()
+	report, err := client.ConfigureDepotAccess(context.Background(), proxy, services)
 	var apiError *vcfinstaller.APIError
 	if !errors.As(err, &apiError) || apiError.OperationID != "updateProxyConfiguration" || apiError.StatusCode != http.StatusTemporaryRedirect {
 		t.Fatalf("error = %T %#v, want proxy APIError for redirect", err, err)
@@ -472,8 +472,8 @@ func TestDeadlineErrorIsPreserved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy, depot := bootstrapInputs()
-	report, err := client.ConfigureDepotAccess(context.Background(), proxy, depot)
+	proxy, services := bootstrapInputs()
+	report, err := client.ConfigureDepotAccess(context.Background(), proxy, services)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %T %v, want preserved deadline", err, err)
 	}
@@ -505,8 +505,8 @@ func TestAcceptedAndRejectedResponseBodiesAreClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy, depot := bootstrapInputs()
-	report, err := client.ConfigureDepotAccess(context.Background(), proxy, depot)
+	proxy, services := bootstrapInputs()
+	report, err := client.ConfigureDepotAccess(context.Background(), proxy, services)
 	var apiError *vcfinstaller.APIError
 	if !errors.As(err, &apiError) || report.Outcome != vcfinstaller.OutcomePartialFailure || calls.Load() != 2 {
 		t.Fatalf("calls=%d report=%#v error=%T %v", calls.Load(), report, err, err)
@@ -569,8 +569,8 @@ func TestContextAndConstructorValidationTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy, depot := bootstrapInputs()
-	report, err := client.ConfigureDepotAccess(nil, proxy, depot)
+	proxy, services := bootstrapInputs()
+	report, err := client.ConfigureDepotAccess(nil, proxy, services)
 	if err == nil || calls.Load() != 0 || report.Outcome != vcfinstaller.OutcomeFailed || len(report.Steps) != 3 {
 		t.Fatalf("nil context calls=%d report=%#v error=%v", calls.Load(), report, err)
 	}
@@ -593,8 +593,8 @@ func TestContextCancellationIsPreserved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy, depot := bootstrapInputs()
-	report, err := client.ConfigureDepotAccess(ctx, proxy, depot)
+	proxy, services := bootstrapInputs()
+	report, err := client.ConfigureDepotAccess(ctx, proxy, services)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %T %v, want preserved cancellation", err, err)
 	}

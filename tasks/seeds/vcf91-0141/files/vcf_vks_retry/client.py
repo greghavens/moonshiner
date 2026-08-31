@@ -1,4 +1,4 @@
-"""Implement the contract-pinned VCF 9.1 retry workflow here."""
+"""Implement the focused VCF 9.1 retry workflow here."""
 
 from __future__ import annotations
 

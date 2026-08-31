@@ -180,7 +180,7 @@ class Handler(BaseHTTPRequestHandler):
         valid = (
             valid_query
             and page_size == scenario["page_size"]
-            and page_number >= 0
+            and page_number >= 1
             and not body
             and entry["contentType"] is None
             and entry["accept"] == "application/json"
@@ -215,7 +215,7 @@ class Handler(BaseHTTPRequestHandler):
             if total_elements
             else 0
         )
-        if total_pages and page_number >= total_pages:
+        if total_pages and page_number > total_pages:
             self._send_json(
                 entry,
                 400,
@@ -225,7 +225,7 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
-        start = page_number * page_size
+        start = (page_number - 1) * page_size
         elements = [dict(item) for item in clusters[start : start + page_size]]
         with state.state_lock:
             reverse = state.reverse_next_response

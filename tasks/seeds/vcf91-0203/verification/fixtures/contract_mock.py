@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import re
+import secrets
 from threading import Thread
 from typing import Any, Iterable
 from urllib.parse import unquote, urlsplit
@@ -42,6 +43,7 @@ class ContractMock:
         task_id: str = "task-bundle-download-91",
         start_response: tuple[int, Any] | None = None,
         task_responses: Iterable[tuple[int, Any]] | None = None,
+        visibility_misses: int = 0,
     ):
         self.poll_statuses = tuple(poll_statuses)
         self.task_responses = (
@@ -52,8 +54,10 @@ class ContractMock:
         if self.task_responses is not None and not self.task_responses:
             raise ValueError("task_responses must not be empty")
         self.start_response = start_response
+        self.access_token = secrets.token_urlsafe(18)
         self.request_log: list[RequestRecord] = []
         self._poll_index = 0
+        self._visibility_misses = visibility_misses
         self._task_id = task_id
         self._server: ThreadingHTTPServer | None = None
         self._thread: Thread | None = None
@@ -118,6 +122,9 @@ class ContractMock:
 
             def do_PATCH(self) -> None:  # noqa: N802 - stdlib handler API
                 record = self._read_and_record()
+                if record.headers.get("authorization") != "Bearer " + owner.access_token:
+                    self._json(401, {"errorCode": "Unauthorized", "message": "Unauthorized"})
+                    return
                 match = re.fullmatch(r"/v1/bundles/([^/]+)", record.path)
                 if match is None or record.query:
                     self._json(404, {"message": "operation is not in the pinned contract"})
@@ -138,12 +145,24 @@ class ContractMock:
 
             def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
                 record = self._read_and_record()
+                if record.headers.get("authorization") != "Bearer " + owner.access_token:
+                    self._json(401, {"errorCode": "Unauthorized", "message": "Unauthorized"})
+                    return
                 match = re.fullmatch(r"/v1/tasks/([^/]+)", record.path)
                 if match is None or record.query or record.raw_body:
                     self._json(404, {"message": "operation is not in the pinned contract"})
                     return
                 if unquote(match.group(1)) != owner._task_id:
                     self._json(404, {"message": "task not found"})
+                    return
+                if owner._visibility_misses > 0:
+                    owner._visibility_misses -= 1
+                    self._json(404, {
+                        "errorCode": "TA_TASK_NOT_FOUND",
+                        "arguments": [owner._task_id],
+                        "message": f"Task with ID {owner._task_id} not found",
+                        "referenceToken": "loopback-reference",
+                    })
                     return
                 if owner.task_responses is not None:
                     response = owner.task_responses[

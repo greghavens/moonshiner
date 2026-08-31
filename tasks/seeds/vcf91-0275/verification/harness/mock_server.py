@@ -25,15 +25,15 @@ PASSWORD = "R3port!Pass"
 # The last element repeats for every further poll.
 DEFINITION_TIMELINES = {
     # completes on the third poll
-    "97417a6d-708d-4b12-9142-484b5a0df4dc": ["Queued", "Running", "Completed"],
+    "97417a6d-708d-4b12-9142-484b5a0df4dc": ["QUEUED", "RUNNING", "COMPLETED"],
     # reaches a terminal FAILED on the third poll
-    "1c0b9c1e-8f4a-4f52-9d6a-2b7c5e3a91fd": ["Queued", "Running", "Failed"],
+    "1c0b9c1e-8f4a-4f52-9d6a-2b7c5e3a91fd": ["QUEUED", "RUNNING", "FAILED"],
     # never reaches a terminal status
-    "5f2d7a34-6b19-4c88-a0e3-9d41f7b26c50": ["Running"],
+    "5f2d7a34-6b19-4c88-a0e3-9d41f7b26c50": ["RUNNING"],
 }
 
 CSV_BODY = "Cluster,Capacity Remaining %,Time Remaining (days)\r\nvcf-m01-cl01,42,118\r\nvcf-w01-cl01,17,26\r\n"
-PDF_BODY = b"%PDF-1.4\n% VCF Operations report fixture\n%%EOF\n"
+PDF_BODY = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n% VCF Operations report fixture\n%%EOF\n"
 
 AUTH_SCHEME = "vRealizeOpsToken"
 
@@ -164,7 +164,7 @@ def op_create_report(ctx):
         "name": "Cluster Capacity Risk Forecast Report",
         "description": "Cluster Capacity Risk Forecast Report",
         "owner": USERNAME,
-        "status": "Queued",
+        "status": "QUEUED",
         "subject": [],
         "publish": False,
         "links": [
@@ -209,14 +209,16 @@ def op_download_report(ctx):
     report = STATE.reports.get(report_id)
     if report is None:
         return 404, "application/json", b'{"message":"No such Report"}', {}
-    status = _status_for(report) if report["polls"] else "Queued"
+    status = _status_for(report) if report["polls"] else "QUEUED"
     if status.upper() != "COMPLETED":
         msg = {"message": "Report %s is not ready for download (status %s)" % (report_id, status)}
         return 409, "application/json", json.dumps(msg).encode("utf-8"), {"servedStatus": status}
-    fmt = dict(ctx["query"]).get("format", "CSV")
+    # The deployed 9.1 appliance defaults an omitted format to PDF.
+    fmt = dict(ctx["query"]).get("format", "PDF")
     if fmt.upper() == "PDF":
         return 200, "application/pdf", PDF_BODY, {"servedFormat": "PDF"}
-    return 200, "text/csv", CSV_BODY.encode("utf-8"), {"servedFormat": "CSV"}
+    # The live CSV download is served as application/octet-stream.
+    return 200, "application/octet-stream", CSV_BODY.encode("utf-8"), {"servedFormat": "CSV"}
 
 
 HANDLERS = {

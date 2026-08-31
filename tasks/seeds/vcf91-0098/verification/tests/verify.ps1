@@ -112,6 +112,14 @@ try {
         'Vcenter.Authorization.Privileges.IterationSpec'.`
         properties.page_size.defaultWhenMissing 200 `
         'specification page-size default'
+    Assert-Equal $Contract.schemas.`
+        'Vcenter.Authorization.Privileges.IterationSpec'.`
+        properties.page_size.minimum 1 `
+        'live page-size minimum'
+    Assert-Equal $Contract.schemas.`
+        'Vcenter.Authorization.Privileges.IterationSpec'.`
+        properties.page_size.maximum 1000 `
+        'live page-size maximum'
     Assert-Equal (($Contract.schemas.`
         'Vcenter.Authorization.Privileges.Info'.required) -join ',') `
         'description,name,on_parent,version' `
@@ -187,63 +195,72 @@ try {
         'runtime exports'
 
     $RunId = [guid]::NewGuid().ToString('N')
-    $OldToken = 'old-' + $RunId.Substring(0, 12)
-    $FreshToken = 'fresh-' + $RunId.Substring(12, 12)
-    $MarkerOne = 'after ' + $RunId.Substring(24, 4) + '/one+?&'
-    $MarkerTwo = 'after+' + $RunId.Substring(28, 4) + '/two ?'
+    $OldToken = $RunId
+    $FreshToken = [guid]::NewGuid().ToString('N')
+    $MarkerOne = (
+        'BjTqebRYWShdB3nui20Kwe+VLlPYyXy6' +
+        'AHLhjTPhmVPHPsEwgbvKQfWMUJq+bP5r'
+    )
+    $MarkerTwo = (
+        '/jTqebRYWShdB3nui20Kwe+VLlPYyXy6' +
+        'AHLhjTPhmVPHPsEwgbvKQfWMUJq+bP5+'
+    )
     $Privileges = @(
         [ordered]@{
-            privilege = 'zulu.' + $RunId.Substring(0, 4)
+            privilege = 'Zone.ObjectAttachable'
             info = [ordered]@{
-                name = 'zulu.' + $RunId.Substring(0, 4)
-                description = 'runtime zulu'
+                name = 'Zone.ObjectAttachable'
+                description = (
+                    'Attach and Detach vSphere objects for vSphere Zones ' +
+                    'in vCenter'
+                )
                 on_parent = $false
-                version = 4
+                version = 0
             }
         },
         [ordered]@{
-            privilege = 'Alpha.' + $RunId.Substring(4, 4)
+            privilege = 'Alarm.Acknowledge'
             info = [ordered]@{
-                name = 'Alpha.' + $RunId.Substring(4, 4)
-                description = 'runtime uppercase alpha'
-                on_parent = $true
-                version = 2
-            }
-        },
-        [ordered]@{
-            privilege = 'alpha.' + $RunId.Substring(8, 4)
-            info = [ordered]@{
-                name = 'alpha.' + $RunId.Substring(8, 4)
-                description = 'runtime lowercase alpha'
+                name = 'Alarm.Acknowledge'
+                description = 'Acknowledge an alarm'
                 on_parent = $false
-                version = 8
+                version = 0
             }
         },
         [ordered]@{
-            privilege = 'Bravo.' + $RunId.Substring(12, 4)
+            privilege = 'System.Read'
             info = [ordered]@{
-                name = 'Bravo.' + $RunId.Substring(12, 4)
-                description = 'runtime uppercase bravo'
-                on_parent = $true
-                version = 3
-            }
-        },
-        [ordered]@{
-            privilege = 'bravo.' + $RunId.Substring(16, 4)
-            info = [ordered]@{
-                name = 'bravo.' + $RunId.Substring(16, 4)
-                description = 'runtime lowercase bravo'
+                name = 'System.Read'
+                description = 'Grants read access to an entity'
                 on_parent = $false
-                version = 5
+                version = 0
             }
         },
         [ordered]@{
-            privilege = 'Charlie.' + $RunId.Substring(20, 4)
+            privilege = 'Host.Config.Settings'
             info = [ordered]@{
-                name = 'Charlie.' + $RunId.Substring(20, 4)
-                description = 'runtime uppercase charlie'
-                on_parent = $true
-                version = 6
+                name = 'Host.Config.Settings'
+                description = 'Change host settings'
+                on_parent = $false
+                version = 0
+            }
+        },
+        [ordered]@{
+            privilege = 'Nsx.Manage'
+            info = [ordered]@{
+                name = 'Nsx.Manage'
+                description = ''
+                on_parent = $false
+                version = 0
+            }
+        },
+        [ordered]@{
+            privilege = 'VirtualMachine.Interact.PowerOn'
+            info = [ordered]@{
+                name = 'VirtualMachine.Interact.PowerOn'
+                description = 'Power on or resume a virtual machine'
+                on_parent = $false
+                version = 0
             }
         }
     )
@@ -406,9 +423,9 @@ try {
     $ExpectedPrivilegeOrder = @(
         $Privileges[1].privilege,
         $Privileges[3].privilege,
-        $Privileges[5].privilege,
-        $Privileges[2].privilege,
         $Privileges[4].privilege,
+        $Privileges[2].privilege,
+        $Privileges[5].privilege,
         $Privileges[0].privilege
     )
     Assert-Equal (($First.privilege) -join ',') `
@@ -420,9 +437,9 @@ try {
     Assert-Equal (($First.info.description) -join ',') `
         (($Privileges[1].info.description,
           $Privileges[3].info.description,
-          $Privileges[5].info.description,
-          $Privileges[2].info.description,
           $Privileges[4].info.description,
+          $Privileges[2].info.description,
+          $Privileges[5].info.description,
           $Privileges[0].info.description) -join ',') `
         'complete privilege info is preserved'
 
@@ -667,17 +684,19 @@ try {
             $InvalidPageSizeCalls.Count++
             return [pscustomobject]@{ items = @() }
         }.GetNewClosure()
-    $InvalidPageSizeError = $null
-    try {
-        Get-VcfVcenterPrivilegeInventory `
-            -Session $InvalidPageSizeSession `
-            -PageSize 0 > $null
+    foreach ($InvalidPageSize in @(0, 1001)) {
+        $InvalidPageSizeError = $null
+        try {
+            Get-VcfVcenterPrivilegeInventory `
+                -Session $InvalidPageSizeSession `
+                -PageSize $InvalidPageSize > $null
+        }
+        catch {
+            $InvalidPageSizeError = $_
+        }
+        Assert-True ($null -ne $InvalidPageSizeError) `
+            "PageSize $InvalidPageSize is rejected"
     }
-    catch {
-        $InvalidPageSizeError = $_
-    }
-    Assert-True ($null -ne $InvalidPageSizeError) `
-        'a non-positive PageSize is rejected'
     Assert-Equal $InvalidPageSizeCalls.Count 0 `
         'invalid PageSize is rejected before an operation call'
 

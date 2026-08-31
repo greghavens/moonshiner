@@ -19,6 +19,7 @@ import (
 const (
 	UpdateOrRotatePasswords = "updateOrRotatePasswords"
 	GetCredentialsTask      = "getCredentialsTask"
+	GetCredentials          = "getCredentials"
 )
 
 // VCFError is the focused contract error shape.
@@ -71,6 +72,7 @@ type RuntimeValues struct {
 	NewPassword     string
 	Username        string
 	TaskID          string
+	ResourceName    string
 }
 
 type contractOperation struct {
@@ -106,6 +108,7 @@ func New(contractPath string, plan Plan) (*Server, error) {
 			NewPassword:     randomValue("new-password"),
 			Username:        randomValue("svc-user"),
 			TaskID:          randomValue("credential task"),
+			ResourceName:    randomValue("resource"),
 		},
 	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -153,6 +156,11 @@ func loadOperations(path string) (map[string]contractOperation, error) {
 			OperationID: GetCredentialsTask,
 			Method:      http.MethodGet,
 			Path:        "/v1/credentials/tasks/{id}",
+		},
+		GetCredentials: {
+			OperationID: GetCredentials,
+			Method:      http.MethodGet,
+			Path:        "/v1/credentials",
 		},
 	}
 	if len(allowed) != len(required) {
@@ -225,7 +233,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if r.URL.RawQuery != "" {
+	if operationID != GetCredentials && r.URL.RawQuery != "" {
 		writeJSON(w, http.StatusBadRequest, VCFError{
 			ErrorCode: "QUERY_NOT_IN_CONTRACT",
 			Message:   "the selected operations have no query parameters",
@@ -235,9 +243,11 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch operationID {
 	case UpdateOrRotatePasswords:
-		s.submit(w)
+		s.submit(w, body)
 	case GetCredentialsTask:
 		s.poll(w)
+	case GetCredentials:
+		s.credentials(w, r)
 	}
 }
 
@@ -257,10 +267,52 @@ func (s *Server) operationFor(method, path string) string {
 			return operation.OperationID
 		}
 	}
+	if operation, ok := s.allowed[GetCredentials]; ok &&
+		method == operation.Method && path == operation.Path {
+		return operation.OperationID
+	}
 	return ""
 }
 
-func (s *Server) submit(w http.ResponseWriter) {
+func (s *Server) credentials(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	if query.Get("resourceName") != s.runtime.ResourceName ||
+		query.Get("resourceType") != "VCENTER" || len(query) < 2 {
+		writeJSON(w, http.StatusBadRequest, VCFError{
+			ErrorCode: "INVALID_FILTER",
+			Message:   "supported credential filters are required",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"elements": []map[string]any{
+			{
+				"credentialType": "SSO",
+				"accountType":    "SERVICE",
+				"username":       s.runtime.Username,
+				"password":       s.runtime.NewPassword,
+				"resource": map[string]any{
+					"resourceId": randomValue("resource-id"),
+					"name":       s.runtime.ResourceName,
+					"type":       "VCENTER",
+				},
+			},
+		},
+		"pageMetadata": map[string]any{"totalElements": 1},
+	})
+}
+
+func (s *Server) submit(w http.ResponseWriter, body []byte) {
+	var request struct {
+		Elements []struct {
+			ResourceName *string `json:"resourceName"`
+		} `json:"elements"`
+	}
+	if json.Unmarshal(body, &request) == nil && len(request.Elements) == 1 &&
+		request.Elements[0].ResourceName != nil &&
+		strings.TrimSpace(*request.Elements[0].ResourceName) != "" {
+		s.runtime.ResourceName = *request.Elements[0].ResourceName
+	}
 	status := s.plan.SubmitStatus
 	if status == 0 {
 		status = http.StatusAccepted
@@ -345,7 +397,9 @@ func (s *Server) subTask(
 		"completionTimestamp": "2026-01-02T03:04:06Z",
 		"status":              status,
 		"username":            s.runtime.Username,
-		"newPassword":         newPassword,
+		"resourceName":        s.runtime.ResourceName,
+		"credentialType":      "SSO",
+		"newPassword":         "",
 		"errors":              taskErrors,
 	}
 }

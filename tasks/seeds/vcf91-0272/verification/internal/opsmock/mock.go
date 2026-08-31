@@ -100,6 +100,8 @@ type Config struct {
 
 	// InstanceID is the id reported for a created adapter instance.
 	InstanceID string
+	// CredentialID is assigned when testConnection receives an inline credential.
+	CredentialID string
 	// ResourceKindKey is reported in the resourceKey of adapter-instance
 	// responses.
 	ResourceKindKey string
@@ -130,6 +132,9 @@ func (c *Config) applyDefaults() {
 	if c.InstanceID == "" {
 		c.InstanceID = "c7e0b4a2-53d1-4a8f-9b16-2ac4f0d9e781"
 	}
+	if c.CredentialID == "" {
+		c.CredentialID = "30dfdb20-8e9a-4ef1-a9c3-a9c8ad0e75e8"
+	}
 	if c.ResourceKindKey == "" {
 		c.ResourceKindKey = "ADAPTER_INSTANCE"
 	}
@@ -144,9 +149,10 @@ type Server struct {
 	cfg  Config
 	http *http.Client
 
-	mu        sync.Mutex
-	requests  []RequestRecord
-	instances []Instance
+	mu          sync.Mutex
+	requests    []RequestRecord
+	instances   []Instance
+	credentials int
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -196,12 +202,20 @@ func (s *Server) Instances() []Instance {
 	return out
 }
 
+// CredentialCount reports credentials persisted as a side effect of precheck.
+func (s *Server) CredentialCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.credentials
+}
+
 // Reset clears the request log and the created-instance inventory.
 func (s *Server) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requests = nil
 	s.instances = nil
+	s.credentials = 0
 }
 
 type errorBody struct {
@@ -216,9 +230,10 @@ type resourceKey struct {
 }
 
 type adapterInstance struct {
-	ID          string      `json:"id,omitempty"`
-	ResourceKey resourceKey `json:"resourceKey"`
-	Description string      `json:"description,omitempty"`
+	ID                   string      `json:"id,omitempty"`
+	CredentialInstanceID string      `json:"credentialInstanceId,omitempty"`
+	ResourceKey          resourceKey `json:"resourceKey"`
+	Description          string      `json:"description,omitempty"`
 }
 
 type authToken struct {
@@ -332,17 +347,35 @@ func decodeCreate(body []byte) (name, adapterKindKey string, err *errorBody) {
 	return name, adapterKindKey, nil
 }
 
+func credentialFrom(body []byte) map[string]any {
+	var req map[string]any
+	_ = json.Unmarshal(body, &req)
+	credential, _ := req["credential"].(map[string]any)
+	return credential
+}
+
 func (s *Server) testConnection(body []byte) (int, any) {
 	name, kind, bad := decodeCreate(body)
 	if bad != nil {
 		return bad.HTTPStatusCode, *bad
 	}
+	credentialID := ""
+	if credential := credentialFrom(body); credential != nil {
+		credentialID, _ = credential["id"].(string)
+		if credentialID == "" {
+			credentialID = s.cfg.CredentialID
+			s.mu.Lock()
+			s.credentials++
+			s.mu.Unlock()
+		}
+	}
 	if s.cfg.PrecheckStatus != http.StatusCreated {
 		return s.cfg.PrecheckStatus, errorBody{Message: s.cfg.PrecheckMessage, HTTPStatusCode: s.cfg.PrecheckStatus}
 	}
-	// A passing precheck creates nothing, so the response carries no id.
 	return http.StatusCreated, adapterInstance{
-		ResourceKey: resourceKey{Name: name, AdapterKindKey: kind, ResourceKindKey: s.cfg.ResourceKindKey},
+		ID:                   "374b4dab-5271-449f-bccf-ff00b2fb3be9",
+		CredentialInstanceID: credentialID,
+		ResourceKey:          resourceKey{Name: name, AdapterKindKey: kind, ResourceKindKey: s.cfg.ResourceKindKey},
 	}
 }
 
@@ -350,6 +383,21 @@ func (s *Server) createAdapterInstance(body []byte) (int, any) {
 	name, kind, bad := decodeCreate(body)
 	if bad != nil {
 		return bad.HTTPStatusCode, *bad
+	}
+	if credential := credentialFrom(body); credential != nil {
+		id, _ := credential["id"].(string)
+		if id != s.cfg.CredentialID {
+			return http.StatusUnprocessableEntity, errorBody{
+				Message:        "CredentialInstance already exists or was not identified by id",
+				HTTPStatusCode: http.StatusUnprocessableEntity,
+			}
+		}
+		if _, sentFields := credential["fields"]; sentFields {
+			return http.StatusUnprocessableEntity, errorBody{
+				Message:        "existing credential fields must not be re-sent",
+				HTTPStatusCode: http.StatusUnprocessableEntity,
+			}
+		}
 	}
 	if s.cfg.CreateStatus != http.StatusCreated {
 		return s.cfg.CreateStatus, errorBody{Message: s.cfg.CreateMessage, HTTPStatusCode: s.cfg.CreateStatus}

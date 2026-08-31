@@ -141,7 +141,7 @@ final class ContractMock implements AutoCloseable {
                     400, "{\"message\":\"bad token request\"}");
             return;
         }
-        send(exchange, operation, "POST", operation.path(), rawQuery, authorization, body, 201,
+        send(exchange, operation, "POST", operation.path(), rawQuery, authorization, body, 200,
                 "{\"accessToken\":\"access-expiring\","
                         + "\"refreshToken\":{\"id\":\"refresh-token-1\"}}");
     }
@@ -178,7 +178,7 @@ final class ContractMock implements AutoCloseable {
         }
         boolean validQuery = query.size() == 2
                 && "2".equals(query.get("pageSize"))
-                && (pageNumber == 0 || pageNumber == 1);
+                && (pageNumber == 1 || pageNumber == 2);
         if (!body.isEmpty() || !validQuery) {
             send(exchange, operation, "GET", operation.path(), rawQuery, authorization, body,
                     400, "{\"message\":\"bad page request\"}");
@@ -198,7 +198,7 @@ final class ContractMock implements AutoCloseable {
         }
 
         List<String> elements = new ArrayList<>();
-        if (pageNumber == 0) {
+        if (pageNumber == 1) {
             elements.add("{\"id\":\"domain-1\",\"name\":\"Alpha\"}");
             elements.add("{\"id\":\"domain-4\",\"name\":\"Zulu\"}");
         } else {

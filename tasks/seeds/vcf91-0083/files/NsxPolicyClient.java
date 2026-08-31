@@ -16,6 +16,7 @@ public final class NsxPolicyClient {
 
     public record PolicySpec(
             String displayName,
+            String ruleId,
             String ruleDisplayName,
             String destinationGroupPath,
             int sequenceNumber,

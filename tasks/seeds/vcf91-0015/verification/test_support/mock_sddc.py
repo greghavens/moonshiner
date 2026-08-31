@@ -142,7 +142,7 @@ class MockSddcManager:
                         },
                     )
                     return
-                if page_number < 0 or requested_size <= 0:
+                if page_number < 1 or requested_size <= 0:
                     self._send_json(
                         400,
                         {
@@ -165,7 +165,7 @@ class MockSddcManager:
 
                 total = len(selected)
                 total_pages = math.ceil(total / requested_size) if total else 0
-                start = page_number * requested_size
+                start = (page_number - 1) * requested_size
                 elements = selected[start : start + requested_size]
                 self._send_json(
                     200,

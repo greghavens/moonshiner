@@ -10,7 +10,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 
 def load_object(path: str) -> dict:
@@ -111,6 +111,7 @@ def main() -> int:
         raise ValueError("scenario initial_info must be an object")
 
     allowed_path = path_template.replace("{vm}", quote(vm, safe=""))
+    path_prefix, path_suffix = path_template.split("{vm}", 1)
     state = {
         "info": copy.deepcopy(initial_info),
         "patch_attempts": 0,
@@ -147,9 +148,15 @@ def main() -> int:
             content_length = int(self.headers.get("Content-Length", "0") or "0")
             body = self.rfile.read(content_length) if content_length else b""
             operation = operation_by_method.get(self.command)
-            operation_match = (
-                operation is not None and split.path == allowed_path
+            route_match = (
+                split.path.startswith(path_prefix)
+                and split.path.endswith(path_suffix)
+                and len(split.path) > len(path_prefix) + len(path_suffix)
             )
+            operation_match = (
+                operation is not None and route_match
+            )
+            resource_exists = split.path == allowed_path
 
             common_valid = (
                 operation_match
@@ -179,44 +186,69 @@ def main() -> int:
                         "error_type": "INVALID_ARGUMENT",
                         "messages": [],
                     }
+                elif not resource_exists:
+                    missing_vm = unquote(
+                        split.path[len(path_prefix) : -len(path_suffix)]
+                    )
+                    status = 404
+                    response = {
+                        "error_type": "NOT_FOUND",
+                        "messages": [
+                            {
+                                "id": "vmsg.ManagedObjectNotFound.summary",
+                                "default_message": (
+                                    f"Virtual machine {missing_vm} was not found."
+                                ),
+                                "args": [missing_vm],
+                            }
+                        ],
+                    }
                 else:
                     with state_lock:
                         response = copy.deepcopy(state["info"])
                     status = 200
             elif common_valid and self.command == "PATCH":
-                try:
-                    request_json = json.loads(body.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    request_json = None
-                patch_valid = (
-                    self.headers.get("Content-Type") == "application/json"
-                    and isinstance(request_json, dict)
-                    and list(request_json) == ["count"]
-                    and isinstance(request_json["count"], int)
-                    and not isinstance(request_json["count"], bool)
-                    and request_json["count"]
-                    in {desired_count, successful_count}
-                )
-                if not patch_valid:
-                    status = 400
+                if not resource_exists:
+                    status = 404
                     response = {
-                        "error_type": "INVALID_ARGUMENT",
+                        "error_type": "NOT_FOUND",
                         "messages": [],
                     }
+                    request_json = None
                 else:
-                    with state_lock:
-                        state["patch_attempts"] += 1
-                        state["info"]["count"] = request_json["count"]
-                        attempt = state["patch_attempts"]
-                    if attempt == 1:
-                        status = 503
+                    try:
+                        request_json = json.loads(body.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        request_json = None
+                    patch_valid = (
+                        self.headers.get("Content-Type") == "application/json"
+                        and isinstance(request_json, dict)
+                        and list(request_json) == ["count"]
+                        and isinstance(request_json["count"], int)
+                        and not isinstance(request_json["count"], bool)
+                        and request_json["count"]
+                        in {desired_count, successful_count}
+                    )
+                    if not patch_valid:
+                        status = 400
                         response = {
-                            "error_type": "SERVICE_UNAVAILABLE",
+                            "error_type": "INVALID_ARGUMENT",
                             "messages": [],
                         }
                     else:
-                        status = 204
-                        response = None
+                        with state_lock:
+                            state["patch_attempts"] += 1
+                            state["info"]["count"] = request_json["count"]
+                            attempt = state["patch_attempts"]
+                        if attempt == 1:
+                            status = 503
+                            response = {
+                                "error_type": "SERVICE_UNAVAILABLE",
+                                "messages": [],
+                            }
+                        else:
+                            status = 204
+                            response = None
 
             entry = {
                 "operationId": (

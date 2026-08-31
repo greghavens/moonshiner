@@ -12,10 +12,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PROTECTED_SHA256 = {
-    "docs/contract.json": "70d726a633ebe55269a965fac043f11af7d8137129b212b746f248e3531765a9",
+    "docs/contract.json": "ac369273655f6075829d9d16709c99bd94dbd316046b5fcf2a229f5ec83b69be",
     "docs/official_sources.json": "c526f68909072aef477f28c051b45eefc299272aea24a36aa7329b02b352dc0e",
-    "tests/MockVcenterServer.java": "efff9a56df8f6256c61c1900550cab8e95655db5d235e4ce78d9e65a469267cc",
-    "tests/TestMain.java": "0f817cbd20c1e3549c336a197ab817525a990ab0703f2e1d5aba2e6b969ccc65",
+    "tests/MockVcenterServer.java": "c5bc001a612be62787b7a69c4b261ce029f2aade3a13fa5e3e1c9393d6925bd2",
+    "tests/TestMain.java": "025c24557ee22261ce3978a4b612f2e23b919d70fe840cb36666f462ad2428f8",
 }
 
 

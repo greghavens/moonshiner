@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"reflect"
 	"sort"
@@ -24,8 +25,8 @@ import (
 const (
 	expectedCommit = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
 	expectedSpec   = "specifications/sddc-manager/sddc-manager-openapi.json"
-	contractSHA256 = "d78da0565db23a765e3f4088adc180538fb8772f95e804dd03f98c2a5c46234a"
-	sourcesSHA256  = "d44f06889979af8059a12f889ff77562cfd80326fac1fac6707830ab710ade88"
+	contractSHA256 = "faf58eecdb50fb0fdbc8c2c6c7432df56b4f0502e5b4d09fcc02197d8b12f367"
+	sourcesSHA256  = "adfbc28a41ae48a386d5fe7284a2b0877b2b8dd02620b7a21ab7e02ae03cd333"
 )
 
 type operationSource struct {
@@ -103,12 +104,13 @@ func TestProtectedContractProvenance(t *testing.T) {
 		t.Fatalf("derivation is not explicit: %q", sources.Derivation)
 	}
 
-	if len(contract.Operations) != 2 {
-		t.Fatalf("contract operations = %d, want 2", len(contract.Operations))
+	if len(contract.Operations) != 3 {
+		t.Fatalf("contract operations = %d, want 3", len(contract.Operations))
 	}
 	wantOperations := map[string][2]string{
-		"getNetworkPool":    {http.MethodGet, "/v1/network-pools"},
-		"createNetworkPool": {http.MethodPost, "/v1/network-pools"},
+		"getNetworkPool":            {http.MethodGet, "/v1/network-pools"},
+		"createNetworkPool":         {http.MethodPost, "/v1/network-pools"},
+		"getNetworksOfNetworkPool": {http.MethodGet, "/v1/network-pools/{id}/networks"},
 	}
 	for _, operation := range contract.Operations {
 		want, ok := wantOperations[operation.OperationID]
@@ -144,6 +146,17 @@ func TestProtectedContractProvenance(t *testing.T) {
 					"#/components/schemas/Error" {
 				t.Fatalf("createNetworkPool projection mismatch: %+v", operation)
 			}
+		case "getNetworksOfNetworkPool":
+			if operation.RequestBody != nil ||
+				operation.Responses["200"].MediaType != "application/json" ||
+				operation.Responses["200"].SchemaRef !=
+					"#/components/schemas/PageOfNetwork" ||
+				operation.Responses["404"].SchemaRef !=
+					"#/components/schemas/Error" ||
+				operation.Responses["500"].SchemaRef !=
+					"#/components/schemas/Error" {
+				t.Fatalf("getNetworksOfNetworkPool projection mismatch: %+v", operation)
+			}
 		}
 		delete(wantOperations, operation.OperationID)
 	}
@@ -163,6 +176,12 @@ func TestProtectedContractProvenance(t *testing.T) {
 			Method:      http.MethodPost,
 			Path:        "/v1/network-pools",
 			JSONPointer: "/paths/~1v1~1network-pools/post",
+		},
+		{
+			OperationID: "getNetworksOfNetworkPool",
+			Method:      http.MethodGet,
+			Path:        "/v1/network-pools/{id}/networks",
+			JSONPointer: "/paths/~1v1~1network-pools~1{id}~1networks/get",
 		},
 	}
 	if !reflect.DeepEqual(sources.Operations, wantSources) {
@@ -265,12 +284,14 @@ func TestEnsureNetworkPoolCreatesOnceThenAdopts(t *testing.T) {
 	}
 
 	requests := server.Requests()
-	if len(requests) != 3 {
-		t.Fatalf("request count = %d, want GET POST GET", len(requests))
+	if len(requests) != 5 {
+		t.Fatalf("request count = %d, want GET POST GET-networks GET GET-networks", len(requests))
 	}
 	assertListWire(t, requests[0], runtime.AccessToken)
 	assertCreateWire(t, requests[1], runtime.AccessToken, spec)
-	assertListWire(t, requests[2], runtime.AccessToken)
+	assertNetworkWire(t, requests[2], runtime.AccessToken, first.Pool.ID)
+	assertListWire(t, requests[3], runtime.AccessToken)
+	assertNetworkWire(t, requests[4], runtime.AccessToken, first.Pool.ID)
 }
 
 func TestRetryAfterCommittedLostResponseDoesNotDuplicateEffect(t *testing.T) {
@@ -296,8 +317,8 @@ func TestRetryAfterCommittedLostResponseDoesNotDuplicateEffect(t *testing.T) {
 		t.Fatalf("retry mutation effects = %d, want 1", got)
 	}
 	requests := server.Requests()
-	if len(requests) != 3 {
-		t.Fatalf("retry request count = %d, want GET POST GET", len(requests))
+	if len(requests) != 4 {
+		t.Fatalf("retry request count = %d, want GET POST GET GET-networks", len(requests))
 	}
 	postCount := 0
 	for _, request := range requests {
@@ -348,8 +369,8 @@ func TestConcurrentEnsuresSerializeWithoutDuplicateEffects(t *testing.T) {
 	if got := server.EffectCount(); got != 1 {
 		t.Fatalf("concurrent mutation effects = %d, want 1", got)
 	}
-	if got := len(server.Requests()); got != workers+1 {
-		t.Fatalf("request count = %d, want %d GETs plus one POST", got, workers)
+	if got := len(server.Requests()); got != 2*workers+1 {
+		t.Fatalf("request count = %d, want %d list/detail GETs plus one POST", got, 2*workers)
 	}
 }
 
@@ -396,8 +417,12 @@ func TestExistingDriftAndAmbiguityAreTableDriven(t *testing.T) {
 			if got := server.EffectCount(); got != 0 {
 				t.Fatalf("non-create case effects = %d, want 0", got)
 			}
-			if got := len(server.Requests()); got != 1 {
-				t.Fatalf("non-create request count = %d, want one GET", got)
+			wantRequests := 2
+			if testCase.wantAmbiguous {
+				wantRequests = 1
+			}
+			if got := len(server.Requests()); got != wantRequests {
+				t.Fatalf("non-create request count = %d, want %d", got, wantRequests)
 			}
 		})
 	}
@@ -493,6 +518,7 @@ func TestEnsureValidationIsLocalAndTableDriven(t *testing.T) {
 		{name: "blank name", spec: replaceName(valid, "")},
 		{name: "spaced name", spec: replaceName(valid, " pool")},
 		{name: "nil networks", spec: npe.NetworkPoolSpec{Name: "pool"}},
+		{name: "empty networks", spec: npe.NetworkPoolSpec{Name: "pool", Networks: []npe.NetworkSpec{}}},
 		{name: "blank type", spec: replaceNetwork(valid, func(n *npe.NetworkSpec) {
 			n.Type = ""
 		})},
@@ -756,6 +782,7 @@ func assertSchemaProjection(
 	t.Helper()
 	for _, name := range []string{
 		"PageOfNetworkPool",
+		"PageOfNetwork",
 		"PageMetadata",
 		"NetworkPool",
 		"Network",
@@ -785,6 +812,16 @@ func assertSchemaProjection(
 		page.Properties["pageMetadata"].Ref !=
 			"#/components/schemas/PageMetadata" {
 		t.Fatalf("PageOfNetworkPool projection mismatch: %+v", page)
+	}
+	if err := json.Unmarshal(schemas["PageOfNetwork"], &page); err != nil {
+		t.Fatalf("decode PageOfNetwork: %v", err)
+	}
+	if page.Properties["elements"].Type != "array" ||
+		page.Properties["elements"].Items.Ref !=
+			"#/components/schemas/Network" ||
+		page.Properties["pageMetadata"].Ref !=
+			"#/components/schemas/PageMetadata" {
+		t.Fatalf("PageOfNetwork projection mismatch: %+v", page)
 	}
 
 	var metadata struct {
@@ -916,6 +953,25 @@ func assertListWire(
 	}
 }
 
+func assertNetworkWire(
+	t *testing.T,
+	request contractmock.Request,
+	token string,
+	poolID string,
+) {
+	t.Helper()
+	if request.Method != http.MethodGet ||
+		request.Path != "/v1/network-pools/"+url.PathEscape(poolID)+"/networks" ||
+		request.RawQuery != "" ||
+		request.Header.Get("Accept") != "application/json" ||
+		request.Header.Get("Authorization") != "Bearer "+token ||
+		request.Header.Get("Content-Type") != "" ||
+		len(request.Body) != 0 ||
+		len(request.TransferEncoding) != 0 {
+		t.Fatalf("getNetworksOfNetworkPool wire mismatch: %+v", request)
+	}
+}
+
 func assertCreateWire(
 	t *testing.T,
 	request contractmock.Request,
@@ -1019,6 +1075,11 @@ func publicPools(input []contractmock.NetworkPool) []npe.NetworkPool {
 	var output []npe.NetworkPool
 	if err := json.Unmarshal(data, &output); err != nil {
 		panic(err)
+	}
+	for poolIndex := range output {
+		for networkIndex, network := range output[poolIndex].Networks {
+			output[poolIndex].Networks[networkIndex] = npe.Network{ID: network.ID}
+		}
 	}
 	return output
 }

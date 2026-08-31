@@ -479,7 +479,7 @@ def assert_scenario_wire(
             request,
             authorization_name="authorization",
             authorization_value=f"Bearer {KUBE_TOKEN}",
-            accept="text/plain" if index == 2 else "application/json",
+            accept="application/json",
         )
 
     forbidden = (

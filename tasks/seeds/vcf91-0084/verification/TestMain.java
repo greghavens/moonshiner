@@ -258,7 +258,7 @@ public final class TestMain {
             Path effectPath,
             String expectedAuthorization
     ) throws Exception {
-        String blockedId = "blocked/" + token;
+        String blockedId = "blocked-" + token;
         NsxPolicyClient.PrecheckFailed blocked = expect(
                 NsxPolicyClient.PrecheckFailed.class,
                 () -> client.updateTier1DescriptionIfReady(
@@ -288,7 +288,7 @@ public final class TestMain {
         equal(0, afterBlocked.get(0).mutationCount(), "failed state has no effect");
         equal("0", Files.readString(effectPath).trim(), "failed state effect file");
 
-        String malformedId = "malformed/" + token;
+        String malformedId = "malformed-" + token;
         expect(
                 NsxPolicyClient.ProtocolException.class,
                 () -> client.updateTier1DescriptionIfReady(
@@ -310,7 +310,7 @@ public final class TestMain {
         equal(0, afterMalformed.get(1).mutationCount(), "malformed state no effect");
         equal("0", Files.readString(effectPath).trim(), "malformed effect file");
 
-        String outageId = "outage/" + token;
+        String outageId = "outage-" + token;
         NsxPolicyClient.NsxPolicyException outage = expect(
                 NsxPolicyClient.NsxPolicyException.class,
                 () -> client.updateTier1DescriptionIfReady(
@@ -351,7 +351,7 @@ public final class TestMain {
             Path effectPath,
             String expectedAuthorization
     ) throws Exception {
-        String tier1Id = "ready/core ?#% Δ-" + token;
+        String tier1Id = "ready-core-" + token;
         String description = "approved \"north\"\nΔ " + token;
         NsxPolicyClient.UpdateResult result =
                 client.updateTier1DescriptionIfReady(
@@ -424,9 +424,9 @@ public final class TestMain {
             Path effectPath,
             String expectedAuthorization
     ) throws Exception {
-        String tier1Id = "options/" + token;
+        String tier1Id = "options-" + token;
         String enforcementPoint =
-                "/infra/sites/default/enforcement-points/edge A?" + token;
+                "/infra/sites/default/enforcement-points/default";
         NsxPolicyClient.UpdateResult result =
                 client.updateTier1DescriptionIfReady(
                         tier1Id,

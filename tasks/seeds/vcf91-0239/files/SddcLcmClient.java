@@ -12,7 +12,7 @@ public final class SddcLcmClient {
 
     public SddcLcmClient(String baseUrl, String bearerToken) {
         throw new UnsupportedOperationException(
-                "Implement the contract-pinned SDDC LCM support-bundle client.");
+                "Implement the focused SDDC LCM support-bundle client.");
     }
 
     /**
@@ -28,7 +28,7 @@ public final class SddcLcmClient {
                                                            Integer lookBackWindow)
             throws SddcLcmException {
         throw new UnsupportedOperationException(
-                "Implement the contract-pinned SDDC LCM support-bundle client.");
+                "Implement the focused SDDC LCM support-bundle client.");
     }
 
     /** Outcome of a support-bundle request: either a fresh submission or an adopted task. */

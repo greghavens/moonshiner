@@ -188,7 +188,7 @@ func TestProtectedContractProvenance(t *testing.T) {
 		"name",
 		"power_state",
 		"cpu_count",
-		"memory_size_mib",
+		"memory_size_MiB",
 	} {
 		if _, ok := summary.Properties[property]; !ok {
 			t.Fatalf("VM summary property %q missing", property)
@@ -881,27 +881,29 @@ var osReadFile = func(path string) ([]byte, error) {
 
 func newScenario(t testing.TB) contractmock.Scenario {
 	t.Helper()
-	cpu := int64(6)
-	memory := int64(24576)
+	cpu := int64(2)
+	memory := int64(4096)
 	return contractmock.Scenario{
-		Username:    "svc-雪-" + randomHex(t),
-		OldPassword: "old-päss-" + randomHex(t),
-		NewPassword: "new-päss-" + randomHex(t),
-		OldToken:    "old-token-" + randomHex(t),
-		NewToken:    "new-token-" + randomHex(t),
+		Username:    "moonshiner-live-validation-0115@vsphere.local",
+		OldPassword: "OldPassphrase!01",
+		NewPassword: "NewPassphrase!02",
+		OldToken:    "0123456789abcdef0123456789abcdef",
+		NewToken:    "123456789abcdef0123456789abcdef0",
 		OldVMs: []contractmock.VM{
 			{
-				VM:         "vm-old-" + randomHex(t),
-				Name:       "old workload",
-				PowerState: "POWERED_ON",
-				CPUCount:   &cpu,
+				VM:            "vm-39",
+				Name:          "vcf-lic01",
+				PowerState:    "POWERED_ON",
+				CPUCount:      &cpu,
+				MemorySizeMiB: &memory,
 			},
 		},
 		NewVMs: []contractmock.VM{
 			{
-				VM:            "vm-new-" + randomHex(t),
-				Name:          "new workload",
-				PowerState:    "SUSPENDED",
+				VM:            "vm-39",
+				Name:          "vcf-lic01",
+				PowerState:    "POWERED_ON",
+				CPUCount:      &cpu,
 				MemorySizeMiB: &memory,
 			},
 		},
@@ -912,14 +914,14 @@ func newScenario(t testing.TB) contractmock.Scenario {
 func allOptions(t testing.TB) ListOptions {
 	t.Helper()
 	return ListOptions{
-		VMs:           []string{"vm/" + randomHex(t), "vm 雪+" + randomHex(t)},
-		Names:         []string{"name?=" + randomHex(t)},
-		Folders:       []string{"folder/" + randomHex(t)},
-		Datacenters:   []string{"dc&" + randomHex(t)},
-		Hosts:         []string{"host #" + randomHex(t)},
-		Clusters:      []string{"cluster+" + randomHex(t)},
-		ResourcePools: []string{"pool=/" + randomHex(t)},
-		PowerStates:   []string{"POWERED_ON", "SUSPENDED"},
+		VMs:           []string{"vm-39"},
+		Names:         []string{"vcf-lic01"},
+		Folders:       []string{"group-v4"},
+		Datacenters:   []string{"datacenter-3"},
+		Hosts:         []string{"host-12"},
+		Clusters:      []string{"domain-c9"},
+		ResourcePools: []string{"resgroup-10"},
+		PowerStates:   []string{"POWERED_ON"},
 	}
 }
 

@@ -38,6 +38,12 @@ ID_POOL = [
 ]
 
 TOKEN = "ops-mock-token-0d4f19c7"
+INVALID_TOKEN = {
+    "type": "Error",
+    "message": 'The provided token for auth scheme "OpsToken" is either invalid or has expired.',
+    "httpStatusCode": 401,
+    "apiErrorCode": 1512,
+}
 
 
 class State:
@@ -148,28 +154,28 @@ def make_handler(state):
             return 200, {
                 "token": TOKEN,
                 "validity": 4102444800000,
-                "expiresAt": "Wednesday, January 1, 2100",
-                "roles": ["Administrator"],
+                "expiresAt": "Friday, January 1, 2100 at 12:00:00 AM Coordinated Universal Time",
+                "roles": [],
             }
 
         def op_getCurrentVersionOfServer(self, rec, body):
             if not self._authorized():
-                return 401, {"message": "missing or invalid token"}
+                return 401, INVALID_TOKEN
             return 200, {
                 "major": 9,
                 "minor": 1,
                 "patch": 0,
                 "minorMinor": 0,
-                "buildNumber": 24000000,
-                "description": "VMware Cloud Foundation Operations",
-                "humanlyReadableReleaseDate": "May 13, 2026",
-                "releasedDate": 1778630400000,
-                "releaseName": "9.1.0.0",
+                "buildNumber": 25541561,
+                "description": None,
+                "humanlyReadableReleaseDate": "Tuesday, March 3, 2026 at 12:00:00 PM Coordinated Universal Time",
+                "releasedDate": 1772539200000,
+                "releaseName": "VCF Operations 9.1.0.0",
             }
 
         def op_getMaintenanceSchedules(self, rec, body):
             if not self._authorized():
-                return 401, {"message": "missing or invalid token"}
+                return 401, INVALID_TOKEN
             query = rec["query"]
             names = query.get("name")
             ids = query.get("id")
@@ -184,13 +190,14 @@ def make_handler(state):
                 "pageInfo": {
                     "totalCount": len(found),
                     "page": 0,
-                    "pageSize": len(found),
+                    "pageSize": 1000,
                 },
+                "links": [],
             }
 
         def op_createMaintenanceSchedules(self, rec, body):
             if not self._authorized():
-                return 401, {"message": "missing or invalid token"}
+                return 401, INVALID_TOKEN
             parsed, error = self._parse_schedule_document(body)
             if error:
                 return error
@@ -204,14 +211,14 @@ def make_handler(state):
                 stored = {
                     "id": state.next_id(),
                     "key": key,
-                    "schedule": parsed["schedule"],
+                    "schedule": dict(parsed["schedule"], startDate="08/30/2026"),
                 }
                 state.schedules.append(stored)
             return 201, json.loads(json.dumps(stored))
 
         def op_updateMaintenanceSchedules(self, rec, body):
             if not self._authorized():
-                return 401, {"message": "missing or invalid token"}
+                return 401, INVALID_TOKEN
             parsed, error = self._parse_schedule_document(body)
             if error:
                 return error
@@ -230,7 +237,7 @@ def make_handler(state):
                                 % parsed["key"]
                             }
                         stored["key"] = parsed["key"]
-                        stored["schedule"] = parsed["schedule"]
+                        stored["schedule"] = dict(parsed["schedule"], startDate="08/30/2026")
                         # docs/contract.json records no response schema for a
                         # successful update. The function must retain the id it
                         # read before the write instead of relying on a response
@@ -278,6 +285,38 @@ def make_handler(state):
                         400,
                         {"message": "schedule field '%s' is required" % field},
                     )
+            schedule_type = schedule.get("scheduleType")
+            if schedule_type not in {"ONCE", "DAILY", "WEEKLY"}:
+                return None, (
+                    400,
+                    {"type": "Error", "message": "Unsupported scheduleType",
+                     "httpStatusCode": 400, "apiErrorCode": 400},
+                )
+            if schedule_type in {"DAILY", "WEEKLY"}:
+                if schedule.get("recurrence") is None:
+                    return None, (
+                        400,
+                        {"type": "Error", "message": "recurrence is mandatory",
+                         "httpStatusCode": 400, "apiErrorCode": 400},
+                    )
+                if schedule.get("expirationDate") is None and schedule.get("expireRuns") is None:
+                    return None, (
+                        400,
+                        {"type": "Error", "message": "expirationDate or expireRuns is mandatory",
+                         "httpStatusCode": 400, "apiErrorCode": 400},
+                    )
+            if schedule_type == "DAILY" and schedule.get("daysOfTheWeek") is not None:
+                return None, (
+                    400,
+                    {"type": "Error", "message": "daysOfTheWeek is invalid for DAILY",
+                     "httpStatusCode": 400, "apiErrorCode": 400},
+                )
+            if schedule_type == "WEEKLY" and not schedule.get("daysOfTheWeek"):
+                return None, (
+                    400,
+                    {"type": "Error", "message": "daysOfTheWeek is mandatory for WEEKLY",
+                     "httpStatusCode": 400, "apiErrorCode": 400},
+                )
             if not isinstance(payload["key"], str) or not payload["key"]:
                 return None, (400, {"message": "key must be a non-empty string"})
             return payload, None

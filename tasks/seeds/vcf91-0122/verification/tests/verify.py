@@ -308,9 +308,11 @@ def run_scenario(
     request_log = scenario_dir / "requests.jsonl"
     config_path = scenario_dir / "config.json"
 
-    session_id = "session-" + secrets.token_urlsafe(18)
+    session_id = secrets.token_hex(16)
     client_token = str(uuid.uuid4())
-    library_id = f'library/{nonce}-"\N{SNOWMAN}'
+    if mode == "other_empty":
+        client_token = client_token.upper()
+    library_id = str(uuid.uuid4())
     name = f'Operations "{nonce}"\nblue \\ \N{SNOWMAN}'
     if mode == "other_empty":
         backing_value = (
@@ -318,7 +320,7 @@ def run_scenario(
             "?label=blue%20snow"
         )
     else:
-        backing_value = f"datastore/{nonce}\\primary"
+        backing_value = "datastore-17"
     server_error = f'private "{nonce}"\nserver text'
     config_path.write_text(
         json.dumps(

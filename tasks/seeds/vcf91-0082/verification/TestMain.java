@@ -1,4 +1,5 @@
 import java.net.http.HttpClient;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -9,124 +10,183 @@ public class TestMain {
 
     public static void main(String[] args) throws Exception {
         Path contract = Path.of("docs", "contract.json");
-        List<Integer> pacedRetries = new ArrayList<>();
+        NsxPolicyClient.SegmentSpec desired = new NsxPolicyClient.SegmentSpec(
+                "Payments \"blue\"\nreconcile",
+                null,
+                null,
+                null,
+                List.of(new NsxPolicyClient.SegmentSubnet("10.42.0.1/24", null)),
+                null,
+                null);
+        String expectedBody =
+                "{\"display_name\":\"Payments \\\"blue\\\"\\nreconcile\","
+                        + "\"subnets\":[{\"gateway_address\":\"10.42.0.1/24\"}]}";
+        String authorization = "Basic " + Base64.getEncoder().encodeToString(
+                "automation:retry-secret".getBytes(StandardCharsets.UTF_8));
 
-        try (ContractMock mock = new ContractMock(contract)) {
-            NsxPolicyClient client = new NsxPolicyClient(
-                    mock.baseUrl() + "/",
-                    "automation",
-                    "retry-secret",
-                    HttpClient.newBuilder().build(),
-                    pacedRetries::add);
+        verifyCommittedOutcome(contract, desired, expectedBody, authorization);
+        verifyAbsentOutcomeRetries(contract, desired, expectedBody, authorization);
+        verifyMismatchedOutcomeIsAmbiguous(contract, desired);
+        verifyEncodedSlashIsLiveFailure(contract, desired);
+        verifyTerminalFailureDoesNotReconcile(contract, desired);
 
-            NsxPolicyClient.SegmentSpec desired = new NsxPolicyClient.SegmentSpec(
-                    "Payments \"blue\"\nretry",
-                    null,
-                    null,
-                    null,
-                    List.of(new NsxPolicyClient.SegmentSubnet("10.42.0.1/24", null)),
-                    null);
+        System.out.println("ALL NSX POLICY CONTRACT CHECKS PASSED (" + checks + " checks)");
+    }
 
-            String response = client.createOrReplaceInfraSegment(
-                    "payments blue/primary",
-                    desired);
+    private static NsxPolicyClient client(
+            ContractMock mock, List<Integer> pacing, String password) {
+        return new NsxPolicyClient(
+                mock.baseUrl() + "/",
+                "automation",
+                password,
+                HttpClient.newBuilder().build(),
+                pacing::add);
+    }
 
-            String expectedBody =
-                    "{\"display_name\":\"Payments \\\"blue\\\"\\nretry\","
-                            + "\"subnets\":[{\"gateway_address\":\"10.42.0.1/24\"}]}";
-
-            equal(expectedBody, response, "successful response body");
-            equal(List.of(1), pacedRetries, "one paced retry");
-            equal(1, mock.resourceCount(), "one resource after retry");
-            equal(1, mock.creationEffects("payments blue/primary"),
-                    "retry must not duplicate the create effect");
-            equal(2, mock.attempts("payments blue/primary"), "two PUT attempts");
-            equal(expectedBody, mock.storedBody("payments blue/primary"),
-                    "stored replacement body");
+    private static void verifyCommittedOutcome(
+            Path contract,
+            NsxPolicyClient.SegmentSpec desired,
+            String expectedBody,
+            String authorization) throws Exception {
+        List<Integer> pacing = new ArrayList<>();
+        try (ContractMock mock = new ContractMock(
+                contract, ContractMock.Behavior.COMMIT_THEN_TRANSIENT)) {
+            String response = client(mock, pacing, "retry-secret")
+                    .createOrReplaceInfraSegment("payments-blue-primary", desired);
+            contains(response, "\"display_name\":\"Payments \\\"blue\\\"\\nreconcile\"",
+                    "reconciled response retains requested display name");
+            equal(List.of(), pacing, "confirmed commit must not pace a retry");
+            equal(1, mock.creationEffects("payments-blue-primary"), "one creation effect");
+            equal(1, mock.attempts("payments-blue-primary"), "one PUT attempt");
 
             List<ContractMock.LoggedRequest> requests = mock.requests();
-            equal(2, requests.size(), "request count");
-            for (int index = 0; index < requests.size(); index++) {
-                ContractMock.LoggedRequest request = requests.get(index);
-                equal("PUT", request.method(), "method attempt " + (index + 1));
-                equal("/policy/api/v1/infra/segments/payments%20blue%2Fprimary",
-                        request.rawPath(), "raw path attempt " + (index + 1));
-                equal(null, request.rawQuery(), "no query attempt " + (index + 1));
-                equal("application/json", mediaType(request.firstHeader("Accept")),
-                        "accept attempt " + (index + 1));
-                equal("application/json", mediaType(request.firstHeader("Content-Type")),
-                        "content type attempt " + (index + 1));
-                equal("Basic " + Base64.getEncoder().encodeToString(
-                                "automation:retry-secret".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
-                        request.firstHeader("Authorization"),
-                        "basic authorization attempt " + (index + 1));
-                equal(expectedBody, request.bodyUtf8(),
-                        "byte-exact body attempt " + (index + 1));
-                absent(request.bodyUtf8(), "\"description\"", "unset description");
-                absent(request.bodyUtf8(), "\"connectivity_path\"", "unset connectivity path");
-                absent(request.bodyUtf8(), "\"transport_zone_path\"", "unset transport zone");
-                absent(request.bodyUtf8(), "\"tags\"", "unset tags");
-                absent(request.bodyUtf8(), "\"dhcp_ranges\"", "unset nested DHCP ranges");
-                absent(request.bodyUtf8(), ":null", "JSON null");
-                absent(request.bodyUtf8(), ":\"\"", "empty string substitute");
-                absent(request.bodyUtf8(), ":[]", "empty array substitute");
-            }
-
-            equal(requests.get(0).rawPath(), requests.get(1).rawPath(),
-                    "retry URI must be identical");
-            equal(requests.get(0).bodyUtf8(), requests.get(1).bodyUtf8(),
-                    "retry body must be identical");
+            equal(2, requests.size(), "commit reconciliation request count");
+            assertPut(requests.get(0), "/policy/api/v1/infra/segments/payments-blue-primary",
+                    expectedBody, authorization, "initial PUT");
+            assertGet(requests.get(1), "/policy/api/v1/infra/segments/payments-blue-primary",
+                    authorization, "reconciliation GET");
         }
+    }
 
-        List<Integer> terminalPacing = new ArrayList<>();
-        try (ContractMock mock = new ContractMock(contract, ContractMock.Behavior.FORBIDDEN)) {
-            NsxPolicyClient client = new NsxPolicyClient(
-                    mock.baseUrl(),
-                    "automation",
-                    "do-not-leak-this-password",
-                    HttpClient.newHttpClient(),
-                    terminalPacing::add);
-            NsxPolicyClient.SegmentSpec desired = new NsxPolicyClient.SegmentSpec(
-                    "Denied segment",
-                    "must not retry",
-                    "/infra/tier-1s/app-tier",
-                    "/infra/sites/default/enforcement-points/default/transport-zones/overlay",
-                    List.of(new NsxPolicyClient.SegmentSubnet(
-                            "10.50.0.1/24",
-                            List.of("10.50.0.10-10.50.0.20"))),
-                    List.of(
-                            new NsxPolicyClient.Tag("environment", "test"),
-                            new NsxPolicyClient.Tag(null, "payments")));
+    private static void verifyAbsentOutcomeRetries(
+            Path contract,
+            NsxPolicyClient.SegmentSpec desired,
+            String expectedBody,
+            String authorization) throws Exception {
+        List<Integer> pacing = new ArrayList<>();
+        try (ContractMock mock = new ContractMock(
+                contract, ContractMock.Behavior.TRANSIENT_THEN_NOT_FOUND)) {
+            String response = client(mock, pacing, "retry-secret")
+                    .createOrReplaceInfraSegment("payments-blue-retry", desired);
+            equal(expectedBody, response, "successful retried response body");
+            equal(List.of(1), pacing, "one paced retry only after 404");
+            equal(1, mock.creationEffects("payments-blue-retry"), "one creation effect");
+            equal(2, mock.attempts("payments-blue-retry"), "two PUT attempts");
 
-            String expectedBody =
-                    "{\"display_name\":\"Denied segment\","
-                            + "\"description\":\"must not retry\","
-                            + "\"connectivity_path\":\"/infra/tier-1s/app-tier\","
-                            + "\"transport_zone_path\":"
-                            + "\"/infra/sites/default/enforcement-points/default/transport-zones/overlay\","
-                            + "\"subnets\":[{\"gateway_address\":\"10.50.0.1/24\","
-                            + "\"dhcp_ranges\":[\"10.50.0.10-10.50.0.20\"]}],"
-                            + "\"tags\":[{\"scope\":\"environment\",\"tag\":\"test\"},{\"tag\":\"payments\"}]}";
+            List<ContractMock.LoggedRequest> requests = mock.requests();
+            equal(3, requests.size(), "absent reconciliation request count");
+            assertPut(requests.get(0), "/policy/api/v1/infra/segments/payments-blue-retry",
+                    expectedBody, authorization, "initial PUT");
+            assertGet(requests.get(1), "/policy/api/v1/infra/segments/payments-blue-retry",
+                    authorization, "404 reconciliation GET");
+            assertPut(requests.get(2), "/policy/api/v1/infra/segments/payments-blue-retry",
+                    expectedBody, authorization, "identical retry PUT");
+            equal(requests.get(0).bodyUtf8(), requests.get(2).bodyUtf8(),
+                    "retry body must be byte-identical");
+        }
+    }
 
+    private static void verifyMismatchedOutcomeIsAmbiguous(
+            Path contract, NsxPolicyClient.SegmentSpec desired) throws Exception {
+        List<Integer> pacing = new ArrayList<>();
+        try (ContractMock mock = new ContractMock(
+                contract, ContractMock.Behavior.MISMATCH_AFTER_TRANSIENT)) {
             try {
-                client.createOrReplaceInfraSegment("denied", desired);
+                client(mock, pacing, "retry-secret")
+                        .createOrReplaceInfraSegment("payments-blue-conflict", desired);
+                throw new AssertionError("mismatching reconciliation must be ambiguous");
+            } catch (NsxPolicyClient.AmbiguousMutationException expected) {
+                equal(503, expected.putStatus(), "ambiguous PUT status");
+                equal(200, expected.readStatus(), "ambiguous read status");
+            }
+            equal(List.of(), pacing, "ambiguous outcome must not retry");
+            equal(2, mock.requests().size(), "ambiguous outcome request count");
+            equal("GET", mock.requests().get(1).method(), "ambiguous outcome uses GET");
+        }
+    }
+
+    private static void verifyEncodedSlashIsLiveFailure(
+            Path contract, NsxPolicyClient.SegmentSpec desired) throws Exception {
+        List<Integer> pacing = new ArrayList<>();
+        try (ContractMock mock = new ContractMock(contract)) {
+            try {
+                client(mock, pacing, "retry-secret")
+                        .createOrReplaceInfraSegment("payments/blue", desired);
+                throw new AssertionError("encoded slash must fail");
+            } catch (NsxPolicyClient.NsxPolicyException expected) {
+                equal(400, expected.statusCode(), "encoded slash HTTP status");
+                contains(expected.responseBody(), "\"error_code\":512",
+                        "encoded slash live error code");
+            }
+            equal(List.of(), pacing, "encoded slash must not retry");
+            equal(1, mock.requests().size(), "encoded slash request count");
+            equal("/policy/api/v1/infra/segments/payments%2Fblue",
+                    mock.requests().get(0).rawPath(), "encoded slash raw path");
+        }
+    }
+
+    private static void verifyTerminalFailureDoesNotReconcile(
+            Path contract, NsxPolicyClient.SegmentSpec desired) throws Exception {
+        List<Integer> pacing = new ArrayList<>();
+        try (ContractMock mock = new ContractMock(contract, ContractMock.Behavior.FORBIDDEN)) {
+            try {
+                client(mock, pacing, "do-not-leak-this-password")
+                        .createOrReplaceInfraSegment("denied", desired);
                 throw new AssertionError("403 must throw NsxPolicyException");
             } catch (NsxPolicyClient.NsxPolicyException expected) {
                 equal(403, expected.statusCode(), "terminal status code");
-                equal("{\"error_code\":403001,\"error_message\":\"forbidden by policy\"}",
-                        expected.responseBody(), "terminal response body");
                 absent(expected.getMessage(), "do-not-leak-this-password",
                         "password in exception message");
-                absent(expected.getMessage(), "Basic ", "authorization in exception message");
+                absent(expected.getMessage(), "Basic ",
+                        "authorization in exception message");
             }
-            equal(List.of(), terminalPacing, "403 must not invoke retry pacer");
+            equal(List.of(), pacing, "403 must not invoke retry pacer");
             equal(0, mock.resourceCount(), "403 must not mutate state");
-            equal(1, mock.requests().size(), "403 must not be retried");
-            equal(expectedBody, mock.requests().get(0).bodyUtf8(),
-                    "all supported optional fields");
+            equal(1, mock.requests().size(), "403 must not be reconciled or retried");
         }
+    }
 
-        System.out.println("ALL NSX POLICY CONTRACT CHECKS PASSED (" + checks + " checks)");
+    private static void assertPut(
+            ContractMock.LoggedRequest request,
+            String path,
+            String body,
+            String authorization,
+            String label) {
+        equal("PUT", request.method(), label + " method");
+        equal(path, request.rawPath(), label + " raw path");
+        equal(null, request.rawQuery(), label + " no query");
+        equal("application/json", mediaType(request.firstHeader("Accept")),
+                label + " Accept");
+        equal("application/json", mediaType(request.firstHeader("Content-Type")),
+                label + " Content-Type");
+        equal(authorization, request.firstHeader("Authorization"), label + " Basic auth");
+        equal(body, request.bodyUtf8(), label + " body");
+        absent(request.bodyUtf8(), ":null", label + " JSON null");
+    }
+
+    private static void assertGet(
+            ContractMock.LoggedRequest request,
+            String path,
+            String authorization,
+            String label) {
+        equal("GET", request.method(), label + " method");
+        equal(path, request.rawPath(), label + " raw path");
+        equal(null, request.rawQuery(), label + " no query");
+        equal("application/json", mediaType(request.firstHeader("Accept")),
+                label + " Accept");
+        equal(null, request.firstHeader("Content-Type"), label + " no Content-Type");
+        equal(authorization, request.firstHeader("Authorization"), label + " Basic auth");
+        equal("", request.bodyUtf8(), label + " empty body");
     }
 
     private static String mediaType(String value) {
@@ -137,10 +197,17 @@ public class TestMain {
         return (separator < 0 ? value : value.substring(0, separator)).trim().toLowerCase();
     }
 
+    private static void contains(String text, String needle, String label) {
+        checks++;
+        if (!text.contains(needle)) {
+            throw new AssertionError(label + ": expected <" + needle + "> in <" + text + ">");
+        }
+    }
+
     private static void absent(String text, String needle, String label) {
         checks++;
         if (text.contains(needle)) {
-            throw new AssertionError(label + " must be omitted, body was " + text);
+            throw new AssertionError(label + " must be omitted, text was " + text);
         }
     }
 

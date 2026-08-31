@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the SDDC LCM rollout contract test.  Loopback only; no VMware endpoint
+# Runs the task's checks.
 # and no network access are involved.
 set -euo pipefail
 
@@ -18,7 +18,7 @@ expected_hashes() {
   cat <<'EOF'
 0a849c83c326ba6d98b77841ec502fa564a886349871154912514237be0734a6  fixtures/rollout-plan.json
 26217a411975b510a76f458e119072c4a0da5272c65e1f767d83d321837443c5  tools/mock_sddc_lcm.py
-ad65cbad97a8fd2410e918733c9010e14405ae9d346476d89df6479d88fdafe7  tests/test_rollout_contract.py
+7a0b1209a751a7a7e08ac6f08f9e2e19e2a6ea34a389099d69a3c1fba54f87ce  tests/test_rollout_contract.py
 EOF
 }
 

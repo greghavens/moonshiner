@@ -1,4 +1,4 @@
-"""Focused stdlib client for a contract-pinned vCenter inventory snapshot."""
+"""Focused stdlib client for a focused vCenter inventory snapshot."""
 
 from .client import ProtocolError, VcenterError, VcenterInventoryClient
 

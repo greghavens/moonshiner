@@ -209,6 +209,7 @@ func TestListOptionsValidationMakesNoRequest(t *testing.T) {
 		options nsxpolicy.ListOptions
 	}{
 		{name: "negative page size", options: nsxpolicy.ListOptions{PageSize: -1}},
+		{name: "zero page size", options: nsxpolicy.ListOptions{PageSize: 0}},
 		{name: "page size above spec maximum", options: nsxpolicy.ListOptions{PageSize: 1001}},
 		{name: "unknown segment type", options: nsxpolicy.ListOptions{SegmentType: "OVERLAY"}},
 	}

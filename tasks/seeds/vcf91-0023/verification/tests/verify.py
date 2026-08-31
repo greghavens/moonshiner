@@ -28,7 +28,7 @@ EXPECTED_SOURCES_SHA256 = (
     "a4c2451b2ba8888ac1a327ae52e9aa159a0e5c1d7d27658c703c67a3f2a283f1"
 )
 EXPECTED_MOCK_SHA256 = (
-    "91a4dd87459fc05bfa0dcf93df67e7e1a22b6b19248085ab0be5ce3519709453"
+    "6016bd36d4de18cf4aba28b168421705cbe339f890bc9871cae436c34d5d65c3"
 )
 EXPECTED_COMMIT = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
 EXPECTED_SPEC_PATH = "specifications/sddc-manager/sddc-manager-openapi.json"
@@ -437,7 +437,7 @@ def verify_complete_sorted_inventory(module: Any) -> None:
         require(first is not second, "each inventory call must return a new list")
         records = read_log(log_path)
         require(len(records) == 6, "complete retrieval must request three pages twice")
-        expected_pages = [0, 1, 2, 0, 1, 2]
+        expected_pages = [1, 2, 3, 1, 2, 3]
         for index, (record, page_number) in enumerate(
             zip(records, expected_pages, strict=True)
         ):

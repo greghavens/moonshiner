@@ -1,4 +1,4 @@
-// Package mockvcenter provides a loopback fixture pinned to docs/contract.json.
+// Package mockvcenter provides focused VCF 9.1 HTTP responses.
 package mockvcenter
 
 import (
@@ -52,7 +52,7 @@ type VM struct {
 	Name          string `json:"name"`
 	PowerState    string `json:"power_state"`
 	CPUCount      *int64 `json:"cpu_count,omitempty"`
-	MemorySizeMiB *int64 `json:"memory_size_mib,omitempty"`
+	MemorySizeMiB *int64 `json:"memory_size_MiB,omitempty"`
 }
 
 // Scenario configures a deterministic mock. When ExpireFirstToken is true, the

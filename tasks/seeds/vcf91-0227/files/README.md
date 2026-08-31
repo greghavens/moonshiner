@@ -207,7 +207,7 @@ call; the run is judged on when and how often it is called.
 1. **Authentication.** Every request for an operation the contract marks
    `"authenticated": true` carries `Authorization: Bearer <token>`, matching the
    security scheme in the contract. `getHealth` is marked `false` and carries no
-   `Authorization` header at all.
+   `Authorization` header at all. Its healthy response is `{"up": true}`.
 
 2. **Optional fields are omitted, never sent empty.** A request body is built
    only from the optional properties the caller actually supplied. An optional
@@ -264,40 +264,12 @@ whole platform spec object is omitted from the body.
 
 ---
 
-## 3. Local mock service
-
-`tests/lcm_mock_server.py` is a loopback-only HTTP service pinned to your
-contract: it reads `docs/contract.json`, builds its routing table and its
-request-body validation from the operations and schemas named there, and serves
-**nothing else**. If the contract names an operation it does not implement, or
-omits a required one, it refuses to start.
-
-It models an expiring access token: after a configurable number of successful
-authenticated requests it rotates its token, and every later request presenting
-the old one gets a `401` until the new token is used.
-
-Run it by hand while developing:
-
-```sh
-python3 tests/lcm_mock_server.py --contract docs/contract.json \
-    --log /tmp/req.jsonl --expire-after 3
-```
-
-It prints one line, `READY <base-url> <initial-token> <rotated-token>`, then
-serves on `127.0.0.1` on an ephemeral port. Every request is appended to the log
-file as one JSON object per line, including the full header list and the raw
-body bytes, so the exact wire shape is inspectable.
-
-The mock contacts no VMware endpoint, and neither does the test suite.
-
----
-
-## 4. Verify
+## 3. Verify
 
 ```sh
 python3 -B tests/verify.py
 ```
 
-Everything under `tests/` is protected: read it, run it, but do not modify
-it. Create `docs/contract.json` and `docs/official_sources.json`, and fill in
+Do not modify the supplied tests. Create `docs/contract.json` and
+`docs/official_sources.json`, and fill in
 `src/vcf_lcm/contract.py` and `src/vcf_lcm/client.py`.

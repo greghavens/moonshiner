@@ -35,9 +35,9 @@ public final class TestMain {
     private static final String ATTACH_OPERATION =
             "Cis.Tagging.TagAssociation_attach";
 
-    private static final String SESSION_ID = "session-contract-fixture";
-    private static final String CATEGORY_ID = "category-42";
-    private static final String TAG_ID = "tag-42";
+    private static final String SESSION_ID = "0123456789abcdef0123456789abcdef";
+    private static final String CATEGORY_ID = "urn:vmomi:InventoryServiceCategory:11111111-2222-4333-8444-555555555555:GLOBAL";
+    private static final String TAG_ID = "urn:vmomi:InventoryServiceTag:66666666-7777-4888-8999-aaaaaaaaaaaa:GLOBAL";
 
     private static final String CATEGORY_BODY =
             "{\"name\":\"Deployment Ring\",\"description\":"
@@ -45,9 +45,11 @@ public final class TestMain {
                     + "\"MULTIPLE\",\"associable_types\":[\"VirtualMachine\"]}";
     private static final String TAG_BODY =
             "{\"name\":\"canary\",\"description\":\"Early rollout cohort\","
-                    + "\"category_id\":\"category-42\"}";
+                    + "\"category_id\":\"urn:vmomi:InventoryServiceCategory:11111111-2222-4333-8444-555555555555:GLOBAL\"}";
     private static final String ATTACH_BODY =
-            "{\"object_id\":{\"type\":\"VirtualMachine\",\"id\":\"vm-202\"}}";
+            "{\"object_id\":{\"type\":\"VirtualMachine\",\"id\":\"vm-39\"}}";
+    private static final String LIVE_SHAPED_ATTACH_ERROR =
+            "User lacks attach or detach privilege for tag " + TAG_ID;
 
     public static void main(String[] args) throws Exception {
         verifyProtectedProjection();
@@ -151,7 +153,7 @@ public final class TestMain {
                                     null),
                             new VcenterTaggingClient.DynamicId(
                                     "VirtualMachine",
-                                    "vm-202"));
+                                    "vm-39"));
 
             VcenterTaggingClient.ChangeReport report =
                     client.createAndAttach(request);
@@ -180,7 +182,7 @@ public final class TestMain {
             equal(attach.error().errorType(), "UNAUTHORIZED",
                     "attachment error_type");
             equal(attach.error().getMessage(),
-                    "Attach privilege missing",
+                    LIVE_SHAPED_ATTACH_ERROR,
                     "attachment first default_message");
             check(!attach.error().toString().contains(SESSION_ID),
                     "attachment error does not disclose session");
@@ -197,7 +199,7 @@ public final class TestMain {
             assertWire(log.get(1), 1, TAG_OPERATION,
                     "/api/cis/tagging/tag", TAG_BODY);
             assertWire(log.get(2), 2, ATTACH_OPERATION,
-                    "/api/cis/tagging/tag-association/tag-42?action=attach",
+                    "/api/cis/tagging/tag-association/urn%3Avmomi%3AInventoryServiceTag%3A66666666-7777-4888-8999-aaaaaaaaaaaa%3AGLOBAL?action=attach",
                     ATTACH_BODY);
 
             check(!log.get(0).body().contains("\"category_id\""),
@@ -398,7 +400,7 @@ public final class TestMain {
                 return;
             }
             sendJson(exchange, 403,
-                    error("UNAUTHORIZED", "Attach privilege missing"));
+                    error("UNAUTHORIZED", LIVE_SHAPED_ATTACH_ERROR));
         }
 
         private boolean validWire(
@@ -430,7 +432,7 @@ public final class TestMain {
                         && body.equals(TAG_BODY);
                 case 2 -> operationId.equals(ATTACH_OPERATION)
                         && target.equals(
-                        "/api/cis/tagging/tag-association/tag-42"
+                        "/api/cis/tagging/tag-association/urn%3Avmomi%3AInventoryServiceTag%3A66666666-7777-4888-8999-aaaaaaaaaaaa%3AGLOBAL"
                                 + "?action=attach")
                         && body.equals(ATTACH_BODY);
                 default -> false;

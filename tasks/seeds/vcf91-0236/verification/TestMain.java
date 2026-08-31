@@ -15,7 +15,7 @@ import java.util.function.Supplier;
 public final class TestMain {
 
     private static final String TOKEN = "eyJhbGciOiJSUzI1NiJ9.sddc-lcm-test-token";
-    private static final String CORRELATION = "corr-vcf91-0236";
+    private static final String CORRELATION = "02360000-0000-4000-8000-000000000001";
 
     private static final String CMP_A = "af6ef462-e192-4fe1-9522-67a50a2b3392";
     private static final String CMP_B = "1c9b6ad2-77c1-4f0b-8d5e-6b2a0f31c7d4";
@@ -93,6 +93,9 @@ public final class TestMain {
         rejects(scenario, "control character in correlation id",
                 () -> new SddcLcmSupportBundleClient.Config(
                         "https://vcf.example.test", TOKEN, "corr\nid", null, null, null));
+        rejects(scenario, "non-UUID correlation id",
+                () -> new SddcLcmSupportBundleClient.Config(
+                        "https://vcf.example.test", TOKEN, "not-a-uuid", null, null, null));
         rejects(scenario, "non-positive poll interval",
                 () -> new SddcLcmSupportBundleClient.Config(
                         "https://vcf.example.test", TOKEN, null, Duration.ZERO, null, null));

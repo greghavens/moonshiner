@@ -123,19 +123,19 @@ func TestReportShape(t *testing.T) {
 		if view.has("failure") {
 			t.Errorf("a run that succeeded reports a failure: %s", pretty(view.Failure))
 		}
-		if !reflect.DeepEqual(view.Skipped, []string{"VCF_OPERATIONS_FLEET_MANAGEMENT"}) {
-			t.Errorf("skipped %v, want [VCF_OPERATIONS_FLEET_MANAGEMENT]", view.Skipped)
+		if !reflect.DeepEqual(view.Skipped, []string{"VCF_FLEET_LCM"}) {
+			t.Errorf("skipped %v, want [VCF_FLEET_LCM]", view.Skipped)
 		}
 
 		wantInstalled := []installedView{
 			{
-				ComponentType: "VCF_OPERATIONS",
+				ComponentType: "OPS",
 				FQDN:          "ops-a.vcf.example.com",
 				Version:       "9.1.0.0",
 				DownloadURL:   opsBinaryURL,
 			},
 			{
-				ComponentType: "VCF_AUTOMATION",
+				ComponentType: "VCFA",
 				FQDN:          "auto-a.vcf.example.com",
 				Version:       "9.1.0.0",
 			},
@@ -171,7 +171,7 @@ func TestReportShape(t *testing.T) {
 			"depot": depotSpec(),
 			"components": []any{
 				map[string]any{
-					"componentType": "VCF_AUTOMATION",
+					"componentType": "VCFA",
 					"fqdn":          "auto-a.vcf.example.com",
 					"password":      "VMw@re123!Auto",
 				},

@@ -2,7 +2,7 @@
 """Protected verifier for the VCF Operations credential rotation seed.
 
 Compiles src/VcfOpsCredentialRotator.java together with the protected TestMain
-harness, runs successful-drain and exhausted-drain scenarios against isolated
+harness, runs a live-style immediate cutover and a concurrent-binding safety scenario against isolated
 loopback mocks pinned to docs/contract.json, and asserts the exact wire shape
 of every request the client made.
 
@@ -173,12 +173,19 @@ def assert_no_empty_values(entries):
         if body is None:
             continue
         for path, value in walk(body):
+            if (entry.get("operationId") == "patchAdapterInstance"
+                    and path.startswith("body.resourceKey.")):
+                # VCF 9.1 expands a VMware adapter resource key with identifiers
+                # whose server-defined value is the empty string. PATCH requires
+                # that composite key to be echoed without dropping or rewriting
+                # those values.
+                continue
             if value is None:
                 offenders.append("seq %d %s is null" % (entry["seq"], path))
             elif isinstance(value, str) and value == "":
                 offenders.append("seq %d %s is an empty string"
                                  % (entry["seq"], path))
-    check("unset optional properties are omitted, never sent null or empty",
+    check("caller-authored unset optionals are omitted while echoed resource keys are preserved",
           not offenders, "; ".join(offenders[:6]))
 
 
@@ -371,10 +378,14 @@ def verify(entries, result, stdout, stderr, exit_code):
     for entry in patches:
         body = entry.get("body_json") or {}
         seq = entry["seq"]
-        check("seq %d: the patch sent exactly id, resourceKey and "
-              "credentialInstanceId" % seq,
-              set(body) == {"id", "resourceKey", "credentialInstanceId"},
+        check("seq %d: the patch sent exactly id, resourceKey, "
+              "credentialInstanceId and adapter-certificates" % seq,
+              set(body) == {"id", "resourceKey", "credentialInstanceId",
+                            "adapter-certificates"},
               "sent %s" % (", ".join(sorted(body)) or "nothing"))
+        check("seq %d: the patch sent the live-required empty certificate array" % seq,
+              body.get("adapter-certificates") == [],
+              "sent adapter-certificates=%r" % body.get("adapter-certificates"))
         adapter_id = body.get("id")
         patched_ids.append(adapter_id)
         check("seq %d: the patch pointed the adapter at the replacement "
@@ -424,10 +435,12 @@ def verify(entries, result, stdout, stderr, exit_code):
         return len((entry.get("response_json") or {}).get(
             "adapterInstancesInfoDto", []))
 
-    check("the rotation kept polling while adapters were still on the old "
-          "secret",
-          any(bound_count(e) > 0 for e in drain_polls),
-          "the first drain poll already came back empty, so nothing was drained")
+    check("the uncontended live-style cutover needed exactly one confirmation poll",
+          len(drain_polls) == 1,
+          "made %d post-patch polls" % len(drain_polls))
+    check("the first confirmation poll reflected the immediate live association update",
+          bound_count(drain_polls[0]) == 0,
+          "%d adapter(s) were still listed" % bound_count(drain_polls[0]))
     last_poll = drain_polls[-1]
     check("the final drain poll showed nothing was using the outgoing "
           "credential", bound_count(last_poll) == 0,
@@ -474,7 +487,7 @@ def verify(entries, result, stdout, stderr, exit_code):
 
 
 def verify_timeout(entries, stdout, stderr, exit_code):
-    """Prove maxDrainPolls is a safety bound, not permission to delete."""
+    """Prove a concurrent late binding prevents deletion at the poll bound."""
     if not check("timeout scenario exited after observing the expected failure",
                  exit_code == 0 and any(
                      line.startswith("EXPECTED_TIMEOUT ")
@@ -514,9 +527,11 @@ def verify_timeout(entries, stdout, stderr, exit_code):
               (e.get("body_json") or {}).get("id") for e in patches])
     wrong_patches = [e for e in patches
                      if set(e.get("body_json") or {})
-                     != {"id", "resourceKey", "credentialInstanceId"}
+                     != {"id", "resourceKey", "credentialInstanceId",
+                         "adapter-certificates"}
                      or (e.get("body_json") or {}).get("credentialInstanceId")
-                     != NEW_CREDENTIAL_ID]
+                     != NEW_CREDENTIAL_ID
+                     or (e.get("body_json") or {}).get("adapter-certificates") != []]
     check("timeout scenario used the contracted partial-update shape",
           not wrong_patches,
           "; ".join("seq %d sent %s"
@@ -559,7 +574,7 @@ def verify_timeout(entries, stdout, stderr, exit_code):
     if drain_polls:
         still_bound = (drain_polls[0].get("response_json") or {}).get(
             "adapterInstancesInfoDto", [])
-        check("the bounded drain poll still reported outgoing-secret users",
+        check("the bounded confirmation poll observed the concurrent late binding",
               bool(still_bound), "the poll unexpectedly came back empty")
         check("the rotation stopped immediately after the exhausted drain poll",
               drain_polls[0]["seq"] == entries[-1]["seq"],

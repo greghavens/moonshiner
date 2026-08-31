@@ -255,7 +255,11 @@ def run_client() -> tuple[subprocess.CompletedProcess[str], list[dict[str, objec
 def verify_wire(entries: list[dict[str, object]]) -> None:
     expected_targets = [
         "/policy/api/v1/infra/realized-state/alarms",
-        "/policy/api/v1/infra/traceflows/tf%20incident%2F42/observations",
+        "/policy/api/v1/infra/realized-state/alarms?cursor=alarm-cursor-two",
+        "/policy/api/v1/infra/traceflows/tf-incident-42/observations",
+        "/policy/api/v1/infra/realized-state/alarms",
+        "/policy/api/v1/infra/realized-state/alarms?cursor=alarm-cursor-two",
+        "/policy/api/v1/infra/traceflows/tf-incident%2F42/observations",
     ]
     if len(entries) != len(expected_targets):
         fail(
@@ -283,8 +287,8 @@ def verify_wire(entries: list[dict[str, object]]) -> None:
             fail(f"request {index + 1} must accept application/json")
         if headers.get("authorization") != expected_auth:
             fail(f"request {index + 1} Basic authorization is incorrect")
-        if "?" in target:
-            fail("unset optional query parameters must be omitted")
+        if "?" in target and "?cursor=alarm-cursor-two" not in target:
+            fail("only the returned ListAlarms continuation cursor may be sent")
 
 
 def main() -> None:

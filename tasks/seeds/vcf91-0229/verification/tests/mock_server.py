@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import threading
+import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -94,7 +95,7 @@ def load_contract(contract_path: Path) -> tuple[list[Route], dict[str, str]]:
         raise RuntimeError("contract route projection changed")
 
     filters = operations[0].get("focusedWireProfile", {}).get("filterValues", {})
-    if not isinstance(filters, dict) or set(filters) != {"type", "resourceType"}:
+    if not isinstance(filters, dict) or set(filters) != {"name"}:
         raise RuntimeError("contract task filter projection changed")
     if not all(isinstance(value, str) and value for value in filters.values()):
         raise RuntimeError("contract task filter values are invalid")
@@ -129,8 +130,7 @@ class MockState:
         scenario: dict[str, Any],
     ) -> None:
         self.routes = routes
-        self.type_filter = filters["type"]
-        self.resource_type_filter = filters["resourceType"]
+        self.task_name_filter = filters["name"]
         self.request_log = request_log
         self.summary_path = summary_path
         self.access_token = require_text(scenario, "accessToken")
@@ -203,15 +203,12 @@ class MockState:
                 "url": f"https://vmsp.example.com/bundles/{bundle_id}",
             }
         )
-        task_id = f"task-{self.bundle_marker}-{index}"
+        task_id = str(uuid.uuid4())
         task = {
             "id": task_id,
-            "name": f"generate-support-bundle-{index}",
+            "name": self.task_name_filter,
             "status": "SUCCEEDED",
-            "type": self.type_filter,
             "createdBy": "lcm-service",
-            "resourceId": self.component_id,
-            "resourceType": self.resource_type_filter,
             "createTime": stamp,
             "correlationId": correlation_id,
             "retriable": False,
@@ -229,10 +226,7 @@ SUMMARY_FIELDS = [
     "id",
     "name",
     "status",
-    "type",
     "createdBy",
-    "resourceId",
-    "resourceType",
     "createTime",
     "correlationId",
     "retriable",
@@ -346,29 +340,22 @@ class ContractHandler(BaseHTTPRequestHandler):
         if any(len(values) != 1 or values[0] == "" for values in query.values()):
             return 400, error_body("WIRE_SHAPE", "query values must be singular")
 
-        base_keys = {"type", "resourceId", "resourceType", "pageSize"}
+        base_keys = {"name", "pageSize"}
         if set(query) not in (base_keys, base_keys | {"pageNumber"}):
             return 400, error_body("WIRE_SHAPE", "unexpected or unset query member")
-        if query["type"][0] != state.type_filter:
-            return 400, error_body("WIRE_SHAPE", "task type filter changed")
-        if query["resourceType"][0] != state.resource_type_filter:
-            return 400, error_body("WIRE_SHAPE", "resource type filter changed")
-        resource_id = query["resourceId"][0]
+        if query["name"][0] != state.task_name_filter:
+            return 400, error_body("WIRE_SHAPE", "task name filter changed")
         try:
             page_size = int(query["pageSize"][0])
-            page_number = int(query["pageNumber"][0]) if "pageNumber" in query else 0
+            page_number = int(query["pageNumber"][0]) if "pageNumber" in query else 1
         except ValueError:
             return 400, error_body("WIRE_SHAPE", "page members must be integers")
         if not 1 <= page_size <= 50:
             return 400, error_body("PAGE_RANGE", "pageSize must be 1..50")
-        if page_number < 0:
-            return 400, error_body("PAGE_RANGE", "pageNumber must be nonnegative")
+        if page_number < 1:
+            return 400, error_body("PAGE_RANGE", "pageNumber must be positive")
 
-        prefix = (
-            f"type={state.type_filter}"
-            f"&resourceId={resource_id}"
-            f"&resourceType={state.resource_type_filter}"
-        )
+        prefix = f"name={state.task_name_filter}"
         expected = (
             f"{prefix}&pageSize={page_size}"
             if "pageNumber" not in query
@@ -380,14 +367,12 @@ class ContractHandler(BaseHTTPRequestHandler):
         matched = [
             task
             for task in state.tasks
-            if task.get("resourceId") == resource_id
-            and task.get("resourceType") == state.resource_type_filter
-            and task.get("type") == state.type_filter
+            if task.get("name") == state.task_name_filter
         ]
-        total_pages = max(1, math.ceil(len(matched) / page_size))
-        if page_number >= total_pages:
+        total_pages = math.ceil(len(matched) / page_size)
+        if total_pages > 0 and page_number > total_pages:
             return 400, error_body("PAGE_RANGE", "page is out of range")
-        start = page_number * page_size
+        start = (page_number - 1) * page_size
         return 200, {
             "elements": [as_summary(task) for task in matched[start : start + page_size]],
             "pageMetadata": {
@@ -416,6 +401,11 @@ class ContractHandler(BaseHTTPRequestHandler):
                 "WIRE_SHAPE", "exactly one nonblank correlation header is required"
             )
         correlation_id = correlation_values[0]
+        if re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            correlation_id,
+        ) is None:
+            return 500, error_body("VCF_LCM_500_INTERNAL_SERVER_ERROR", "correlation ID must be a UUID")
 
         try:
             payload = json.loads(body.decode("utf-8"))

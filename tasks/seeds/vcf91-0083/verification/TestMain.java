@@ -10,7 +10,7 @@ public final class TestMain {
             + "\"operationId\":\"PatchGroupForDomain\",\"status\":\"succeeded\"},"
             + "{\"name\":\"security-policy\","
             + "\"operationId\":\"PatchSecurityPolicyForDomain\","
-            + "\"status\":\"failed\",\"http_status\":503,\"error_code\":73001}]}\n";
+            + "\"status\":\"failed\",\"http_status\":400,\"error_code\":500060}]}\n";
 
     private TestMain() {
     }
@@ -30,6 +30,7 @@ public final class TestMain {
                         "Source group", List.of("10.20.0.0/24"), null),
                 new NsxPolicyClient.PolicySpec(
                         "Application policy",
+                        "allow-app-traffic",
                         "Allow app traffic",
                         "/infra/domains/default/groups/destination",
                         1_000_000,
@@ -53,6 +54,7 @@ public final class TestMain {
                         null),
                 new NsxPolicyClient.PolicySpec(
                         "Application policy",
+                        "allow-app-traffic",
                         "Allow app\ntraffic",
                         "/infra/domains/default/groups/destination",
                         120,
@@ -61,7 +63,7 @@ public final class TestMain {
                         null));
 
         NsxPolicyClient.ChangeReport report = client.applyChange(
-                "prod east", "source+blue", "allow/edge", plan, reportPath);
+                "prod-east", "source-blue", "allow-edge", plan, reportPath);
 
         check("partial_failure".equals(report.status()), "wrong report status");
         check(report.succeeded() == 1, "wrong succeeded count");
@@ -79,8 +81,8 @@ public final class TestMain {
                 "security-policy",
                 "PatchSecurityPolicyForDomain",
                 "failed",
-                503,
-                73001L);
+                400,
+                500060L);
 
         boolean immutable = false;
         try {

@@ -45,6 +45,26 @@ try {
         $Handler
     )
 
+    $LiveGapError = $null
+    try {
+        $null = Invoke-VcfVksCoordinatedChange `
+            -NamespaceApi $Api `
+            -KubernetesBaseUri "http://127.0.0.1:${Port}" `
+            -KubernetesToken $Config.kubernetes_bearer_token `
+            -Supervisor $Config.supervisor `
+            -Namespace $Config.namespace `
+            -ClusterName $Config.cluster_name `
+            -ClusterClass $Config.cluster_class `
+            -NamespaceDescription $Config.new_description `
+            -TargetVersion $Config.target_version
+    }
+    catch {
+        $LiveGapError = $_
+    }
+    if ($null -eq $LiveGapError) {
+        throw 'The exact live namespace 404 preflight unexpectedly succeeded.'
+    }
+
     $Result = Invoke-VcfVksCoordinatedChange `
         -NamespaceApi $Api `
         -KubernetesBaseUri "http://127.0.0.1:${Port}" `

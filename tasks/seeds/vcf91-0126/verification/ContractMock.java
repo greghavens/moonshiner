@@ -22,6 +22,7 @@ final class ContractMock implements AutoCloseable {
     enum Scenario {
         FAILED_ATTESTATION,
         RUNNING_TASK,
+        EVENT_NOT_FOUND,
         EVENT_SERVICE_UNAVAILABLE
     }
 
@@ -48,7 +49,8 @@ final class ContractMock implements AutoCloseable {
 
     static final String EVENT_EVIDENCE =
             "PCR7 event=EV_EFI_VARIABLE_DRIVER_CONFIG result=SECURE_BOOT_DISABLED";
-    static final String SUPPORT_TASK_ID = "support bundle/task#77";
+    static final String SUPPORT_TASK_ID =
+            "task-5000:7978ee81-a66c-4c37-8653-c577c0161e9d";
 
     private static final String TASK_OPERATION = "Cis.Tasks_get";
     private static final String EVENT_OPERATION =
@@ -117,7 +119,13 @@ final class ContractMock implements AutoCloseable {
         }
 
         if (EVENT_OPERATION.equals(operationId)) {
-            if (scenario == Scenario.EVENT_SERVICE_UNAVAILABLE) {
+            if (scenario == Scenario.EVENT_NOT_FOUND) {
+                respond(exchange, 404,
+                        "{\"error_type\":\"NOT_FOUND\","
+                                + "\"messages\":[{\"id\":\"com.vmware.esx.trusted_infrastructure.hardware.tpm.not_found\","
+                                + "\"default_message\":\"TPM missing-vcf-tpm not found.\","
+                                + "\"args\":[\"missing-vcf-tpm\"]}]}");
+            } else if (scenario == Scenario.EVENT_SERVICE_UNAVAILABLE) {
                 respond(exchange, 503,
                         "{\"error_type\":\"SERVICE_UNAVAILABLE\","
                                 + "\"messages\":[{\"id\":\"mock.event.unavailable\","
@@ -158,16 +166,15 @@ final class ContractMock implements AutoCloseable {
 
     private static String failedTask(String decodedTask) {
         return "{"
-                + "\"description\":{\"id\":\"mock.attestation\","
-                + "\"default_message\":\"Attestation task failed\","
-                + "\"args\":[" + jsonString(decodedTask) + "]},"
-                + "\"service\":\"com.vmware.vcenter.trusted_infrastructure\","
-                + "\"operation\":\"attest\","
+                + "\"description\":{\"id\":\"Description\","
+                + "\"default_message\":\"\",\"args\":[]},"
+                + "\"service\":\"7978ee81-a66c-4c37-8653-c577c0161e9d\","
+                + "\"operation\":\"com.vmware.vcenter.cluster.evc_mode.check_set\","
                 + "\"status\":\"FAILED\","
                 + "\"cancelable\":false,"
-                + "\"error\":{\"error_type\":\"FAILED_ATTESTATION\","
-                + "\"messages\":[{\"id\":\"mock.attestation.failed\","
-                + "\"default_message\":\"Host trust check failed; inspect TPM events\","
+                + "\"error\":{\"error_type\":\"INVALID_ARGUMENT\","
+                + "\"messages\":[{\"id\":\"com.vmware.vcenter.cluster.evc_mode.EmptyEvcMode\","
+                + "\"default_message\":\"EVC mode is empty.\","
                 + "\"args\":[]}]}"
                 + "}";
     }

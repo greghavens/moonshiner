@@ -4,23 +4,18 @@ import json
 from pathlib import Path
 import unittest
 
-from tests.mock_nsx import FRESH_TOKEN, OLD_TOKEN, ContractNsxMock, running_mock
+from tests.mock_nsx import (
+    BASIC_AUTHORIZATION,
+    BASIC_PASSWORD,
+    BASIC_USERNAME,
+    ContractNsxMock,
+    running_mock,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT = json.loads((ROOT / "docs" / "contract.json").read_text(encoding="utf-8"))
 SOURCES = json.loads((ROOT / "docs" / "official_sources.json").read_text(encoding="utf-8"))
-
-
-class TokenSequence:
-    def __init__(self, *tokens):
-        self.tokens = tokens
-        self.calls = 0
-
-    def __call__(self):
-        index = min(self.calls, len(self.tokens) - 1)
-        self.calls += 1
-        return self.tokens[index]
 
 
 class ContractMetadataTests(unittest.TestCase):
@@ -35,6 +30,8 @@ class ContractMetadataTests(unittest.TestCase):
         )
         self.assertEqual(CONTRACT["swagger"], "2.0")
         self.assertEqual(CONTRACT["base_path"], "/policy/api/v1")
+        self.assertEqual(CONTRACT["securityDefinitions"]["BasicAuth"], {"type": "basic"})
+        self.assertEqual(CONTRACT["security"], [{"BasicAuth": []}])
         self.assertEqual(
             set(SOURCES["operation_ids"]),
             {"CreateOrReplaceInfraSegment", "ListAllInfraSegments"},
@@ -67,34 +64,35 @@ class ContractMetadataTests(unittest.TestCase):
 
 
 class NsxPolicyIntegrationTests(unittest.TestCase):
-    def test_mid_run_expiry_retries_only_failed_put_and_sorts_every_list(self):
+    def test_upserts_in_order_without_replay_and_sorts_every_list(self):
         from nsx_policy import NsxPolicyClient, sync_segments
 
-        tokens = TokenSequence(OLD_TOKEN, FRESH_TOKEN)
         desired = [
             {
                 "resource_type": "Segment",
                 "id": "segment-zeta",
                 "display_name": "Zeta application",
-                "description": "accepted before token expiry",
+                "description": "accepted first",
             },
             {
                 "resource_type": "Segment",
                 "id": "segment-alpha",
                 "display_name": "Alpha application",
-                "description": "the failed request is replayed after refresh",
+                "description": "accepted second",
             },
             {
                 "resource_type": "Segment",
                 "id": "segment-mu",
                 "display_name": "Mu application",
-                "description": "work continues with the fresh token",
+                "description": "accepted third",
             },
         ]
         expected_ids = ["segment-alpha", "segment-mu", "segment-zeta"]
 
         with running_mock(CONTRACT) as (origin, mock):
-            client = NsxPolicyClient(origin, tokens, timeout=2.0)
+            client = NsxPolicyClient(
+                origin, BASIC_USERNAME, BASIC_PASSWORD, timeout=2.0
+            )
             result_one = sync_segments(client, desired)
             result_two = client.list_segments()
             result_three = client.list_segments()
@@ -102,8 +100,6 @@ class NsxPolicyIntegrationTests(unittest.TestCase):
         self.assertEqual([segment["id"] for segment in result_one], expected_ids)
         self.assertEqual([segment["id"] for segment in result_two], expected_ids)
         self.assertEqual([segment["id"] for segment in result_three], expected_ids)
-        self.assertEqual(tokens.calls, 2, "one initial token and one refresh")
-
         put_log = [
             event
             for event in mock.request_log
@@ -111,20 +107,13 @@ class NsxPolicyIntegrationTests(unittest.TestCase):
         ]
         self.assertEqual(
             [event["path"].rsplit("/", 1)[-1] for event in put_log],
-            ["segment-zeta", "segment-alpha", "segment-alpha", "segment-mu"],
+            ["segment-zeta", "segment-alpha", "segment-mu"],
             "the completed first PUT must not be replayed",
         )
-        self.assertEqual([event["status"] for event in put_log], [200, 401, 200, 200])
-        self.assertEqual(
-            [event["authorization"] for event in put_log],
-            [
-                f"Bearer {OLD_TOKEN}",
-                f"Bearer {OLD_TOKEN}",
-                f"Bearer {FRESH_TOKEN}",
-                f"Bearer {FRESH_TOKEN}",
-            ],
+        self.assertEqual([event["status"] for event in put_log], [200, 200, 200])
+        self.assertTrue(
+            all(event["authorization"] == BASIC_AUTHORIZATION for event in put_log)
         )
-        self.assertEqual(put_log[1]["body"], put_log[2]["body"])
         self.assertEqual(put_log[0]["body"], desired[0])
         self.assertTrue(all("application/json" in event["accept"] for event in put_log))
         self.assertTrue(
@@ -141,16 +130,17 @@ class NsxPolicyIntegrationTests(unittest.TestCase):
         self.assertNotEqual(list_log[1]["response_ids"], list_log[2]["response_ids"])
         self.assertEqual(list_log[0]["response_ids"], list_log[2]["response_ids"])
         self.assertTrue(
-            all(event["authorization"] == f"Bearer {FRESH_TOKEN}" for event in list_log)
+            all(event["authorization"] == BASIC_AUTHORIZATION for event in list_log)
         )
 
-    def test_non_401_error_is_preserved_and_does_not_refresh(self):
+    def test_non_authentication_error_is_preserved(self):
         from nsx_policy import NsxPolicyClient, NsxPolicyError
 
-        tokens = TokenSequence(FRESH_TOKEN)
         invalid = {"id": "broken", "display_name": "Missing resource type"}
         with running_mock(CONTRACT) as (origin, mock):
-            client = NsxPolicyClient(origin, tokens, timeout=2.0)
+            client = NsxPolicyClient(
+                origin, BASIC_USERNAME, BASIC_PASSWORD, timeout=2.0
+            )
             with self.assertRaises(NsxPolicyError) as caught:
                 client.upsert_segment(invalid)
 
@@ -160,14 +150,12 @@ class NsxPolicyIntegrationTests(unittest.TestCase):
         self.assertEqual(error.error_message, "Invalid Segment")
         self.assertIn("id must match", error.details)
         self.assertEqual(error.payload["module_name"], "policy")
-        self.assertEqual(tokens.calls, 1)
         self.assertEqual(len(mock.request_log), 1)
         self.assertEqual(mock.request_log[0]["status"], 400)
 
     def test_path_id_is_percent_encoded_and_body_is_not_mutated(self):
         from nsx_policy import NsxPolicyClient
 
-        tokens = TokenSequence(FRESH_TOKEN)
         segment = {
             "resource_type": "Segment",
             "id": "blue floor/edge",
@@ -175,7 +163,9 @@ class NsxPolicyIntegrationTests(unittest.TestCase):
         }
         original = dict(segment)
         with running_mock(CONTRACT) as (origin, mock):
-            client = NsxPolicyClient(origin, tokens, timeout=2.0)
+            client = NsxPolicyClient(
+                origin, BASIC_USERNAME, BASIC_PASSWORD, timeout=2.0
+            )
             response = client.upsert_segment(segment)
 
         self.assertEqual(segment, original)
@@ -185,41 +175,35 @@ class NsxPolicyIntegrationTests(unittest.TestCase):
             "/policy/api/v1/infra/segments/blue%20floor%2Fedge",
         )
 
-    def test_refreshed_token_is_replayed_at_most_once(self):
+    def test_rejected_basic_credentials_are_not_retried(self):
         from nsx_policy import NsxPolicyClient, NsxPolicyError
 
-        tokens = TokenSequence(OLD_TOKEN, OLD_TOKEN, OLD_TOKEN)
-        first = {
-            "resource_type": "Segment",
-            "id": "first",
-            "display_name": "First",
-        }
         with running_mock(CONTRACT) as (origin, mock):
-            client = NsxPolicyClient(origin, tokens, timeout=2.0)
-            client.upsert_segment(first)
+            client = NsxPolicyClient(origin, BASIC_USERNAME, "wrong", timeout=2.0)
             with self.assertRaises(NsxPolicyError) as caught:
                 client.list_segments()
 
-        self.assertEqual(caught.exception.status_code, 401)
-        self.assertEqual(tokens.calls, 2)
+        self.assertEqual(caught.exception.status_code, 403)
+        self.assertEqual(caught.exception.error_code, 403)
+        self.assertEqual(caught.exception.payload["module_name"], "common-services")
         list_attempts = [
             event
             for event in mock.request_log
             if event["operation_id"] == "ListAllInfraSegments"
         ]
-        self.assertEqual(len(list_attempts), 2)
-        self.assertEqual([event["status"] for event in list_attempts], [401, 401])
+        self.assertEqual(len(list_attempts), 1)
+        self.assertEqual([event["status"] for event in list_attempts], [403])
 
     def test_local_segment_id_validation_sends_no_http(self):
         from nsx_policy import NsxPolicyClient
 
-        tokens = TokenSequence(FRESH_TOKEN)
         with running_mock(CONTRACT) as (origin, mock):
-            client = NsxPolicyClient(origin, tokens, timeout=2.0)
+            client = NsxPolicyClient(
+                origin, BASIC_USERNAME, BASIC_PASSWORD, timeout=2.0
+            )
             with self.assertRaises((TypeError, ValueError)):
                 client.upsert_segment({"resource_type": "Segment", "id": ""})
 
-        self.assertEqual(tokens.calls, 0)
         self.assertEqual(mock.request_log, [])
 
 

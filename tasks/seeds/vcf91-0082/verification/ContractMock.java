@@ -18,7 +18,9 @@ import java.util.regex.Pattern;
 
 final class ContractMock implements AutoCloseable {
     enum Behavior {
-        LOST_FIRST_SUCCESS,
+        COMMIT_THEN_TRANSIENT,
+        TRANSIENT_THEN_NOT_FOUND,
+        MISMATCH_AFTER_TRANSIENT,
         FORBIDDEN
     }
 
@@ -43,8 +45,8 @@ final class ContractMock implements AutoCloseable {
         }
     }
 
-    private static final String OPERATION_ID = "CreateOrReplaceInfraSegment";
-    private static final String METHOD = "PUT";
+    private static final String PUT_OPERATION_ID = "CreateOrReplaceInfraSegment";
+    private static final String GET_OPERATION_ID = "ReadInfraSegment";
     private static final String BASE_PATH = "/policy/api/v1";
     private static final Pattern ROUTE =
             Pattern.compile("^/policy/api/v1/infra/segments/([^/]+)$");
@@ -60,7 +62,7 @@ final class ContractMock implements AutoCloseable {
     private final Map<String, Integer> attempts = new LinkedHashMap<>();
 
     ContractMock(Path contractPath) throws IOException {
-        this(contractPath, Behavior.LOST_FIRST_SUCCESS);
+        this(contractPath, Behavior.COMMIT_THEN_TRANSIENT);
     }
 
     ContractMock(Path contractPath, Behavior behavior) throws IOException {
@@ -104,10 +106,11 @@ final class ContractMock implements AutoCloseable {
         while (matcher.find()) {
             operationIds.add(matcher.group(1));
         }
-        require(operationIds.equals(List.of(OPERATION_ID)),
-                "mock contract must name only " + OPERATION_ID + ", got " + operationIds);
-        require(contract.contains("\"method\": \"" + METHOD + "\""),
-                "mock method is not pinned by contract");
+        require(operationIds.equals(List.of(PUT_OPERATION_ID, GET_OPERATION_ID)),
+                "mock contract must name the PUT and reconciliation GET, got " + operationIds);
+        require(contract.contains("\"method\": \"PUT\"")
+                        && contract.contains("\"method\": \"GET\""),
+                "mock methods are not pinned by contract");
         require(contract.contains("\"path\": \"/infra/segments/{segment-id}\""),
                 "mock path is not pinned by contract");
         require(contract.contains("\"basePath\": \"" + BASE_PATH + "\""),
@@ -131,9 +134,15 @@ final class ContractMock implements AutoCloseable {
                 send(exchange, 404, "{\"error_message\":\"operation not in contract\"}");
                 return;
             }
-            if (!METHOD.equals(exchange.getRequestMethod())) {
-                exchange.getResponseHeaders().set("Allow", METHOD);
+            if (!"PUT".equals(exchange.getRequestMethod())
+                    && !"GET".equals(exchange.getRequestMethod())) {
+                exchange.getResponseHeaders().set("Allow", "GET, PUT");
                 send(exchange, 405, "{\"error_message\":\"method not in contract\"}");
+                return;
+            }
+            if (route.group(1).toUpperCase().contains("%2F")) {
+                send(exchange, 400,
+                        "{\"error_code\":512,\"error_message\":\"Encoded slash character is not allowed in the URI.\",\"module_name\":\"common-services\"}");
                 return;
             }
             if (behavior == Behavior.FORBIDDEN) {
@@ -143,16 +152,43 @@ final class ContractMock implements AutoCloseable {
             }
 
             String segmentId = decodePathSegment(route.group(1));
+            if ("GET".equals(exchange.getRequestMethod())) {
+                byte[] stored;
+                synchronized (this) {
+                    stored = resources.get(segmentId);
+                }
+                if (stored == null) {
+                    send(exchange, 404,
+                            "{\"error_code\":500090,\"error_message\":\"Segment not found\",\"module_name\":\"Policy\"}");
+                    return;
+                }
+                String object = new String(stored, StandardCharsets.UTF_8);
+                String enriched = object.substring(0, object.length() - 1)
+                        + ",\"_revision\":1,\"id\":\"" + segmentId
+                        + "\",\"resource_type\":\"Segment\"}";
+                send(exchange, 200, enriched);
+                return;
+            }
+
             int attempt;
             synchronized (this) {
                 attempt = attempts.merge(segmentId, 1, Integer::sum);
-                if (!resources.containsKey(segmentId)) {
-                    creations.merge(segmentId, 1, Integer::sum);
+                if (attempt == 1 && behavior == Behavior.TRANSIENT_THEN_NOT_FOUND) {
+                    // The first PUT did not commit.
+                } else {
+                    if (!resources.containsKey(segmentId)) {
+                        creations.merge(segmentId, 1, Integer::sum);
+                    }
+                    if (behavior == Behavior.MISMATCH_AFTER_TRANSIENT) {
+                        resources.put(segmentId,
+                                "{\"display_name\":\"different segment\"}"
+                                        .getBytes(StandardCharsets.UTF_8));
+                    } else {
+                        resources.put(segmentId, body.clone());
+                    }
                 }
-                resources.put(segmentId, body.clone());
             }
 
-            // The first response is deliberately lost after the mutation is committed.
             if (attempt == 1) {
                 send(exchange, 503,
                         "{\"error_code\":503001,\"error_message\":\"transient service failure\"}");

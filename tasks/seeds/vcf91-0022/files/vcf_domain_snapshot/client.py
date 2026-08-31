@@ -23,11 +23,11 @@ class SddcManagerError(RuntimeError):
 
 
 class ProtocolError(SddcManagerError):
-    """A successful response violated the protected contract."""
+    """A successful response violated the documented API contract."""
 
 
 class SddcManagerClient:
-    """Client for the three operations named by the protected contract."""
+    """Client for the three operations named by the documented API contract."""
 
     def __init__(
         self,

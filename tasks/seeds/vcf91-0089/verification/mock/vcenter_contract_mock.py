@@ -19,6 +19,7 @@ EXPECTED_OPERATION_IDS = {
     "Vcenter.VM_clone$Task",
     "Cis.Tasks_get",
 }
+SERVICE_UUID = "7978ee81-a66c-4c37-8653-c577c0161e9d"
 
 
 def compile_path(path: str) -> tuple[re.Pattern[str], list[str]]:
@@ -110,8 +111,8 @@ class ContractState:
         digest = hashlib.sha256(
             (self.source_digest + material).encode("utf-8")
         ).hexdigest()
-        task_id = f"task-{digest[:16]}"
-        result = f"vm-{digest[16:28]}"
+        task_id = f"task-{int(digest[:4], 16)}:{SERVICE_UUID}"
+        result = f"vm-{int(digest[4:8], 16)}:{SERVICE_UUID}"
         with self.lock:
             self.tasks[task_id] = {"polls": 0, "result": result}
         return task_id, result
@@ -129,12 +130,12 @@ class ContractState:
 
         info: dict[str, Any] = {
             "description": {
-                "id": "com.vmware.vcenter.vm.clone",
-                "default_message": "Clone virtual machine",
+                "id": "Description",
+                "default_message": "",
                 "args": [],
             },
-            "service": "com.vmware.vcenter.vm",
-            "operation": "clone",
+            "service": SERVICE_UUID,
+            "operation": "com.vmware.vcenter.vm.clone",
             "status": status,
             "cancelable": status != "SUCCEEDED",
         }
@@ -265,6 +266,7 @@ class ContractHandler(BaseHTTPRequestHandler):
                 return
             entry["pollCount"] = poll_count
             entry["returnedStatus"] = info["status"]
+            entry["returnedTaskInfo"] = info
             self.state.append_log(entry)
             self._write_json(HTTPStatus.OK, info)
             return

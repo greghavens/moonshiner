@@ -23,6 +23,13 @@ EXPECTED_OPERATIONS = {
         "/vcenter/cluster/{cluster}/evc-mode?vmw-task=true",
     ),
 }
+SERVICE_UUID = "7978ee81-a66c-4c37-8653-c577c0161e9d"
+SESSION_ID = "0123456789abcdef0123456789abcdef"
+PRECHECK_TASKS = {
+    "domain-c9": f"task-4125:{SERVICE_UUID}",
+    "domain-c8": f"task-4126:{SERVICE_UUID}",
+    "domain-c10": f"task-4127:{SERVICE_UUID}",
+}
 
 
 def load_and_pin_contract(path: Path) -> dict:
@@ -45,7 +52,7 @@ def valid_set_spec(value: object) -> bool:
     if not isinstance(value, dict) or set(value) - {"evc_mode"}:
         return False
     if "evc_mode" not in value:
-        return value == {}
+        return False
     mode = value["evc_mode"]
     if not isinstance(mode, dict) or set(mode) != {"key", "masks"}:
         return False
@@ -85,7 +92,7 @@ def localizable(message_id: str, default_message: str) -> dict:
 
 def task_info(task_id: str, precheck: dict) -> dict:
     cluster = precheck["cluster"]
-    if cluster == "domain-c8":
+    if cluster == "domain-c10":
         result = [
             {
                 "error": {
@@ -103,17 +110,26 @@ def task_info(task_id: str, precheck: dict) -> dict:
         ]
     else:
         result = []
-    return {
+    info = {
         "cancelable": False,
-        "description": localizable(
-            "com.vmware.vcenter.cluster.evc_mode.check_set",
-            f"Check EVC mode for {cluster}",
-        ),
-        "operation": "check_set",
+        "description": localizable("Description", ""),
+        "operation": "com.vmware.vcenter.cluster.evc_mode.check_set",
         "result": result,
-        "service": "com.vmware.vcenter.cluster.evc_mode",
-        "status": "SUCCEEDED",
+        "service": SERVICE_UUID,
+        "status": "FAILED" if cluster == "domain-c8" else "SUCCEEDED",
     }
+    if cluster == "domain-c8":
+        info["result"] = None
+        info["error"] = {
+            "error_type": "INVALID_ARGUMENT",
+            "messages": [
+                localizable(
+                    "com.vmware.vcenter.evc_modes.UnknownFeatures",
+                    "EVC mode features are unknown.",
+                )
+            ],
+        }
+    return info
 
 
 def make_handler(state: State):
@@ -148,7 +164,7 @@ def make_handler(state: State):
             )
 
         def authenticate(self) -> bool:
-            if self.headers.get("vmware-api-session-id") != "session-test-token":
+            if self.headers.get("vmware-api-session-id") != SESSION_ID:
                 self.send_json(401, {"error_type": "UNAUTHENTICATED"})
                 return False
             return True
@@ -178,7 +194,10 @@ def make_handler(state: State):
                 self.send_json(400, {"error_type": "INVALID_ARGUMENT"})
                 return
             cluster = unquote(match.group(1))
-            task_id = f"precheck-{cluster}"
+            task_id = PRECHECK_TASKS.get(cluster)
+            if task_id is None:
+                self.send_json(404, {"error_type": "NOT_FOUND"})
+                return
             with state.lock:
                 state.prechecks[task_id] = {"cluster": cluster, "spec": spec}
             self.send_json(202, task_id)
@@ -223,7 +242,7 @@ def make_handler(state: State):
                 self.send_json(400, {"error_type": "INVALID_ARGUMENT"})
                 return
             cluster = unquote(match.group(1))
-            task_id = f"precheck-{cluster}"
+            task_id = PRECHECK_TASKS.get(cluster)
             with state.lock:
                 precheck = state.prechecks.get(task_id)
                 allowed = (
@@ -236,7 +255,7 @@ def make_handler(state: State):
             if not allowed:
                 self.send_json(409, {"error_type": "PRECHECK_REQUIRED"})
                 return
-            self.send_json(202, f"mutation-{cluster}")
+            self.send_json(202, f"task-4128:{SERVICE_UUID}")
 
     return Handler
 

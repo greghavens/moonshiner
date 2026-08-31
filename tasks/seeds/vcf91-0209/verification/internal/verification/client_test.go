@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -106,9 +105,7 @@ func TestOfficialSourceRecordsEveryContractOperation(t *testing.T) {
 
 func TestUpdateProxyAndWaitExactWire(t *testing.T) {
 	server := contractmock.Start(t, filepath.Join(repositoryRoot(t), "docs", "contract.json"), []string{
-		"PENDING",
-		"In Progress",
-		"Successful",
+		"COMPLETED_WITH_SUCCESS",
 	})
 	token := "runtime-token-0209"
 	client, err := vcfinstaller.NewClient(server.URL(), token, &http.Client{Timeout: 2 * time.Second})
@@ -125,13 +122,13 @@ func TestUpdateProxyAndWaitExactWire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdateProxyAndWait: %v", err)
 	}
-	if final.ID != server.TaskID() || final.Status != "Successful" {
+	if final.ID != server.TaskID() || final.Status != "COMPLETED_WITH_SUCCESS" {
 		t.Fatalf("final task = %+v", final)
 	}
 
 	requests := server.Requests()
-	if len(requests) != 4 {
-		t.Fatalf("request log = %v, want one PATCH and three GETs", requests)
+	if len(requests) != 1 {
+		t.Fatalf("request log = %v, live terminal acceptance must require only one PATCH", requests)
 	}
 	patch := requests[0]
 	if patch.OperationID != "updateProxyConfiguration" || patch.Method != http.MethodPatch || patch.RawTarget != "/v1/system/proxy-configuration" {
@@ -173,21 +170,6 @@ func TestUpdateProxyAndWaitExactWire(t *testing.T) {
 		t.Fatalf("PATCH members = %v, want exactly %v", gotMembers, wantMembers)
 	}
 
-	wantTarget := "/v1/tasks/" + url.PathEscape(server.TaskID())
-	for index, request := range requests[1:] {
-		if request.OperationID != "getTask" || request.Method != http.MethodGet || request.RawTarget != wantTarget {
-			t.Fatalf("poll request %d = %v", index, request)
-		}
-		assertSingleHeader(t, request.Header, "Authorization", "Bearer "+token)
-		assertSingleHeader(t, request.Header, "Accept", "application/json")
-		assertHeaderNames(t, request.Header, "Accept", "Accept-Encoding", "Authorization", "User-Agent")
-		if values := request.Header.Values("Content-Type"); len(values) != 0 {
-			t.Errorf("GET %d Content-Type values = %v, want absent", index, values)
-		}
-		if len(request.Body) != 0 || request.ContentLength > 0 || len(request.TransferEncoding) != 0 {
-			t.Errorf("GET %d framing body=%d contentLength=%d transferEncoding=%v", index, len(request.Body), request.ContentLength, request.TransferEncoding)
-		}
-	}
 }
 
 func TestOptionalBooleanAndOmissionTable(t *testing.T) {
@@ -244,8 +226,8 @@ func TestOptionalBooleanAndOmissionTable(t *testing.T) {
 				t.Fatalf("UpdateProxyAndWait: %v", err)
 			}
 			requests := server.Requests()
-			if len(requests) != 2 {
-				t.Fatalf("requests = %v, want submit plus mandatory poll", requests)
+			if len(requests) != 1 {
+				t.Fatalf("requests = %v, want the live terminal PATCH only", requests)
 			}
 			if string(requests[0].Body) != test.wantBody {
 				t.Fatalf("body = %q, want %q", requests[0].Body, test.wantBody)
@@ -285,7 +267,7 @@ func TestNonTerminalStatusTable(t *testing.T) {
 			if err != nil || task.Status != "Successful" {
 				t.Fatalf("task=%+v error=%v", task, err)
 			}
-			if got := server.Requests(); len(got) != 3 || got[1].OperationID != "getTask" || got[2].OperationID != "getTask" {
+			if got := server.Requests(); len(got) != 2 || got[1].OperationID != "getTask" {
 				t.Fatalf("nonterminal request log = %v", got)
 			}
 		})
@@ -300,6 +282,7 @@ func TestTerminalStatusTable(t *testing.T) {
 		wantProtocol bool
 	}{
 		{name: "successful spelling", status: "  Successful  "},
+		{name: "live completed with success", status: "COMPLETED_WITH_SUCCESS"},
 		{name: "failed", status: "FAILED", wantFailure: true},
 		{name: "cancelled", status: "Cancelled", wantFailure: true},
 		{name: "warning terminal", status: "completed with warning", wantFailure: true},
@@ -329,8 +312,8 @@ func TestTerminalStatusTable(t *testing.T) {
 			if failed != nil && (failed.Task.ID != task.ID || failed.Task.Status != task.Status) {
 				t.Fatalf("TaskFailedError task = %+v, returned %+v", failed.Task, task)
 			}
-			if got := server.Requests(); len(got) != 2 || got[1].OperationID != "getTask" {
-				t.Fatalf("mandatory poll log = %v", got)
+			if got := server.Requests(); len(got) != 1 || got[0].OperationID != "updateProxyConfiguration" {
+				t.Fatalf("terminal accepted task unexpectedly triggered polling: %v", got)
 			}
 		})
 	}
@@ -388,11 +371,10 @@ func TestArgumentErrorsDoNotSendRequests(t *testing.T) {
 	}
 }
 
-func TestAcceptedTerminalTaskIsStillPolled(t *testing.T) {
+func TestAcceptedTerminalTaskReturnsWithoutUnqueryablePoll(t *testing.T) {
 	taskID := "terminal/accepted"
 	responses := []scriptedResponse{
-		{status: http.StatusAccepted, contentType: "application/json", body: taskBody(taskID, "Successful")},
-		{status: http.StatusOK, contentType: "application/json; charset=utf-8", body: taskBody(taskID, "Successful")},
+		{status: http.StatusAccepted, contentType: "application/json", body: taskBody(taskID, "COMPLETED_WITH_SUCCESS")},
 	}
 	server, count := startScriptedServer(t, responses)
 	client, err := vcfinstaller.NewClient(server.URL, "mandatory-token", nil)
@@ -403,8 +385,8 @@ func TestAcceptedTerminalTaskIsStillPolled(t *testing.T) {
 	if err != nil || task.ID != taskID {
 		t.Fatalf("task=%+v error=%v", task, err)
 	}
-	if got := count.Load(); got != 2 {
-		t.Fatalf("request count = %d, want accepted PATCH plus mandatory GET", got)
+	if got := count.Load(); got != 1 {
+		t.Fatalf("request count = %d, want only the live terminal PATCH", got)
 	}
 }
 

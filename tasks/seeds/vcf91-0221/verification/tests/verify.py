@@ -82,6 +82,16 @@ def verify_provenance() -> dict[str, Any]:
         == ["PENDING", "SCHEDULED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELED"],
         "task lifecycle states do not match the source specification",
     )
+    require(
+        contract["schemas"]["VspClusterEndpoint"]["required"]
+        == ["instanceFqdn", "platformFqdn", "sslThumbprint"],
+        "VSP cluster requirements do not match the source specification",
+    )
+    require(
+        contract["schemas"]["VcenterEndpoint"]["required"]
+        == ["fqdn", "password", "sslThumbprint", "username"],
+        "vCenter endpoint requirements do not match the source specification",
+    )
     return contract
 
 
@@ -151,6 +161,7 @@ function Invoke-Case {{
 $managerSecret = ConvertTo-SecureString 'SddcPass!42' -AsPlainText -Force
 $managerCredential = [pscredential]::new('administrator@vsphere.local', $managerSecret)
 $accessToken = ConvertTo-SecureString 'loopback-access-token' -AsPlainText -Force
+$fleetToken = ConvertTo-SecureString 'fleet-ops-token' -AsPlainText -Force
 $common = @{{
     BaseUri = 'http://127.0.0.1:{port}/sddc-lcm'
     AccessToken = $accessToken
@@ -158,8 +169,13 @@ $common = @{{
     SddcManagerFqdn = 'sddc-manager01.example.test'
     SddcManagerCredential = $managerCredential
     SddcManagerSslThumbprint = 'AA:11:22:33'
+    VspPlatformFqdn = 'platform01.example.test'
+    VspInstanceFqdn = 'instance01.example.test'
+    VspFleetFqdn = 'fleet01.example.test'
+    VspSslThumbprint = 'CC:77:88:99'
     FleetLcmFqdn = 'fleet-lcm01.example.test'
     FleetLcmSslThumbprint = 'BB:44:55:66'
+    FleetOpsToken = $fleetToken
     PollIntervalSeconds = 0
     TimeoutSeconds = 10
 }}
@@ -168,7 +184,6 @@ $results += Invoke-Case -Name 'happy' -Action {{ Set-VcfSddcLcmConfiguration @co
 
 $fleetSecret = ConvertTo-SecureString 'FleetPass!84' -AsPlainText -Force
 $fleetCredential = [pscredential]::new('fleet-admin', $fleetSecret)
-$fleetToken = ConvertTo-SecureString 'fleet-ops-token' -AsPlainText -Force
 $optional = $common.Clone()
 $optional['FleetLcmCredential'] = $fleetCredential
 $optional['FleetOpsToken'] = $fleetToken
@@ -273,7 +288,7 @@ def verify_outcomes(results: list[dict[str, Any]]) -> None:
     )
     by_name = {item["name"]: item for item in results}
 
-    returned = ("happy", "optional", "accepted-succeeded", "empty-optional")
+    returned = ("happy", "optional", "accepted-succeeded")
     for name in returned:
         item = by_name[name]
         require(item.get("outcome") == "returned", f"{name} should return successfully")
@@ -290,6 +305,7 @@ def verify_outcomes(results: list[dict[str, Any]]) -> None:
         "missing-status",
         "mismatched-id",
         "invalid-accepted-id",
+        "empty-optional",
         "timeout",
     )
     for name in rejected:
@@ -327,9 +343,16 @@ def verify_wire(entries: list[dict[str, Any]]) -> None:
             "password": "SddcPass!42",
             "sslThumbprint": "AA:11:22:33",
         },
+        "vspCluster": {
+            "platformFqdn": "platform01.example.test",
+            "instanceFqdn": "instance01.example.test",
+            "sslThumbprint": "CC:77:88:99",
+            "fleetFqdn": "fleet01.example.test",
+        },
         "fleetLcm": {
             "fqdn": "fleet-lcm01.example.test",
             "sslThumbprint": "BB:44:55:66",
+            "opsToken": "fleet-ops-token",
         },
     }
 
@@ -359,12 +382,14 @@ def verify_wire(entries: list[dict[str, Any]]) -> None:
                     "opsToken": "fleet-ops-token",
                 }
             )
+        elif workflow == 9:
+            body = json.loads(json.dumps(expected_body))
+            body["fleetLcm"].pop("opsToken")
         require(submit["bodyJson"] == body, f"{case_name} ConfigSpec JSON wire shape is not exact")
-        require("vspCluster" not in submit["bodyJson"], f"{case_name} must omit vspCluster")
         require("vcenter" not in submit["bodyJson"], f"{case_name} must omit vcenter")
-        if workflow != 1:
+        if workflow not in (1, 9):
             fleet = submit["bodyJson"]["fleetLcm"]
-            for optional in ("username", "password", "opsToken"):
+            for optional in ("username", "password"):
                 require(optional not in fleet, f"{case_name} must omit Fleet LCM {optional}")
 
         if workflow == 8:

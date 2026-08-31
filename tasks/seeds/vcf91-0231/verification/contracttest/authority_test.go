@@ -58,7 +58,7 @@ func TestContractIsAuthoritative(t *testing.T) {
 	server := startMock(t, mockWithContract(altered))
 	planPath := writePlan(t, map[string]any{
 		"scope":         "FLEET",
-		"correlationId": "drill-2026-02-11",
+		"correlationId": "dbf7816d-28f6-42a3-9262-491e435d52e8",
 		"components":    []any{map[string]any{"componentType": "vidb"}},
 	})
 

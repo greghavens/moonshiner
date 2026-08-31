@@ -35,6 +35,9 @@ public final class VksClusterApplyClient {
             Duration requestTimeout) {
     }
 
+    public record TopologyVariable(String name, Object value) {
+    }
+
     public record ApplyRequest(
             String supervisor,
             String namespace,
@@ -42,9 +45,10 @@ public final class VksClusterApplyClient {
             String fieldManager,
             String clusterClass,
             String kubernetesVersion,
-            String vmClass,
-            String storageClass,
+            List<TopologyVariable> topologyVariables,
             int controlPlaneReplicas,
+            String workerClass,
+            String workerName,
             Integer workerReplicas,
             List<String> podCidrs,
             List<String> serviceCidrs,
@@ -354,8 +358,27 @@ public final class VksClusterApplyClient {
         validateRequired(request.fieldManager(), "fieldManager");
         validateRequired(request.clusterClass(), "clusterClass");
         validateRequired(request.kubernetesVersion(), "kubernetesVersion");
-        validateRequired(request.vmClass(), "vmClass");
-        validateRequired(request.storageClass(), "storageClass");
+        List<String> expectedVariables = List.of(
+                "datastore", "dnsImageTag", "imageRepository",
+                "infraServerThumbprint", "network", "infraServerURL",
+                "resourcePool", "vmTemplate", "datacenter", "etcdImageTag",
+                "folder", "controlPlaneIpAddr", "credsSecretName",
+                "kubeVipPodManifest");
+        if (request.topologyVariables() == null
+                || request.topologyVariables().size() != expectedVariables.size()) {
+            throw new IllegalArgumentException(
+                    "topologyVariables must contain the fourteen ClusterClass variables");
+        }
+        for (int index = 0; index < expectedVariables.size(); index++) {
+            TopologyVariable variable = request.topologyVariables().get(index);
+            if (variable == null
+                    || !expectedVariables.get(index).equals(variable.name())
+                    || variable.value() == null) {
+                throw new IllegalArgumentException(
+                        "topologyVariables names, order, and values are required");
+            }
+            validateJsonValue(variable.value());
+        }
         if (request.controlPlaneReplicas() < 1) {
             throw new IllegalArgumentException(
                     "controlPlaneReplicas must be positive");
@@ -365,8 +388,57 @@ public final class VksClusterApplyClient {
             throw new IllegalArgumentException(
                     "workerReplicas must not be negative");
         }
+        if (request.workerReplicas() != null) {
+            validateRequired(request.workerClass(), "workerClass");
+            validateRequired(request.workerName(), "workerName");
+        }
         validateCidrs(request.podCidrs(), "podCidrs");
         validateCidrs(request.serviceCidrs(), "serviceCidrs");
+    }
+
+    private static void validateJsonValue(Object value) {
+        if (value == null) {
+            throw new IllegalArgumentException(
+                    "topology variable values must not be null");
+        }
+        if (value instanceof String || value instanceof Boolean
+                || value instanceof BigDecimal || value instanceof Byte
+                || value instanceof Short || value instanceof Integer
+                || value instanceof Long) {
+            return;
+        }
+        if (value instanceof Float number) {
+            if (!Float.isFinite(number)) {
+                throw new IllegalArgumentException(
+                        "topology variable number must be finite");
+            }
+            return;
+        }
+        if (value instanceof Double number) {
+            if (!Double.isFinite(number)) {
+                throw new IllegalArgumentException(
+                        "topology variable number must be finite");
+            }
+            return;
+        }
+        if (value instanceof List<?> list) {
+            for (Object item : list) {
+                validateJsonValue(item);
+            }
+            return;
+        }
+        if (value instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                if (!(entry.getKey() instanceof String key) || key.isBlank()) {
+                    throw new IllegalArgumentException(
+                            "topology variable object keys must be nonblank strings");
+                }
+                validateJsonValue(entry.getValue());
+            }
+            return;
+        }
+        throw new IllegalArgumentException(
+                "topology variable values must be JSON-compatible");
     }
 
     private static void validateCidrs(List<String> values, String name) {

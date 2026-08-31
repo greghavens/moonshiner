@@ -1,3 +1,3 @@
-module moonshiner.local/vcf91-0186
+module vcflogforwarder
 
 go 1.22

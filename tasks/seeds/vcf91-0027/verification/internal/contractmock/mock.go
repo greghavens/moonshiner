@@ -156,7 +156,7 @@ func (s *Server) responseFor(r *http.Request) *http.Response {
 		return textResponse(http.StatusBadRequest, "pageNumber is required by this fixture\n")
 	}
 	pageNumber, err := strconv.Atoi(pageText[0])
-	if err != nil || pageNumber < 0 || pageNumber >= len(s.pages) {
+	if err != nil || pageNumber < 1 || pageNumber > len(s.pages) {
 		return textResponse(http.StatusBadRequest, "pageNumber is out of range\n")
 	}
 
@@ -173,7 +173,7 @@ func (s *Server) responseFor(r *http.Request) *http.Response {
 			TotalPages    int `json:"totalPages"`
 		} `json:"pageMetadata"`
 	}{
-		Elements: append([]Host(nil), s.pages[pageNumber]...),
+		Elements: append([]Host(nil), s.pages[pageNumber-1]...),
 	}
 	response.PageMetadata.PageNumber = pageNumber
 	response.PageMetadata.PageSize = len(response.Elements)

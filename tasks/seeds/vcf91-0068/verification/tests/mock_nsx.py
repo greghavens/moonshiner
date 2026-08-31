@@ -7,6 +7,7 @@ mock endpoint. Every request is retained in request_log for verifier checks.
 
 from contextlib import contextmanager
 from copy import deepcopy
+import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import re
@@ -14,8 +15,11 @@ import threading
 from urllib.parse import unquote, urlsplit
 
 
-OLD_TOKEN = "fixture-access-token-v1"
-FRESH_TOKEN = "fixture-access-token-v2"
+BASIC_USERNAME = "nsx-automation"
+BASIC_PASSWORD = "fixture-password"
+BASIC_AUTHORIZATION = "Basic " + base64.b64encode(
+    f"{BASIC_USERNAME}:{BASIC_PASSWORD}".encode("utf-8")
+).decode("ascii")
 
 
 class ContractNsxMock:
@@ -26,7 +30,6 @@ class ContractNsxMock:
         self.request_log = []
         self.segments = {}
         self.collection_response_count = 0
-        self.old_token_successes = 0
         self.lock = threading.RLock()
 
         operations = contract["operations"]
@@ -88,27 +91,15 @@ class ContractNsxMock:
                 )
 
             authorization = headers.get("authorization")
-            if authorization == f"Bearer {OLD_TOKEN}":
-                if self.old_token_successes >= 1:
-                    return self._finish(
-                        event,
-                        401,
-                        {
-                            "error_code": 401003,
-                            "error_message": "Access token has expired",
-                            "details": "Obtain a fresh access token and retry the failed request",
-                            "module_name": "authentication",
-                        },
-                    )
-            elif authorization != f"Bearer {FRESH_TOKEN}":
+            if authorization != BASIC_AUTHORIZATION:
                 return self._finish(
                     event,
-                    401,
+                    403,
                     {
-                        "error_code": 401002,
-                        "error_message": "Authentication required",
-                        "details": "A valid bearer access token is required",
-                        "module_name": "authentication",
+                        "error_code": 403,
+                        "error_message": "Authentication failed",
+                        "details": "Credentials are incorrect or the account is locked",
+                        "module_name": "common-services",
                     },
                 )
 
@@ -117,8 +108,6 @@ class ContractNsxMock:
             else:
                 result = self._list_segments(event)
 
-            if authorization == f"Bearer {OLD_TOKEN}" and result[0] < 400:
-                self.old_token_successes += 1
             return result
 
     def _put_segment(self, event, segment_id, raw_body):

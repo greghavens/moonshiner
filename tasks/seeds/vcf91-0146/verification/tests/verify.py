@@ -337,6 +337,115 @@ def cluster_fixture() -> list[dict[str, str]]:
     ]
 
 
+def live_cluster_fixture() -> list[dict[str, str]]:
+    return [
+        {
+            "name": "vcf-msr01",
+            "topologyVersion": "v1.34.2",
+        }
+    ]
+
+
+def run_live_boundary_cases(directory: Path) -> None:
+    session = "8a1d0d1b3fe94ad0b05f3a8fcfd92ab5"
+    token = "distinct-kubernetes-bearer"
+    namespace = "vmsp-platform"
+    clusters = live_cluster_fixture()
+
+    namespace_log = directory / "live-namespace-404.jsonl"
+    with ContractMock(
+        CONTRACT_PATH,
+        namespace_log,
+        namespace=namespace,
+        supervisor="absent-supervisor",
+        clusters=clusters,
+        task_id="task-101:11111111-2222-3333-4444-555555555555",
+        task_states=["SUCCEEDED"],
+        task_result=None,
+        namespace_not_found=True,
+    ) as mock:
+        error = require_raises(
+            ApiError,
+            lambda: NamespaceBackupClient(
+                mock.base_url, mock.base_url, session, token
+            ).backup_namespace(namespace),
+            "live namespace 404 was not preserved",
+        )
+    require(error.operation_id == GET_NAMESPACE_OPERATION, "wrong 404 operation")
+    require(error.status_code == 404, "wrong namespace failure status")
+    records = read_log(namespace_log)
+    require(len(records) == 1, "namespace 404 did not stop before Kubernetes")
+
+    supervisor_log = directory / "live-supervisor-404.jsonl"
+    with ContractMock(
+        CONTRACT_PATH,
+        supervisor_log,
+        namespace=namespace,
+        supervisor="absent-supervisor",
+        clusters=clusters,
+        task_id="task-102:11111111-2222-3333-4444-555555555555",
+        task_states=["SUCCEEDED"],
+        task_result=None,
+        supervisor_not_found=True,
+    ) as mock:
+        error = require_raises(
+            ApiError,
+            lambda: NamespaceBackupClient(
+                mock.base_url, mock.base_url, session, token
+            ).backup_namespace(namespace),
+            "live Supervisor 404 was not preserved",
+        )
+    require(error.operation_id == CREATE_BACKUP_OPERATION, "wrong backup failure operation")
+    require(error.status_code == 404, "wrong Supervisor failure status")
+    records = read_log(supervisor_log)
+    require(
+        [record["contract_name"] for record in records]
+        == [
+            "getSupervisorNamespace",
+            "listVksClusters",
+            "createSupervisorBackup",
+        ],
+        "Supervisor 404 did not stop before task polling",
+    )
+    require(
+        base64.b64decode(records[2]["body_base64"], validate=True) == b"{}",
+        "live absent-Supervisor probe did not use compact empty JSON",
+    )
+
+    expired_log = directory / "live-expired-task-404.jsonl"
+    with ContractMock(
+        CONTRACT_PATH,
+        expired_log,
+        namespace=namespace,
+        supervisor="supervisor-101",
+        clusters=clusters,
+        task_id="task-103:11111111-2222-3333-4444-555555555555",
+        task_states=["SUCCEEDED"],
+        task_result=None,
+        task_not_found=True,
+    ) as mock:
+        error = require_raises(
+            ApiError,
+            lambda: NamespaceBackupClient(
+                mock.base_url, mock.base_url, session, token
+            ).backup_namespace(namespace),
+            "expired live task 404 was not preserved",
+        )
+    require(error.operation_id == GET_TASK_OPERATION, "wrong expired-task operation")
+    require(error.status_code == 404, "wrong expired-task status")
+    records = read_log(expired_log)
+    require(
+        [record["contract_name"] for record in records]
+        == [
+            "getSupervisorNamespace",
+            "listVksClusters",
+            "createSupervisorBackup",
+            "getTask",
+        ],
+        "expired task 404 did not stop before the final inventory",
+    )
+
+
 def run_primary_case(directory: Path) -> None:
     session = "session-" + secrets.token_urlsafe(24)
     token = "kube-" + secrets.token_urlsafe(24)
@@ -692,6 +801,7 @@ def main() -> None:
     assert_public_types_and_validation()
     with tempfile.TemporaryDirectory(prefix="vcf91-0146-") as raw_directory:
         directory = Path(raw_directory)
+        run_live_boundary_cases(directory)
         run_primary_case(directory)
         run_unset_comment_case(directory)
         run_failed_task_case(directory)

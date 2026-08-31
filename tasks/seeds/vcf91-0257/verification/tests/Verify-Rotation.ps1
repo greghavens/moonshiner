@@ -115,8 +115,10 @@ try {
             -AdapterKind $ADAPTER_KIND `
             -CredentialName $CRED_NAME `
             -NewCredentialName $NEW_NAME `
+            -CredentialField ([ordered]@{ USER = 'svc-rotation@vsphere.local' }) `
             -NewSecret $NEW_SECRET `
-            -SecretFieldName $FIELD_NAME
+            -SecretFieldName $FIELD_NAME `
+            -SkipCertificateCheck
     }
     catch {
         $invokeError = $_
@@ -240,15 +242,21 @@ if ($create.Count -eq 1) {
     Test-Claim ([string]$b.name -eq $NEW_NAME) "createCredential name was '$($b.name)'"
 
     $fields = @($b.fields)
-    Test-Claim ($fields.Count -eq 1) "createCredential sent $($fields.Count) field(s), expected 1"
-    if ($fields.Count -ge 1) {
-        $fn = Get-PropertyName $fields[0]
-        Test-Claim (($fn -join ',') -eq 'name,value') `
-            "createCredential field had properties '$($fn -join ',')', expected 'name,value'"
-        Test-Claim ([string]$fields[0].name -eq $FIELD_NAME) `
-            "createCredential field name was '$($fields[0].name)'"
-        Test-Claim ([string]$fields[0].value -eq $NEW_SECRET) `
-            'createCredential did not carry the new secret'
+    Test-Claim ($fields.Count -eq 2) "createCredential sent $($fields.Count) field(s), expected USER and PASSWORD"
+    if ($fields.Count -eq 2) {
+        foreach ($field in $fields) {
+            $fn = Get-PropertyName $field
+            Test-Claim (($fn -join ',') -eq 'name,value') `
+                "createCredential field had properties '$($fn -join ',')', expected 'name,value'"
+        }
+        Test-Claim ([string]$fields[0].name -eq 'USER') `
+            "first createCredential field was '$($fields[0].name)', expected USER"
+        Test-Claim ([string]$fields[0].value -eq 'svc-rotation@vsphere.local') `
+            'createCredential did not preserve the supplied USER field'
+        Test-Claim ([string]$fields[1].name -eq $FIELD_NAME) `
+            "second createCredential field was '$($fields[1].name)', expected $FIELD_NAME"
+        Test-Claim ([string]$fields[1].value -eq $NEW_SECRET) `
+            'createCredential did not append the new secret'
     }
     Test-Claim ($create[0].status -eq 201) "createCredential returned $($create[0].status)"
 }
@@ -263,9 +271,11 @@ $patchedIds = @()
 foreach ($p in $patches) {
     $b = $p.body | ConvertFrom-Json
     $names = Get-PropertyName $b
-    Test-Claim (($names -join ',') -eq 'credentialInstanceId,id,resourceKey') `
+    Test-Claim (($names -join ',') -eq 'adapter-certificates,credentialInstanceId,id,resourceKey') `
         ("patchAdapterInstance (seq $($p.seq)) body had properties '$($names -join ',')'; " +
-         "expected exactly 'credentialInstanceId,id,resourceKey'")
+         "expected exactly 'adapter-certificates,credentialInstanceId,id,resourceKey'")
+    Test-Claim (@($b.'adapter-certificates').Count -eq 0) `
+        "patchAdapterInstance (seq $($p.seq)) must send adapter-certificates as an empty array"
     Test-Claim ([string]$b.credentialInstanceId -eq $NEW_ID) `
         "patchAdapterInstance (seq $($p.seq)) pointed at '$($b.credentialInstanceId)', expected the staged credential $NEW_ID"
     if ($b.PSObject.Properties.Name -contains 'resourceKey') {
@@ -367,6 +377,7 @@ $failureMock = Start-Process -FilePath (Get-Process -Id $PID).Path -PassThru `
     )
 
 $failureResult = $null
+$failureError = $null
 try {
     $deadline = [datetime]::UtcNow.AddSeconds(60)
     while (-not (Test-Path -LiteralPath $failureReadyPath)) {
@@ -383,13 +394,14 @@ try {
             -AdapterKind $ADAPTER_KIND `
             -CredentialName $CRED_NAME `
             -NewCredentialName "$NEW_NAME-failure" `
+            -CredentialField ([ordered]@{ USER = 'svc-rotation@vsphere.local' }) `
             -NewSecret $NEW_SECRET `
             -SecretFieldName $FIELD_NAME `
+            -SkipCertificateCheck `
             -MaxAttempts 2
     }
     catch {
-        # Exhaustion may be a terminating failure. The wire assertions below
-        # are the safety contract: never retire a credential still in use.
+        $failureError = $_
     }
 }
 finally {
@@ -404,6 +416,8 @@ if (Test-Path -LiteralPath $failureLogPath) {
         ForEach-Object { $_ | ConvertFrom-Json })
 }
 Test-Claim ($failureEntries.Count -gt 0) 'the persistent-failure mock recorded no requests'
+Test-Claim ($null -eq $failureError) `
+    "a bounded 503 exhaustion must return a safety report, not throw: $failureError"
 
 $failurePatches = @($failureEntries | Where-Object { $_.operationId -eq 'patchAdapterInstance' })
 $failureFlakyPatches = @($failurePatches | Where-Object {
@@ -427,6 +441,7 @@ $failureViolations = @($failureEntries | Where-Object {
 })
 Test-Claim ($failureViolations.Count -eq 0) `
     'the persistent-failure scenario attempted an unsafe credential mutation'
+Test-Claim ($null -ne $failureResult) 'the persistent-failure scenario returned no safety report'
 if ($failureResult) {
     Test-Claim (-not [bool]$failureResult.Drained) `
         'the persistent-failure result claimed the old credential was drained'

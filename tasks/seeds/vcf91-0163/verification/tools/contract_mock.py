@@ -124,6 +124,13 @@ class ContractHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if fixture["scenario"] == "blank_discovery":
+            self._json(200, [{
+                "master_host": "",
+                "namespace": "",
+                "control_plane_api_server_port": 6443,
+            }])
+            return
         values = [
             {
                 "namespace": fixture["otherSupervisorNamespace"],
@@ -161,6 +168,15 @@ class ContractHandler(BaseHTTPRequestHandler):
                     ],
                 },
             )
+            return
+
+        if fixture["scenario"] == "live_empty":
+            self._json(200, {
+                "apiVersion": "v1",
+                "kind": "EventList",
+                "metadata": {"resourceVersion": "2545994"},
+                "items": [],
+            })
             return
 
         items = [
@@ -212,7 +228,7 @@ class ContractHandler(BaseHTTPRequestHandler):
         if captures != [fixture["workloadNamespace"], fixture["podName"]]:
             self._json(404, {"error": "Pod identity mismatch"})
             return
-        if fixture["scenario"] == "event_only":
+        if fixture["scenario"] in {"event_only", "live_empty"}:
             text = (
                 "2026-07-30T12:04:09Z java.net.ConnectException: "
                 "Connection refused\n"

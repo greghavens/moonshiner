@@ -3,7 +3,8 @@
  *
  * <p>Onboarding an adapter instance is a two-step flow: {@code testConnection} is a precheck, and
  * {@code createAdapterInstance} is the mutation it gates. The mutation must not be issued unless the
- * precheck succeeded.
+ * precheck succeeded. A new inline credential can be persisted by the precheck; the create call
+ * must reuse the returned credential identifier rather than re-sending its secret fields.
  *
  * <p>Implement every member below. The public shape is fixed: {@code TestMain} compiles against it.
  * Use only the JDK; no third-party libraries are available.
@@ -92,8 +93,9 @@ public final class OpsAdapterClient {
 
     /**
      * A {@code credential} payload. {@code name}, {@code adapterKindKey} and
-     * {@code credentialKindKey} are required; {@code fields} is optional, and {@code id} and
-     * {@code editable} are never sent by this client.
+     * {@code credentialKindKey} are required and {@code fields} is optional. A new inline
+     * credential is sent to the precheck without {@code id}; the create request reuses the
+     * {@code credentialInstanceId} returned by the precheck and omits secret fields.
      */
     public static final class Credential {
 

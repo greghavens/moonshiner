@@ -295,6 +295,16 @@ func (s *Server) handlePut(w http.ResponseWriter, operationID string, body []byt
 		return
 	}
 	s.mu.Lock()
+	if _, exists := s.tags[operationID]; exists {
+		s.mu.Unlock()
+		writeJSON(w, http.StatusBadRequest, "application/json", map[string]any{
+			"error_code":    527004,
+			"error_message": "Tag operation with the given id already exists.",
+			"module_name":   "policy",
+			"details":       "use a new operation id for each submission",
+		})
+		return
+	}
 	s.tags[operationID] = cloneMap(tag)
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, s.script.SuccessContentType, map[string]any{

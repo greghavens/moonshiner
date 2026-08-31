@@ -23,7 +23,7 @@ CONTRACT_PATH = ROOT / "docs" / "contract.json"
 SOURCES_PATH = ROOT / "docs" / "official_sources.json"
 MOCK_PATH = ROOT / "tools" / "mock_sddc_manager.py"
 EXPECTED_CONTRACT_SHA256 = (
-    "a8924d45cefd3254345707b346b795d1817012609c76eae47e0b8f1546b44812"
+    "463a9a2d069264fc988341cabcaf69a617903e76f652125084d4327fc08f9d2e"
 )
 EXPECTED_SOURCES_SHA256 = (
     "39a94a0f2493322133c0bcdcf3a58445df3431d5f8a50876332128f7c7551688"
@@ -156,7 +156,7 @@ def verify_protected_contract() -> None:
         item["operationId"]: item for item in contract["operations"]
     }
     require(
-        list(operations["createToken"]["responses"]) == ["201", "400", "500"],
+        list(operations["createToken"]["responses"]) == ["200", "400", "500"],
         "createToken responses changed from the pinned projection",
     )
     require(
@@ -492,13 +492,13 @@ def verify_wire(
                     "password": runtime["password"],
                 }
             ),
-            "responseStatus": 201,
+            "responseStatus": 200,
         },
         {
             "operationId": "getDomains",
             "method": "GET",
-            "rawTarget": "/v1/domains?pageNumber=0&pageSize=2",
-            "queryPairs": [["pageNumber", "0"], ["pageSize", "2"]],
+            "rawTarget": "/v1/domains?pageNumber=1&pageSize=2",
+            "queryPairs": [["pageNumber", "1"], ["pageSize", "2"]],
             "authorization": "Bearer " + runtime["first_access_token"],
             "contentType": None,
             "body": "",
@@ -507,8 +507,8 @@ def verify_wire(
         {
             "operationId": "getDomains",
             "method": "GET",
-            "rawTarget": "/v1/domains?pageNumber=1&pageSize=2",
-            "queryPairs": [["pageNumber", "1"], ["pageSize", "2"]],
+            "rawTarget": "/v1/domains?pageNumber=2&pageSize=2",
+            "queryPairs": [["pageNumber", "2"], ["pageSize", "2"]],
             "authorization": "Bearer " + runtime["first_access_token"],
             "contentType": None,
             "body": "",
@@ -527,8 +527,8 @@ def verify_wire(
         {
             "operationId": "getDomains",
             "method": "GET",
-            "rawTarget": "/v1/domains?pageNumber=1&pageSize=2",
-            "queryPairs": [["pageNumber", "1"], ["pageSize", "2"]],
+            "rawTarget": "/v1/domains?pageNumber=2&pageSize=2",
+            "queryPairs": [["pageNumber", "2"], ["pageSize", "2"]],
             "authorization": "Bearer " + runtime["second_access_token"],
             "contentType": None,
             "body": "",
@@ -537,8 +537,8 @@ def verify_wire(
         {
             "operationId": "getDomains",
             "method": "GET",
-            "rawTarget": "/v1/domains?pageNumber=2&pageSize=2",
-            "queryPairs": [["pageNumber", "2"], ["pageSize", "2"]],
+            "rawTarget": "/v1/domains?pageNumber=3&pageSize=2",
+            "queryPairs": [["pageNumber", "3"], ["pageSize", "2"]],
             "authorization": "Bearer " + runtime["second_access_token"],
             "contentType": None,
             "body": "",
@@ -560,15 +560,15 @@ def verify_wire(
                 f"request {index} has wrong {key}",
             )
 
-    page_zero_requests = [
+    page_one_requests = [
         request
         for request in requests
         if request.get("rawTarget")
-        == "/v1/domains?pageNumber=0&pageSize=2"
+        == "/v1/domains?pageNumber=1&pageSize=2"
     ]
     require(
-        len(page_zero_requests) == 1,
-        "refresh must not restart pagination or refetch completed page 0",
+        len(page_one_requests) == 1,
+        "refresh must not restart pagination or refetch completed page 1",
     )
     require(
         sum(

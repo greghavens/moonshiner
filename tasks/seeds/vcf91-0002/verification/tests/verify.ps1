@@ -83,9 +83,9 @@ foreach ($path in @(
 }
 
 $protectedHashes = @{
-    $contractPath = 'aebb0cfe07d8021cc5a8d8f66d810a63048198d86925cd6f57daa351459d5858'
+    $contractPath = 'c27e50ed304acf42ed076e8adddddddaaf97fe14a27d5c86031d1e45ba81776a'
     $sourcesPath = '1a5fd3a21fd468caecbed5dc76d19a864c641f25999f78213e950136f48b2ef8'
-    $mockPath = '1b0d133a855abedbdc630ce38f592623cd05c305266f1216467eca59805174fb'
+    $mockPath = '62967192dbb332c34a7c4ee0a4a66b4a16b1f1abca3a866f7c8ae9e0e5d11a49'
     $moduleManifest = '4818eaea5a04f565e395f4102ea54eeacc2264588529fbcd5f7af5cb8a7c3f3a'
 }
 foreach ($entry in $protectedHashes.GetEnumerator()) {
@@ -140,6 +140,18 @@ Assert-True 'solution names getDomains' (
 )
 Assert-True 'solution names refreshAccessToken' (
     $sourceText -cmatch '\brefreshAccessToken\b'
+)
+Assert-True 'solution obtains the supplied server SDK client' (
+    $sourceText -cmatch '\.GetClient\s*\('
+)
+Assert-True 'solution accesses the SDK internal connection state' (
+    $sourceText -cmatch '\bInternalConnection\b'
+)
+Assert-True 'solution updates the SDK access token' (
+    $sourceText -cmatch '\bUpdateAccessToken\b'
+)
+Assert-True 'solution does not assign the read-only SessionSecret' (
+    $sourceText -notmatch '(?im)\bSessionSecret\s*='
 )
 foreach ($forbidden in @(
     '\bInvoke-WebRequest\b',

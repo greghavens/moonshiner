@@ -24,8 +24,8 @@ from mock_vcenter import MockState, MockVCenter, read_request_log
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-SESSION_ID = "fixture-session-vcf91"
-HOST_ID = "host-42"
+SESSION_ID = "0123456789abcdef0123456789abcdef"
+HOST_ID = "host-12"
 DESCRIPTION = "Collect TPM logs \u2013 reboot 731"
 
 EXPECTED_SOURCE = {
@@ -106,7 +106,9 @@ def fixture_state(*, active: bool, truncated: bool, suffix: str) -> MockState:
                 }
             ],
         },
-        support_bundle_task=f"task-support-{suffix}",
+        support_bundle_task=(
+            "task-4183:7978ee81-a66c-4c37-8653-c577c0161e9d"
+        ),
     )
 
 
@@ -541,11 +543,40 @@ def check_tpm_selection_failures(temporary: Path) -> None:
             fail(f"{suffix} TPM selection used the wrong list request")
 
 
+def check_live_absent_tpm(temporary: Path) -> None:
+    from vcf_diag import VCenterAPIError, VCenterClient
+
+    state = fixture_state(active=True, truncated=False, suffix="absent")
+    request_log = temporary / "requests-absent-tpm.jsonl"
+    with MockVCenter(ROOT, state, request_log) as service:
+        client = VCenterClient(service.base_url, SESSION_ID, timeout=2)
+        try:
+            client.get_tpm_event_log(HOST_ID, "tpm-exact")
+        except VCenterAPIError as error:
+            if error.status != 404:
+                fail("absent TPM did not preserve HTTP 404")
+            payload = json.loads(error.response_body or "{}")
+            message_ids = [
+                message.get("id") for message in payload.get("messages", [])
+            ]
+            if message_ids != [
+                "com.vmware.esx.trusted_infrastructure.hardware.tpm.not_found"
+            ]:
+                fail("absent TPM did not preserve the live message ID")
+        else:
+            fail("absent TPM unexpectedly returned an event log")
+    requests = read_request_log(request_log)
+    if len(requests) != 1:
+        fail("absent TPM must issue exactly one event-log request")
+
+
 def main() -> int:
     check_protected_inputs()
     check_stdlib_only()
     with tempfile.TemporaryDirectory(prefix="vcf91-0106-") as directory:
         temporary = Path(directory)
+        check_tpm_selection_failures(temporary)
+        check_live_absent_tpm(temporary)
         run_scenario(
             temporary,
             active=True,
@@ -570,7 +601,6 @@ def main() -> int:
         check_optional_filter_wire_shape(temporary)
         check_path_segment_encoding(temporary)
         check_log_bundle_optional_wire_shape(temporary)
-        check_tpm_selection_failures(temporary)
     print("vcf91-0106 acceptance: PASS")
     return 0
 

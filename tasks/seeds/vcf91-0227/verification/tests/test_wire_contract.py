@@ -850,7 +850,7 @@ class ContractDrivenMutationTest(unittest.TestCase):
             timeout=10.0,
         )
 
-        self.assertEqual(client.get_health().get("status"), "HEALTHY")
+        self.assertIs(client.get_health().get("up"), True)
         accepted = client.perform_component_action(
             COMPONENT_RETRY, "apply", TARGET_VERSION, MANIFEST_URL
         )
@@ -887,7 +887,7 @@ class ExpiringTokenWorkflowTest(WireShapeTestCase):
 
     def test_run_survives_a_mid_run_token_expiry(self):
         health = self.client.get_health()
-        self.assertEqual(health.get("status"), "HEALTHY")
+        self.assertIs(health.get("up"), True)
 
         resolved = self.client.resolve_depot_components(
             DEPOT_FQDN,

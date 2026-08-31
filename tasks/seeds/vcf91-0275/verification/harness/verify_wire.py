@@ -24,6 +24,7 @@ DEF_FAILS = "1c0b9c1e-8f4a-4f52-9d6a-2b7c5e3a91fd"
 DEF_STUCK = "5f2d7a34-6b19-4c88-a0e3-9d41f7b26c50"
 
 CSV_BODY = "Cluster,Capacity Remaining %,Time Remaining (days)\r\nvcf-m01-cl01,42,118\r\nvcf-w01-cl01,17,26\r\n"
+PDF_BODY = "%PDF-1.4\n%\u00e2\u00e3\u00cf\u00d3\n% VCF Operations report fixture\n%%EOF\n"
 
 SCENARIOS = [
     {
@@ -33,7 +34,7 @@ SCENARIOS = [
         "traversal": None,
         "format": None,
         "polls": 3,
-        "terminal": "Completed",
+        "terminal": "COMPLETED",
         "downloads": True,
         "throws": None,
     },
@@ -50,7 +51,7 @@ SCENARIOS = [
         },
         "format": "CSV",
         "polls": 3,
-        "terminal": "Completed",
+        "terminal": "COMPLETED",
         "downloads": True,
         "throws": None,
     },
@@ -61,7 +62,7 @@ SCENARIOS = [
         "traversal": None,
         "format": None,
         "polls": 3,
-        "terminal": "Failed",
+        "terminal": "FAILED",
         "downloads": False,
         "throws": None,
     },
@@ -464,7 +465,8 @@ def verify_scenario(scenario, segment, record):
     check(result.get("pollCount") == scenario["polls"], where,
           "Result.pollCount is %r, expected %d" % (result.get("pollCount"), scenario["polls"]))
     if scenario["downloads"]:
-        check(result.get("downloadBody") == CSV_BODY, where,
+        expected_body = CSV_BODY if scenario["format"] == "CSV" else PDF_BODY
+        check(result.get("downloadBody") == expected_body, where,
               "Result.downloadBody is %r, expected the downloaded report body verbatim"
               % result.get("downloadBody"))
     else:

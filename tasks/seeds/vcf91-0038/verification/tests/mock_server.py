@@ -122,7 +122,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"message": "Bad credentials document"})
                 return
             self.send_json(
-                201,
+                200,
                 {
                     "accessToken": self.server.initial_token,
                     "refreshToken": {"id": self.server.refresh_token},

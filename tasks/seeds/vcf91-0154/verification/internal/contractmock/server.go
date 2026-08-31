@@ -41,6 +41,7 @@ type Fixture struct {
 	Log          string
 	Auth         Auth
 	ForcedStatus map[string]int
+	ForcedBody   map[string]string
 }
 
 type Request struct {
@@ -214,6 +215,12 @@ func (s *Server) serveHTTP(response http.ResponseWriter, request *http.Request) 
 	if status := s.fixture.ForcedStatus[matched.name]; status != 0 {
 		if status >= 300 && status < 400 {
 			response.Header().Set("Location", "/operation-not-named-by-contract")
+		}
+		if body := s.fixture.ForcedBody[matched.name]; body != "" {
+			response.Header().Set("Content-Type", "application/json")
+			response.WriteHeader(status)
+			_, _ = io.WriteString(response, body)
+			return
 		}
 		writeJSON(response, status, map[string]string{"status": "forced failure"})
 		return

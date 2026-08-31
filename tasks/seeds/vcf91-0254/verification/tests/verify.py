@@ -410,9 +410,10 @@ def scenario_create_then_retry():
                 "minuteOfTheHour": 30,
                 "duration": 120,
                 "recurrence": 1,
+                "expireRuns": 5,
             },
             "%s: createMaintenanceSchedules schedule body must contain exactly the four "
-            "required fields plus the bound recurrence, got %s"
+            "required fields plus the bound recurrence and expiry, got %s"
             % (scenario, json.dumps(body.get("schedule"), sort_keys=True)),
         )
 
@@ -485,6 +486,7 @@ def scenario_drift_update():
                 "minuteOfTheHour": 30,
                 "duration": 240,
                 "recurrence": 1,
+                "expireRuns": 5,
             },
             "%s: updateMaintenanceSchedules schedule body must carry the drifted duration "
             "and nothing else, got %s"
@@ -534,12 +536,18 @@ def scenario_weekly_omission():
                 "hour",
                 "minuteOfTheHour",
                 "duration",
+                "recurrence",
                 "daysOfTheWeek",
                 "expirationDate",
             },
-            "%s: the request must carry exactly the bound fields. Recurrence, ExpireRuns "
-            "and TimeZone were not bound and must be absent, got keys %s"
+            "%s: the request must carry exactly the bound fields. ExpireRuns and TimeZone "
+            "were not bound and must be absent, got keys %s"
             % (scenario, sorted(schedule)),
+        )
+        check(
+            schedule.get("recurrence") == 1,
+            "%s: WEEKLY schedules require recurrence, got %r"
+            % (scenario, schedule.get("recurrence")),
         )
         check(
             schedule.get("daysOfTheWeek") == ["SATURDAY", "SUNDAY"],
@@ -587,14 +595,14 @@ def scenario_full_convergence():
         % (scenario, len(creates)),
     )
     check(
-        len(updates) == 14,
-        "%s: each independently changed field and omitted optional must update "
-        "in place, while the settle call must not write; saw %d update(s)"
+        len(updates) == 13,
+        "%s: every live-valid field change and omission must update in place, while "
+        "the settle call must not write; saw %d update(s)"
         % (scenario, len(updates)),
     )
 
     desired = {
-        "scheduleType": "DAILY",
+        "scheduleType": "WEEKLY",
         "hour": 1,
         "minuteOfTheHour": 5,
         "duration": 30,
@@ -606,7 +614,6 @@ def scenario_full_convergence():
     }
     expected_updates = []
     for field, value in (
-        ("scheduleType", "WEEKLY"),
         ("hour", 4),
         ("minuteOfTheHour", 45),
         ("duration", 75),
@@ -618,20 +625,22 @@ def scenario_full_convergence():
     ):
         desired[field] = value
         expected_updates.append(dict(desired))
-    for field in (
-        "recurrence",
-        "daysOfTheWeek",
-        "expirationDate",
-        "expireRuns",
-        "timeZone",
-    ):
-        desired.pop(field)
-        expected_updates.append(dict(desired))
+    desired.pop("timeZone")
+    expected_updates.append(dict(desired))
+    desired.pop("expirationDate")
+    expected_updates.append(dict(desired))
+    desired["expirationDate"] = "01/31/2029"
+    expected_updates.append(dict(desired))
+    desired.pop("expireRuns")
+    expected_updates.append(dict(desired))
+    desired["scheduleType"] = "DAILY"
+    desired.pop("daysOfTheWeek")
+    expected_updates.append(dict(desired))
 
     if creates:
         created_body = body_of(creates[0])
         expected_create = {
-            "scheduleType": "DAILY",
+            "scheduleType": "WEEKLY",
             "hour": 1,
             "minuteOfTheHour": 5,
             "duration": 30,
@@ -670,7 +679,6 @@ def scenario_full_convergence():
 
     expected_actions = [
         ("create", "Created"),
-        ("schedule-type", "Updated"),
         ("hour", "Updated"),
         ("minute", "Updated"),
         ("duration", "Updated"),
@@ -679,11 +687,11 @@ def scenario_full_convergence():
         ("expiration", "Updated"),
         ("expire-runs", "Updated"),
         ("time-zone", "Updated"),
-        ("remove-recurrence", "Updated"),
-        ("remove-days", "Updated"),
-        ("remove-expiration", "Updated"),
-        ("remove-expire-runs", "Updated"),
         ("remove-time-zone", "Updated"),
+        ("remove-expiration", "Updated"),
+        ("restore-expiration", "Updated"),
+        ("remove-expire-runs", "Updated"),
+        ("daily-without-days", "Updated"),
         ("settle", "Unchanged"),
     ]
     for label, action in expected_actions:

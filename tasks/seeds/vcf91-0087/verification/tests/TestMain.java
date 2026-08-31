@@ -35,25 +35,34 @@ public final class TestMain {
                 });
 
         List<String> policyIds = List.of(
-                "web & edge", "alpha-policy", "mike-policy", "web & edge");
+                "web-edge", "alpha-policy", "mike-policy", "web-edge");
         List<String> displayNames = List.of("zulu", "alpha", "mike", "zulu");
         List<List<NsxPolicyClient.PolicySummary>> expectedRuns = List.of(
-                List.of(new NsxPolicyClient.PolicySummary("web & edge", "zulu")),
+                List.of(
+                        new NsxPolicyClient.PolicySummary(
+                                "default-layer3-section", "default-layer3-section"),
+                        new NsxPolicyClient.PolicySummary("web-edge", "zulu")),
                 List.of(
                         new NsxPolicyClient.PolicySummary("alpha-policy", "alpha"),
-                        new NsxPolicyClient.PolicySummary("web & edge", "zulu")),
+                        new NsxPolicyClient.PolicySummary(
+                                "default-layer3-section", "default-layer3-section"),
+                        new NsxPolicyClient.PolicySummary("web-edge", "zulu")),
                 List.of(
                         new NsxPolicyClient.PolicySummary("alpha-policy", "alpha"),
+                        new NsxPolicyClient.PolicySummary(
+                                "default-layer3-section", "default-layer3-section"),
                         new NsxPolicyClient.PolicySummary("mike-policy", "mike"),
-                        new NsxPolicyClient.PolicySummary("web & edge", "zulu")),
+                        new NsxPolicyClient.PolicySummary("web-edge", "zulu")),
                 List.of(
                         new NsxPolicyClient.PolicySummary("alpha-policy", "alpha"),
+                        new NsxPolicyClient.PolicySummary(
+                                "default-layer3-section", "default-layer3-section"),
                         new NsxPolicyClient.PolicySummary("mike-policy", "mike"),
-                        new NsxPolicyClient.PolicySummary("web & edge", "zulu")));
+                        new NsxPolicyClient.PolicySummary("web-edge", "zulu")));
 
         for (int run = 0; run < policyIds.size(); run++) {
             List<NsxPolicyClient.PolicySummary> actual = client.upsertWaitAndList(
-                    "acme org", "project/blue", "default",
+                    "acme-org", "project-blue", "default",
                     policyIds.get(run), displayNames.get(run),
                     Duration.ofSeconds(2), Duration.ofMillis(2));
             List<NsxPolicyClient.PolicySummary> expected = expectedRuns.get(run);
@@ -95,17 +104,17 @@ public final class TestMain {
 
         String completeLog = String.join("\n", lines);
         if (!completeLog.contains(
-                "\"response_order\":[\"zulu\",\"alpha\",\"mike\"]")
+                "\"response_order\":[\"default-layer3-section\",\"zulu\",\"alpha\",\"mike\"]")
                 || !completeLog.contains(
-                        "\"response_order\":[\"mike\",\"alpha\",\"zulu\"]")) {
+                        "\"response_order\":[\"mike\",\"alpha\",\"zulu\",\"default-layer3-section\"]")) {
             throw new AssertionError("mock did not flip collection response order");
         }
-        if (!completeLog.contains("/acme%20org/projects/project%2Fblue/")
-                || !completeLog.contains("security-policies/web%20%26%20edge")) {
+        if (!completeLog.contains("/acme-org/projects/project-blue/")
+                || !completeLog.contains("security-policies/web-edge")) {
             throw new AssertionError("path segments were not independently percent encoded");
         }
         if (!completeLog.contains(
-                "\"intent_path\":[\"/infra/domains/default/security-policies/web & edge\"]")) {
+                "\"intent_path\":[\"/orgs/acme-org/projects/project-blue/infra/domains/default/security-policies/web-edge\"]")) {
             throw new AssertionError("intent_path query parameter was missing or incorrect");
         }
 

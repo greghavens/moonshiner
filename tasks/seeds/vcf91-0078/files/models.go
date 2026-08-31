@@ -1,26 +1,19 @@
 package nsxpolicy
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 )
 
 const ListAllInfraSegmentsOperation = "ListAllInfraSegments"
 
-// AccessTokenSource provides the current access token and refreshes a token
-// rejected by the service.
-type AccessTokenSource interface {
-	Token(context.Context) (string, error)
-	Refresh(context.Context, string) (string, error)
-}
-
-// Config contains the NSX Manager origin, access-token source, and optional
+// Config contains the NSX Manager origin, Basic credentials, and optional
 // transport. NewClient copies HTTPClient before changing redirect behavior.
 type Config struct {
-	BaseURL     string
-	TokenSource AccessTokenSource
-	HTTPClient  *http.Client
+	BaseURL    string
+	Username   string
+	Password   string
+	HTTPClient *http.Client
 }
 
 // ListOptions projects the caller-controlled optional query parameters
@@ -65,22 +58,6 @@ type APIError struct {
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("%s failed with HTTP status %d", e.OperationID, e.StatusCode)
-}
-
-// TokenError retains a token-source cause for errors.Is/errors.As while
-// keeping source-controlled text and token values out of Error().
-type TokenError struct {
-	OperationID string
-	Action      string
-	Cause       error
-}
-
-func (e *TokenError) Error() string {
-	return fmt.Sprintf("%s access token %s failed", e.OperationID, e.Action)
-}
-
-func (e *TokenError) Unwrap() error {
-	return e.Cause
 }
 
 // TransportError retains its cause for errors.Is/errors.As while keeping the

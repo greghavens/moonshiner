@@ -49,6 +49,12 @@ try {
         Credential           = $credential
         AuthSource           = 'local'
         AdapterKindKey       = 'VMWARE'
+        AdapterCredentialName = 'vc01 Adapter Credential'
+        AdapterCredentialKindKey = 'PRINCIPALCREDENTIAL'
+        AdapterCredentialField = [ordered]@{
+            USER     = 'administrator@vsphere.local'
+            PASSWORD = 'PrecheckTarget!23'
+        }
         SkipCertificateCheck = $true
     }
 

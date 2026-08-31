@@ -35,10 +35,10 @@ EXPECTED_CONTRACT_OPERATIONS = [
 
 # The harness protects this verifier separately, so it does not self-hash.
 PROTECTED_SHA256 = {
-    "TestMain.java": "18d6b34ea12445ac812871c09d95ccb468d21a2d81e8e5a74cd95f0915165d60",
-    "docs/contract.json": "2feaad0704298be0c97d91059b49e0a897686f0bbe89ad2bb39120576e707a75",
+    "TestMain.java": "12f8ba9fa12683c9a64a4a1ae5d28b07b2a9e398fb036900eea41b06efaed60c",
+    "docs/contract.json": "1120e676604c66c0d9f03571c0e6e433f7be2a4538c0c10e71bda35609b72be0",
     "docs/official_sources.json": "b65ec03ee1763779166f827ef3330a59747367ba4d48ac28de15fa57666afab9",
-    "tools/contract_mock.py": "766400d7dd12fee5cce1bf3eef727510511c1ff0dacd6b320d18e6e33997f4ac",
+    "tools/contract_mock.py": "38558b92795835e02cf94211af3dbfec44466d33d18ae528c192665248acc165",
 }
 
 
@@ -179,20 +179,27 @@ def body_bytes(entry: dict[str, object]) -> bytes:
 def expected_apply_body(
     scenario: str, config: dict[str, object]
 ) -> bytes:
+    variable_names = [
+        "datastore", "dnsImageTag", "imageRepository",
+        "infraServerThumbprint", "network", "infraServerURL",
+        "resourcePool", "vmTemplate", "datacenter", "etcdImageTag",
+        "folder", "controlPlaneIpAddr", "credsSecretName",
+        "kubeVipPodManifest",
+    ]
     topology: dict[str, object] = {
-        "class": config["clusterClass"],
+        "classRef": {"name": config["clusterClass"]},
         "version": config["version"],
-        "variables": [
-            {"name": "vmClass", "value": config["vmClass"]},
-            {"name": "storageClass", "value": config["storageClass"]},
-        ],
         "controlPlane": {"replicas": 3},
     }
     spec: dict[str, object] = {"topology": topology}
     if scenario == "explicit_zero_false":
         topology["workers"] = {
             "machineDeployments": [
-                {"class": "node-pool", "name": "worker", "replicas": 0}
+                {
+                    "class": config["workerClass"],
+                    "name": config["workerName"],
+                    "replicas": 0,
+                }
             ]
         }
         spec["clusterNetwork"] = {
@@ -206,12 +213,23 @@ def expected_apply_body(
     elif scenario == "ambiguous":
         topology["workers"] = {
             "machineDeployments": [
-                {"class": "node-pool", "name": "worker", "replicas": 2}
+                {
+                    "class": config["workerClass"],
+                    "name": config["workerName"],
+                    "replicas": 2,
+                }
             ]
         }
         spec["clusterNetwork"] = {
             "services": {"cidrBlocks": ["10.96.0.0/12"]}
         }
+    topology["variables"] = [
+        {
+            "name": name,
+            "value": {"liveValidated": True, "name": name},
+        }
+        for name in variable_names
+    ]
 
     value = {
         "apiVersion": "cluster.x-k8s.io/v1beta2",
@@ -376,10 +394,10 @@ def run_scenario(
         "namespace": "team blue/edge%?-" + nonce,
         "cluster": "vks +/canary?-" + nonce,
         "fieldManager": "moon/client +?=" + nonce,
-        "clusterClass": "builtin-generic-v3.5.0",
-        "version": "v1.33.6+vmware.1-fips",
-        "vmClass": "best-effort-medium",
-        "storageClass": "vsan-default",
+        "clusterClass": "vsphere-9.1.2668",
+        "version": "v1.34.2",
+        "workerClass": "vsphere-9.1.2668-worker",
+        "workerName": "workers",
         "uid": "uid-" + secrets.token_hex(8),
         "resourceVersion": str(10_000 + secrets.randbelow(80_000)),
         "generation": 23,
@@ -444,8 +462,8 @@ def run_scenario(
                 str(config["fieldManager"]),
                 str(config["clusterClass"]),
                 str(config["version"]),
-                str(config["vmClass"]),
-                str(config["storageClass"]),
+                str(config["workerClass"]),
+                str(config["workerName"]),
                 str(config["uid"]),
                 str(config["resourceVersion"]),
                 str(config["generation"]),
@@ -501,9 +519,19 @@ def run_scenario(
         all(entry["operation"] is not None for entry in entries),
         "off-contract request was sent",
     )
-    if scenario in {"namespace_not_ready", "redirect"}:
+    if scenario in {
+            "namespace_not_ready", "redirect", "live_namespace_404"}:
         require(len(entries) == 1, f"{scenario} did not stop after GET")
         require(state == {"effects": 0, "patchAttempts": 0}, "blocked mutation")
+        return
+
+    if scenario == "live_admission_422":
+        require(len(entries) == 2, "admission case request count")
+        assert_patch_wire(entries[1], scenario, config)
+        require(
+            state == {"effects": 0, "patchAttempts": 0},
+            "admission failure mutated state",
+        )
         return
 
     expected_count = 3 if scenario == "ambiguous" else 2
@@ -564,6 +592,8 @@ def main() -> None:
             "javac failed\n" + compile_result.stdout + compile_result.stderr,
         )
         for scenario in (
+            "live_namespace_404",
+            "live_admission_422",
             "minimal",
             "explicit_zero_false",
             "ambiguous",

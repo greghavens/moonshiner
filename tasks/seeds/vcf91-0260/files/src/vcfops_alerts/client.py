@@ -1,25 +1,13 @@
-"""HTTP layer for the three VCF Operations 9.1 operations in docs/contract.json.
+"""HTTP layer for three VCF Operations 9.1 operations.
 
-Standard library only.  Every path, method, parameter name and body property below is
-taken from the contract; nothing is invented locally.
+The implementation is intentionally incomplete. Research the official VMware API
+contract before filling in its methods, paths, authorization, and request bodies.
 """
 
 import json
-import os
 import urllib.error
 import urllib.parse
 import urllib.request
-
-CONTRACT_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "docs",
-    "contract.json",
-)
-
-
-def load_contract(path=None):
-    with open(path or CONTRACT_PATH, encoding="utf-8") as fh:
-        return json.load(fh)
 
 
 class VcfOperationsError(Exception):
@@ -91,7 +79,7 @@ class VcfOperationsClient:
         contract=None,
         timeout=15.0,
     ):
-        self.contract = contract or load_contract()
+        self.contract = contract
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._username = username
@@ -99,9 +87,9 @@ class VcfOperationsClient:
         self._auth_source = auth_source
         self._token = None
         self.token_acquisitions = 0
-        self._operations = {op["operationId"]: op for op in self.contract["operations"]}
-        self._auth_header = self.contract["security"]["name"]
-        self._auth_value_format = self.contract["security"]["value_format"]
+        self._operations = {}
+        self._auth_header = None
+        self._auth_value_format = None
 
     # -- token ------------------------------------------------------------
 

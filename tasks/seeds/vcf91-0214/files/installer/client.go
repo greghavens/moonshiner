@@ -15,7 +15,7 @@ const (
 
 var ErrNotImplemented = errors.New("PrecheckAndDeploy is not implemented")
 
-// Client calls the two-operation VCF Installer contract in docs/contract.json.
+// Client calls the two-operation VCF Installer API contract.
 // A Client may be used by multiple goroutines after construction.
 type Client struct {
 	baseURL     *url.URL

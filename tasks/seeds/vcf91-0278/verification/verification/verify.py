@@ -107,7 +107,7 @@ EXPECTED_SCHEMAS = {
 PROTECTED = {
     "README.md": "d9b72e7233e5cb7465be6b19cca43ef7eeb121cdc070485f5544b9465939856a",
     "harness/TestMain.java": "c0b567380e56f5eabcd1d7068631caaea8509bd8dce482fbe8e590d904e4017a",
-    "harness/mock_vcf_operations.py": "7ed0a04f3ed0bea608938c32f5a7c335b0053afc12e49b1853fa815f906ce6f6",
+    "harness/mock_vcf_operations.py": "33ac5023532ff8fc8958bec0af59e68873a47736c16116c1e93a020a0fec1d7a",
     "harness/run_tests.sh": "b94ae58df8b3ec50b88a6db5fafe2dc9a829892e5dd5c9294e7be360799aed59",
 }
 

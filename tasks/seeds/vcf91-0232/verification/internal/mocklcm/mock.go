@@ -667,11 +667,9 @@ func statusAt(poll []string, idx int) string {
 func (m *Mock) taskJSON(status string, script *TaskScript) map[string]any {
 	task := map[string]any{
 		"id":           m.taskID,
-		"name":         "vcf_fleet_component_install",
-		"type":         "install",
+		"name":         "INSTALL_COMPONENTS_WORKFLOW",
 		"status":       status,
-		"resourceType": "COMPONENT",
-		"createdBy":    "admin",
+		"createdBy":    "system",
 		"createTime":   "2026-03-01T10:00:00.000Z",
 		"cancellable":  status == StatusPending || status == StatusRunning || status == StatusScheduled,
 		"retriable":    status == StatusFailed && script.Retriable,

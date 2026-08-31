@@ -31,7 +31,7 @@ PROTECTED_HASHES = {
     "docs/contract.json": "b7ed7819d00d2ed99b9573ae8cb0a92713240db5d4f48a2d5cf2838eb093a136",
     "docs/official_sources.json": "295b93aa5721b5985bbda1828daeb26881679c9b2dbb77dd5f9e533357a5ff7f",
     "tests/TestMain.java": "bcf595c462dab41cd1b82d86bf17c0478bb2c7d8608f3c62ef8abb09382e0416",
-    "tests/mock_server.py": "d952da6471106df2ab5bacd9661fa65c392e198e6633c0df678a3b1c3f649c50",
+    "tests/mock_server.py": "ac6f452ab17ba9418074a1c443e0537a5c5aebb9eb7ddae288201aeac6ada5d2",
 }
 
 

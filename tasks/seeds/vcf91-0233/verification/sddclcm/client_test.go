@@ -50,7 +50,7 @@ func fixturePages() [][]map[string]any {
 		},
 		{
 			task("t-02", "2026-03-01T09:00:00Z", "RUNNING"),
-			task("t-03", "2026-03-01T10:00:00Z", "FAILED"), // duplicate of the page 0 entry
+			task("t-03", "2026-03-01T10:00:00Z", "FAILED"), // duplicate of the page 1 entry
 			task("t-05", "2026-03-01T08:00:00Z", "SUCCEEDED"),
 		},
 		{
@@ -112,7 +112,7 @@ func TestGetTasksRequestWireShape(t *testing.T) {
 			opts: func(*testing.T) sddclcm.ListTasksOptions {
 				return sddclcm.ListTasksOptions{PageSize: 3}
 			},
-			wantQuery: []string{"pageNumber=0", "pageSize=3"},
+			wantQuery: []string{"pageNumber=1", "pageSize=3"},
 		},
 		{
 			name: "single string filter",
@@ -122,7 +122,7 @@ func TestGetTasksRequestWireShape(t *testing.T) {
 					Filter:   sddclcm.TaskFilter{Status: "RUNNING"},
 				}
 			},
-			wantQuery: []string{"pageNumber=0", "pageSize=3", "status=RUNNING"},
+			wantQuery: []string{"pageNumber=1", "pageSize=3", "status=RUNNING"},
 		},
 		{
 			name: "explicit false is sent, it is not an unset value",
@@ -132,7 +132,7 @@ func TestGetTasksRequestWireShape(t *testing.T) {
 					Filter:   sddclcm.TaskFilter{IncludeSystemTasks: ptrBool(false)},
 				}
 			},
-			wantQuery: []string{"includeSystemTasks=false", "pageNumber=0", "pageSize=3"},
+			wantQuery: []string{"includeSystemTasks=false", "pageNumber=1", "pageSize=3"},
 		},
 		{
 			name: "explicit true is sent",
@@ -142,7 +142,7 @@ func TestGetTasksRequestWireShape(t *testing.T) {
 					Filter:   sddclcm.TaskFilter{IncludeSystemTasks: ptrBool(true)},
 				}
 			},
-			wantQuery: []string{"includeSystemTasks=true", "pageNumber=0", "pageSize=3"},
+			wantQuery: []string{"includeSystemTasks=true", "pageNumber=1", "pageSize=3"},
 		},
 		{
 			name: "timestamps are normalised to RFC3339 in UTC",
@@ -157,7 +157,7 @@ func TestGetTasksRequestWireShape(t *testing.T) {
 			},
 			wantQuery: []string{
 				"endTimeLt=2026-03-02T00:00:00Z",
-				"pageNumber=0",
+				"pageNumber=1",
 				"pageSize=3",
 				"startTimeGt=2026-03-01T00:00:00Z",
 			},
@@ -192,7 +192,7 @@ func TestGetTasksRequestWireShape(t *testing.T) {
 				"endTimeLt=2026-03-06T00:00:00Z",
 				"includeSystemTasks=true",
 				"name=vcfa_90_to_91_upgrade",
-				"pageNumber=0",
+				"pageNumber=1",
 				"pageSize=3",
 				"resourceId=af6ef462-e192-4fe1-9522-67a50a2b3392",
 				"resourceType=COMPONENT",
@@ -227,13 +227,13 @@ func TestGetTasksRequestWireShape(t *testing.T) {
 			var first mockvcf.Request
 			found := false
 			for _, r := range requests {
-				if r.PageNumber() == 0 {
+				if r.PageNumber() == 1 {
 					first, found = r, true
 					break
 				}
 			}
 			if !found {
-				t.Fatalf("no request for page 0; requests: %+v", requests)
+				t.Fatalf("no request for page 1; requests: %+v", requests)
 			}
 
 			if first.Method != http.MethodGet {
@@ -369,7 +369,8 @@ func TestListAllTasksRetrievesEveryPage(t *testing.T) {
 	for _, r := range srv.RequestsFor("getTasks") {
 		seen[r.PageNumber()]++
 	}
-	for page := range pages {
+	for pageIndex := range pages {
+		page := pageIndex + 1
 		if seen[page] != 1 {
 			t.Errorf("page %d was requested %d times, want exactly 1 (all: %v)", page, seen[page], seen)
 		}
@@ -439,7 +440,7 @@ func TestListAllTasksStableOrder(t *testing.T) {
 				}
 				for _, ts := range got {
 					if ts.ID == "t-03" && ts.Status != "SUCCEEDED" {
-						t.Fatalf("attempt %d: duplicate t-03 resolved to status %q, want the page 0 occurrence (SUCCEEDED)",
+						t.Fatalf("attempt %d: duplicate t-03 resolved to status %q, want the page 1 occurrence (SUCCEEDED)",
 							attempt, ts.Status)
 					}
 				}
@@ -591,7 +592,7 @@ func TestSinglePageCollection(t *testing.T) {
 		},
 		{
 			name:    "empty collection",
-			pages:   [][]map[string]any{{}},
+			pages:   [][]map[string]any{},
 			wantIDs: []string{},
 			wantReq: 1,
 		},

@@ -39,6 +39,7 @@ $scenario = [ordered]@{
     reportId       = '7d0f0b3a-2b5e-4a1c-9c2f-1d6a8e4b3c55'
     statusSequence = @('QUEUED', 'RUNNING', 'COMPLETED')
     downloadBody   = "Resource,Metric,Value`nvcf-esx-01,cpu|demand,42`n"
+    pdfBody        = "%PDF-1.4 mock report`n"
     releaseName    = $contract.api.version
 }
 if ($ScenarioPath -and (Test-Path -LiteralPath $ScenarioPath)) {
@@ -236,12 +237,12 @@ try {
                     }
                     'downloadReport' {
                         $fmt = $req.QueryString['format']
-                        if ($fmt -eq 'PDF') {
-                            $contentType = 'application/pdf'
-                            $payload = "%PDF-1.4 mock report`n"
-                        } else {
-                            $contentType = 'text/csv'
+                        if ($fmt -eq 'CSV') {
+                            $contentType = 'application/octet-stream'
                             $payload = $scenario.downloadBody
+                        } else {
+                            $contentType = 'application/pdf'
+                            $payload = $scenario.pdfBody
                         }
                     }
                 }

@@ -50,7 +50,7 @@ type Group struct {
 	Revision     *int         `json:"_revision,omitempty"`
 	Description  *string      `json:"description,omitempty"`
 	DisplayName  *string      `json:"display_name,omitempty"`
-	Expression   []Expression `json:"expression,omitempty"`
+	Expression   []Expression `json:"expression"`
 	GroupType    []string     `json:"group_type,omitempty"`
 	ID           string       `json:"id,omitempty"`
 	ResourceType string       `json:"resource_type,omitempty"`

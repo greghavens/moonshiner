@@ -49,6 +49,7 @@ type Request struct {
 type Server struct {
 	httpServer *httptest.Server
 	routes     map[string]operation
+	accepted   string
 	statuses   []string
 	taskID     string
 
@@ -92,7 +93,8 @@ func Start(t testing.TB, contractPath string, statuses []string) *Server {
 
 	s := &Server{
 		routes:   routes,
-		statuses: append([]string(nil), statuses...),
+		accepted: statuses[0],
+		statuses: append([]string(nil), statuses[1:]...),
 		taskID:   "task/91 proxy?0209",
 	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -156,10 +158,17 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch operationID {
 	case "updateProxyConfiguration":
-		s.writeTask(w, http.StatusAccepted, "PENDING")
+		s.writeTask(w, http.StatusAccepted, s.accepted)
 	case "getTask":
 		s.mu.Lock()
 		index := s.poll
+		if len(s.statuses) == 0 {
+			s.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"errorCode":"TA_TASK_NOT_FOUND","message":"Task not found"}`)
+			return
+		}
 		if index >= len(s.statuses) {
 			index = len(s.statuses) - 1
 		}

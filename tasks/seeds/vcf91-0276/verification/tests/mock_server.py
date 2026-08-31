@@ -90,8 +90,8 @@ def build_fixture() -> dict:
             "controlState": "OPEN",
             "alertDefinitionId": f"AlertDefinition-{index}",
             "alertDefinitionName": f"Sustained saturation {index}",
-            "startTimeUTC": 1753368185 + index,
-            "updateTimeUTC": 1753378185 + index,
+            "startTimeUTC": 1753368185000 + index,
+            "updateTimeUTC": 1753378185000 + index,
             "cancelTimeUTC": 0,
             "suspendUntilTimeUTC": 0,
         }
@@ -101,10 +101,10 @@ def build_fixture() -> dict:
     alerts = [
         alert(1, monitored[0]["identifier"], "CRITICAL", "ACTIVE"),
         alert(2, monitored[0]["identifier"], "WARNING", "ACTIVE"),
-        alert(3, monitored[1]["identifier"], "IMMEDIATE", "NEW"),
+        alert(3, monitored[1]["identifier"], "IMMEDIATE", "ACTIVE"),
         alert(4, unmonitored[0]["identifier"], "CRITICAL", "ACTIVE"),
         alert(5, monitored[1]["identifier"], "CRITICAL", "CANCELED"),
-        alert(6, monitored[2]["identifier"], "CRITICAL", "UPDATED"),
+        alert(6, monitored[2]["identifier"], "CRITICAL", "ACTIVE"),
         alert(7, monitored[2]["identifier"], "IMMEDIATE", "ACTIVE"),
         alert(8, monitored[2]["identifier"], "CRITICAL", "ACTIVE"),
     ]
@@ -310,9 +310,9 @@ def handler_type(state: State):
                 200,
                 {
                     "token": value,
-                    "validity": 1786800000000 + index,
-                    "expiresAt": "2026-08-04T18:00:00.000",
-                    "roles": ["ContentAdmin"],
+                    "validity": 1788104578791 + index,
+                    "expiresAt": "Sunday, August 30, 2026 at 3:42:58 PM Coordinated Universal Time",
+                    "roles": [],
                 },
             )
 
@@ -436,17 +436,28 @@ def handler_type(state: State):
                 record = state.tokens.get(value)
                 if record is not None:
                     record["remaining"] = 0
-            self._json(200, {"message": "The sessionId is terminated successfully"})
+            self._empty(200)
 
         def _error(self, status: int, message: str) -> None:
+            if status == 401:
+                message = 'The provided token for auth scheme "OpsToken" is either invalid or has expired.'
             self._json(
                 status,
                 {
                     "message": message,
                     "httpStatusCode": status,
-                    "apiErrorCode": status * 10,
+                    "apiErrorCode": 1512 if status == 401 else status * 10,
+                    "type": "Error",
                 },
             )
+
+        def _empty(self, status: int) -> None:
+            self.entry["status"] = status
+            state.record(self.entry)
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
 
         def _json(self, status: int, payload: object) -> None:
             body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode(

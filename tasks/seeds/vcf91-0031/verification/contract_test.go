@@ -20,8 +20,8 @@ import (
 )
 
 const (
-	contractSHA256 = "a47a6f6d7ba6705cb08f4715681ba8f8469e13cc54ea0156725ff7af493e5a0d"
-	sourcesSHA256  = "e18d486cb13e19218c1a77d59574859c17e8828f70f4fd5b8f617f9017f549e7"
+	contractSHA256 = "b5572b4e189298ea091a2f7f37407406beef2a87d820e3d278b35c7040938704"
+	sourcesSHA256  = "8c0c52fff5097ba1d608584535630e25d504be68183173528d6dbc6b114d62b2"
 )
 
 func TestProtectedSpecificationProvenance(t *testing.T) {
@@ -94,11 +94,20 @@ func TestProtectedSpecificationProvenance(t *testing.T) {
 			Method:      http.MethodGet,
 			Path:        "/v1/credentials/tasks/{id}",
 		},
+		{
+			OperationID: "getCredentials",
+			Method:      http.MethodGet,
+			Path:        "/v1/credentials",
+		},
 	}
 	if !reflect.DeepEqual(contract.Operations, wantOperations) {
 		t.Fatalf("contract operations = %#v, want %#v", contract.Operations, wantOperations)
 	}
 	for _, schema := range []string{
+		"PageOfCredential",
+		"Credential",
+		"AuthenticatedResource",
+		"PageMetadata",
 		"CredentialsUpdateSpec",
 		"ResourceCredentials",
 		"BaseCredential",
@@ -128,7 +137,11 @@ func TestProtectedSpecificationProvenance(t *testing.T) {
 		sources.SpecPath != contract.DerivedFrom.SpecPath ||
 		!reflect.DeepEqual(
 			sources.OperationIDs,
-			[]string{"updateOrRotatePasswords", "getCredentialsTask"},
+			[]string{
+				"updateOrRotatePasswords",
+				"getCredentialsTask",
+				"getCredentials",
+			},
 		) {
 		t.Fatalf("official source record does not mirror the contract: %+v", sources)
 	}
@@ -352,8 +365,8 @@ func TestOptionalRotationFieldsArePresentOnlyWhenSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	requests := server.Requests()
-	if len(requests) != 2 {
-		t.Fatalf("request count = %d, want 2", len(requests))
+	if len(requests) != 3 {
+		t.Fatalf("request count = %d, want 3", len(requests))
 	}
 	usernameJSON, _ := json.Marshal(runtime.Username)
 	want := `{"operationType":"ROTATE","elements":[{` +
@@ -429,7 +442,7 @@ func TestTaskOutcomesKeepOrReplacePassword(t *testing.T) {
 			name:         "success is still polled immediately",
 			plan:         contractmock.Plan{SubmitTaskStatus: "SUCCESSFUL"},
 			maxPolls:     2,
-			wantRequests: 2,
+			wantRequests: 3,
 			wantNew:      true,
 			checkError:   noError,
 		},
@@ -522,14 +535,15 @@ func TestTaskOutcomesKeepOrReplacePassword(t *testing.T) {
 			checkError:   wantErrorType[*ProtocolError],
 		},
 		{
-			name: "missing generated password",
+			name: "blank task password uses credential inventory",
 			plan: contractmock.Plan{Polls: []contractmock.PollReply{{
 				TaskStatus:      "SUCCESSFUL",
 				OmitNewPassword: true,
 			}}},
 			maxPolls:     2,
-			wantRequests: 2,
-			checkError:   wantErrorType[*ProtocolError],
+			wantRequests: 3,
+			wantNew:      true,
+			checkError:   noError,
 		},
 		{
 			name: "ambiguous generated password",
@@ -786,15 +800,17 @@ func TestConcurrentRotationsAreSerialized(t *testing.T) {
 		t.Fatalf("subsequent Rotate: %v", err)
 	}
 	requests := server.Requests()
-	if len(requests) != 5 {
-		t.Fatalf("serialized request count = %d, want 5", len(requests))
+	if len(requests) != 7 {
+		t.Fatalf("serialized request count = %d, want 7", len(requests))
 	}
 	wantOperations := []string{
 		"updateOrRotatePasswords",
 		"getCredentialsTask",
 		"getCredentialsTask",
+		"getCredentials",
 		"updateOrRotatePasswords",
 		"getCredentialsTask",
+		"getCredentials",
 	}
 	for index, want := range wantOperations {
 		if requests[index].OperationID != want {
@@ -848,8 +864,8 @@ func assertHappyWire(
 	runtime contractmock.RuntimeValues,
 ) {
 	t.Helper()
-	if len(requests) != 3 {
-		t.Fatalf("request count = %d, want 3", len(requests))
+	if len(requests) != 4 {
+		t.Fatalf("request count = %d, want 4", len(requests))
 	}
 	patch := requests[0]
 	if patch.OperationID != "updateOrRotatePasswords" ||
@@ -895,7 +911,7 @@ func assertHappyWire(
 	credential := credentials[0].(map[string]any)
 	assertJSONKeys(t, credential, "username")
 
-	for index, get := range requests[1:] {
+	for index, get := range requests[1:3] {
 		if get.OperationID != "getCredentialsTask" ||
 			get.Method != http.MethodGet ||
 			get.Path != "/v1/credentials/tasks/"+runtime.TaskID ||
@@ -924,6 +940,24 @@ func assertHappyWire(
 				get.Body,
 			)
 		}
+	}
+	credentialsGet := requests[3]
+	if credentialsGet.OperationID != "getCredentials" ||
+		credentialsGet.Method != http.MethodGet ||
+		credentialsGet.Path != "/v1/credentials" ||
+		credentialsGet.RawQuery != "resourceName="+
+			url.QueryEscape(runtime.ResourceName)+"&resourceType=VCENTER" {
+		t.Fatalf("getCredentials request target = %+v", credentialsGet)
+	}
+	assertSingleHeader(t, credentialsGet.Header, "Accept", "application/json")
+	assertSingleHeader(
+		t,
+		credentialsGet.Header,
+		"Authorization",
+		"Bearer "+runtime.AccessToken,
+	)
+	if values := credentialsGet.Header.Values("Content-Type"); len(values) != 0 {
+		t.Fatalf("getCredentials Content-Type = %v, want absent", values)
 	}
 }
 

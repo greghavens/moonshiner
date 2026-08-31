@@ -30,7 +30,7 @@ class ProvisioningFailed(RuntimeError):
 
 
 class LogManagementClient:
-    """Minimal client for the two operations in ``docs/contract.json``."""
+    """Minimal client for the required Log Management operations."""
 
     def __init__(self, base_url: str, token: str, *, timeout: float = 5.0) -> None:
         self.base_url = base_url

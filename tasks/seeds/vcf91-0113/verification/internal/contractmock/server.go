@@ -3,8 +3,6 @@
 package contractmock
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -47,7 +45,7 @@ type Reply struct {
 }
 
 // Plan controls operation responses. Missing entries use the workflow defaults:
-// both updates return 204 and power start returns a standard vAPI 503.
+// both updates return 204 and power start returns the observed already-on error.
 type Plan struct {
 	Replies map[string]Reply
 }
@@ -107,13 +105,12 @@ func New(contractPath string, plan Plan) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	random := randomBytes()
 	runtime := RuntimeValues{
-		SessionToken:   "session-" + hex.EncodeToString(random[:12]),
-		VM:             "vm /prod?#%✓-" + hex.EncodeToString(random[12:18]),
-		CPUCount:       int64(2 + random[18]%15),
-		MemoryMiB:      int64(4+random[19]%13) * 1024,
-		FailureMessage: "power service unavailable " + hex.EncodeToString(random[20:]),
+		SessionToken:   "0123456789abcdef0123456789abcdef",
+		VM:             "vm-39",
+		CPUCount:       2,
+		MemoryMiB:      4096,
+		FailureMessage: "Virtual machine is already powered on.",
 	}
 	rendered, err := renderOperations(operations, runtime.VM)
 	if err != nil {
@@ -321,13 +318,20 @@ func (s *Server) reply(
 	if operation.OperationID != PowerStart {
 		return http.StatusNoContent, nil, ""
 	}
-	return encodeReply(http.StatusServiceUnavailable, VAPIError{
-		ErrorType: "SERVICE_UNAVAILABLE",
-		Messages: []LocalizableMessage{{
-			Args:           []string{},
-			DefaultMessage: s.runtime.FailureMessage,
-			ID:             "com.vmware.vcenter.power.unavailable",
-		}},
+	return encodeReply(http.StatusBadRequest, VAPIError{
+		ErrorType: "ALREADY_IN_DESIRED_STATE",
+		Messages: []LocalizableMessage{
+			{
+				Args:           []string{},
+				DefaultMessage: s.runtime.FailureMessage,
+				ID:             "com.vmware.api.vcenter.vm.power.already_powered_on",
+			},
+			{
+				Args:           []string{},
+				DefaultMessage: "The attempted operation cannot be performed in the current state (Powered on).",
+				ID:             "vmsg.InvalidPowerState.summary",
+			},
+		},
 	}, nil, "application/json")
 }
 
@@ -343,12 +347,4 @@ func encodeReply(status int, body any, raw []byte, contentType string) (int, []b
 		panic("contract mock reply is not JSON encodable")
 	}
 	return status, encoded, contentType
-}
-
-func randomBytes() [32]byte {
-	var value [32]byte
-	if _, err := rand.Read(value[:]); err != nil {
-		panic("cannot generate loopback fixture values")
-	}
-	return value
 }

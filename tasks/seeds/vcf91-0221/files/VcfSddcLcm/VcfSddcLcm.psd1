@@ -5,7 +5,7 @@
     Author = 'VCF automation team'
     CompanyName = 'Community'
     Copyright = '(c) 2026. Apache-2.0 derived contract attribution is in docs/official_sources.json.'
-    Description = 'Contract-pinned VCF 9.1 SDDC and Fleet lifecycle configuration helper.'
+    Description = 'focused VCF 9.1 SDDC and Fleet lifecycle configuration helper.'
     PowerShellVersion = '7.4'
     FunctionsToExport = @('Set-VcfSddcLcmConfiguration')
     CmdletsToExport = @()

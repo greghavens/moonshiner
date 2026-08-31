@@ -122,7 +122,10 @@ class State:
             self.list_reads += 1
 
         items = []
-        for cluster in self.config["clusters"]:
+        configured = self.config["clusters"]
+        if self.config["scenario"] == "live_backup_404":
+            configured = configured[:1]
+        for cluster in configured:
             version = cluster["version"]
             if (
                 self.config["scenario"] == "inventory_changed"
@@ -201,6 +204,15 @@ class Handler(BaseHTTPRequestHandler):
             if captures != [config["namespace"]]:
                 self._respond(404, {"error": "namespace not found"})
                 return
+            if scenario == "live_namespace_404":
+                self._respond(404, {
+                    "error_type": "NOT_FOUND",
+                    "messages": [{
+                        "id": "vcenter.wcp.workload.notfound",
+                        "default_message": "Workload not found.",
+                    }],
+                })
+                return
             status = "ERROR" if scenario == "namespace_not_ready" else "RUNNING"
             self._respond(
                 200,
@@ -241,6 +253,15 @@ class Handler(BaseHTTPRequestHandler):
         if operation == "createSupervisorBackup":
             if captures != [config["supervisor"]]:
                 self._respond(404, {"error": "supervisor not found"})
+                return
+            if scenario == "live_backup_404":
+                self._respond(404, {
+                    "error_type": "NOT_FOUND",
+                    "messages": [{
+                        "id": "vcenter.wcp.supervisor.notfound",
+                        "default_message": "Supervisor not found.",
+                    }],
+                })
                 return
             if scenario == "api_error":
                 self._respond(

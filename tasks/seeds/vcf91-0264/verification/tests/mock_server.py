@@ -122,17 +122,20 @@ def expected_auth_body(case: dict[str, Any]) -> bytes:
     return compact(payload)
 
 
-def expected_create_body(case: dict[str, Any]) -> bytes:
-    """create-adapter-instance projected in contract declaration order."""
+def expected_adapter_body(case: dict[str, Any], *, persisted: bool) -> bytes:
+    """Precheck or create body projected in contract declaration order."""
     credential = {
         "adapterKindKey": require_text(case, "adapterKindKey"),
         "credentialKindKey": require_text(case, "credentialKindKey"),
-        "fields": [
+    }
+    if persisted:
+        credential["id"] = require_text(case, "precheckCredentialInstanceId")
+    else:
+        credential["fields"] = [
             {"name": name, "value": value}
             for name, value in pairs(case, "credentialFields")
-        ],
-        "name": require_text(case, "credentialName"),
-    }
+        ]
+    credential["name"] = require_text(case, "credentialName")
     payload: dict[str, Any] = {
         "adapterKindKey": require_text(case, "adapterKindKey"),
         "credential": credential,
@@ -159,6 +162,7 @@ class MockState:
             raise RuntimeError("scenario must contain cases")
         self.cases_by_auth_body: dict[bytes, dict[str, Any]] = {}
         self.cases_by_token: dict[str, dict[str, Any]] = {}
+        self.expected_precheck: dict[str, bytes] = {}
         self.expected_create: dict[str, bytes] = {}
         outcomes = []
         for case in raw_cases:
@@ -171,7 +175,12 @@ class MockState:
                 raise RuntimeError("scenario cases must be distinguishable")
             self.cases_by_auth_body[auth_body] = case
             self.cases_by_token[token] = case
-            self.expected_create[key] = expected_create_body(case)
+            self.expected_precheck[key] = expected_adapter_body(
+                case, persisted=False
+            )
+            self.expected_create[key] = expected_adapter_body(
+                case, persisted=True
+            )
             outcomes.append(require_text(case, "outcome"))
         mode = scenario.get("mode")
         if mode == "gate-flow":
@@ -385,7 +394,7 @@ class ContractHandler(BaseHTTPRequestHandler):
                 return 409, error_body(
                     409, "the adapter name must be checked before testing a connection"
                 )
-        if body != self.server.state.expected_create[case["key"]]:
+        if body != self.server.state.expected_precheck[case["key"]]:
             return 400, error_body(
                 400, "connection test body carries unset or misordered members"
             )
@@ -414,7 +423,7 @@ class ContractHandler(BaseHTTPRequestHandler):
                 )
         if body != self.server.state.expected_create[case["key"]]:
             return 400, error_body(
-                400, "adapter creation body differs from the tested body"
+                400, "adapter creation did not use the precheck credential id"
             )
         forced = self.server.state.forced_error(case, "createAdapterInstance")
         if forced is not None:

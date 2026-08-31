@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent
 CONTRACT_PATH = ROOT / "docs" / "contract.json"
 SOURCES_PATH = ROOT / "docs" / "official_sources.json"
 MOCK_PATH = ROOT / "mock_nsx_policy.py"
-OPERATION_ID = "UpdateGroupForDomain"
+OPERATION_ID = "PatchGroupForDomain"
 
 
 def read_json_lines(path: Path) -> list[dict[str, object]]:
@@ -108,7 +108,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(list(contract["operations"]), [OPERATION_ID])
         operation = contract["operations"][OPERATION_ID]
         self.assertEqual(operation["operationId"], OPERATION_ID)
-        self.assertEqual(operation["method"], "PUT")
+        self.assertEqual(operation["method"], "PATCH")
         self.assertEqual(
             operation["path"], "/infra/domains/{domain-id}/groups/{group-id}"
         )
@@ -200,7 +200,7 @@ class ContractTests(unittest.TestCase):
         self.assertTrue(issubclass(NsxApiError, Exception))
         self.assertTrue(issubclass(ProtocolError, Exception))
 
-    def test_02_lost_response_replays_identical_put_once(self) -> None:
+    def test_02_lost_response_replays_identical_patch_once(self) -> None:
         with MockProcess() as mock:
             username = "svc-rollout"
             password = "contract-secret-62"
@@ -243,7 +243,7 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(result.ambiguous_retries, 1)
             self.assertEqual(result.group["resource_type"], "Group")
             self.assertEqual(result.group["display_name"], display_name)
-            self.assertEqual(result.group["id"], group_id)
+            self.assertNotIn("id", result.group)
 
             records = read_json_lines(mock.log_file)
             self.assertEqual(len(records), 2, records)
@@ -267,7 +267,7 @@ class ContractTests(unittest.TestCase):
 
             for record in records:
                 self.assertEqual(record["operationId"], OPERATION_ID)
-                self.assertEqual(record["method"], "PUT")
+                self.assertEqual(record["method"], "PATCH")
                 self.assertEqual(record["raw_target"], expected_target)
                 self.assertNotIn("?", record["raw_target"])
                 self.assertEqual(record["body_utf8"], expected_body)

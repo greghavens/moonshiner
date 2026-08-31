@@ -221,12 +221,8 @@ try {
     ) 'items' 'list result required fields'
 
     $Manifest = Import-PowerShellDataFile -LiteralPath $ManifestPath
-    Assert-Equal @($Manifest.RequiredModules).Count 1 `
+    Assert-Equal @($Manifest.RequiredModules).Count 0 `
         'manifest prerequisite count'
-    Assert-Equal $Manifest.RequiredModules[0].ModuleName `
-        'VMware.Sdk.Vcf.SddcManager' 'VCF PowerCLI module prerequisite'
-    Assert-Equal ([version] $Manifest.RequiredModules[0].ModuleVersion) `
-        ([version] '13.5.0.25380678') 'VCF PowerCLI module version'
     Assert-Equal (($Manifest.FunctionsToExport) -join ',') (
         'New-VcfVcenterCredentialClient,' +
         'Get-VcfVcenterAuthorizationRole,' +
@@ -255,8 +251,7 @@ try {
     Assert-Equal @($ParseErrors).Count 0 'module parses without errors'
     $SourceText = Get-Content -Raw -LiteralPath $ModulePath
     foreach ($RequiredText in @(
-        'VMware.Sdk.OpenApi.Cmdlets.IServerConnection',
-        '.GetClient()',
+        'DangerousAcceptAnyServerCertificateValidator',
         'vmware-api-session-id',
         'System.Threading.Monitor',
         'Net.Http.HttpRequestMessage'
@@ -269,7 +264,10 @@ try {
         'Invoke-WebRequest',
         'Start-Process',
         'curl',
-        'Connect-VIServer'
+        'Connect-VIServer',
+        'VMware.Sdk.OpenApi.Cmdlets.IServerConnection',
+        '.GetClient()',
+        'VMware.Sdk.Vcf.SddcManager'
     )) {
         Assert-True (-not $SourceText.Contains($ForbiddenText)) `
             "implementation must not use $ForbiddenText"
@@ -291,40 +289,58 @@ try {
         'Set-VcfVcenterCredential'
     ) 'runtime exports'
     $NewCommand = Get-Command New-VcfVcenterCredentialClient
-    Assert-Equal $NewCommand.Parameters.Connection.ParameterType.FullName `
-        'VMware.Sdk.OpenApi.Cmdlets.IServerConnection' `
-        'constructor connection type'
+    Assert-True (-not $NewCommand.Parameters.ContainsKey('Connection')) `
+        'constructor has no unsupported connection parameter'
+    Assert-Equal $NewCommand.Parameters.Server.ParameterType.FullName `
+        'System.Uri' 'constructor server type'
+    Assert-Equal $NewCommand.Parameters.SessionToken.ParameterType.FullName `
+        'System.String' 'constructor API-session type'
     $SetCommand = Get-Command Set-VcfVcenterCredential
-    Assert-Equal $SetCommand.Parameters.Connection.ParameterType.FullName `
-        'VMware.Sdk.OpenApi.Cmdlets.IServerConnection' `
-        'replacement connection type'
+    Assert-True (-not $SetCommand.Parameters.ContainsKey('Connection')) `
+        'replacement has no unsupported connection parameter'
+    Assert-Equal $SetCommand.Parameters.Server.ParameterType.FullName `
+        'System.Uri' 'replacement server type'
+    Assert-Equal $SetCommand.Parameters.SessionToken.ParameterType.FullName `
+        'System.String' 'replacement API-session type'
 
     $RunId = [guid]::NewGuid().ToString('N')
-    $OldToken = 'old-session-' + $RunId
-    $NewToken = 'new-session-' + $RunId
-    $OldItem = [ordered]@{
-        role = 'old-role-' + $RunId.Substring(0, 8)
-        info = [ordered]@{
-            name = 'Old request ' + $RunId.Substring(8, 6)
-            description = 'admitted before cutover'
-            privileges = @('System.Read')
-            system = $false
+    $OldToken = $RunId
+    $NewToken = [guid]::NewGuid().ToString('N')
+    $RoleItems = @(
+        [ordered]@{
+            role = '-8'
+            info = [ordered]@{
+                privileges = @(
+                    'System.Anonymous',
+                    'System.Read',
+                    'System.View'
+                )
+                system = $true
+                name = 'NoTrustedAdmin'
+                description = (
+                    'Full access without Trusted Infrastructure privileges'
+                )
+            }
+        },
+        [ordered]@{
+            role = '1816151822'
+            info = [ordered]@{
+                privileges = @(
+                    'Nsx.Manage',
+                    'System.Anonymous',
+                    'System.Read',
+                    'System.View'
+                )
+                system = $false
+                name = 'NsxViAdministrator'
+                description = 'This role allows vSphere user to manage NSX.'
+            }
         }
-    }
-    $NewItem = [ordered]@{
-        role = 'new-role-' + $RunId.Substring(14, 8)
-        info = [ordered]@{
-            name = 'New request ' + $RunId.Substring(22, 6)
-            description = 'admitted after cutover'
-            privileges = @('System.Read', 'System.View')
-            system = $true
-        }
-    }
+    )
     $Scenario = [ordered]@{
         old_token = $OldToken
         new_token = $NewToken
-        old_item = $OldItem
-        new_item = $NewItem
+        items = $RoleItems
         release_file = $ReleasePath
     }
     [IO.File]::WriteAllText(
@@ -500,14 +516,18 @@ try {
         -Invocation $QueuedInvocation
     $QueuedInvocation = $null
 
-    Assert-Equal $OldResult.role $OldItem.role `
-        'old request returns the old response'
-    Assert-Equal $OldResult.info.name $OldItem.info.name `
+    Assert-Equal (@($OldResult.role) -join ',') `
+        (@($RoleItems.role) -join ',') `
+        'old request returns the live-shaped role inventory'
+    Assert-Equal (@($OldResult.info.name) -join ',') `
+        (@($RoleItems.info.name) -join ',') `
         'old response is fully decoded before lease release'
-    Assert-Equal $QueuedResult.role $NewItem.role `
-        'queued request returns the post-cutover response'
-    Assert-Equal $QueuedResult.info.name $NewItem.info.name `
-        'queued response is decoded'
+    Assert-Equal (@($QueuedResult.role) -join ',') `
+        (@($RoleItems.role) -join ',') `
+        'queued request returns the same live-shaped role inventory'
+    Assert-Equal (@($QueuedResult.info.name) -join ',') `
+        (@($RoleItems.info.name) -join ',') `
+        'queued response is decoded under the replacement generation'
     Assert-Equal (
         ($RotationResult.PSObject.Properties.Name) -join ','
     ) 'PreviousVersion,CurrentVersion' 'cutover result property contract'

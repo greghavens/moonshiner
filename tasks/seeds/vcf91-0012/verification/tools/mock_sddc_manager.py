@@ -126,7 +126,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"errorCode": "INVALID_CREDENTIALS", "message": "Invalid credentials"})
                 return
             self._send(
-                201,
+                200,
                 {
                     "accessToken": ACCESS_TOKEN,
                     "refreshToken": {"id": REFRESH_TOKEN},

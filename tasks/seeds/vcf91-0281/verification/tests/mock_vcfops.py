@@ -29,20 +29,40 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 USERNAME = "svc-rotation"
 PASSWORD = "OldRotationPassw0rd!"
 TOKEN = "ops-tok-3f2a91c7d4e85b60"
-TOKEN_VALIDITY = 1778000000000
-TOKEN_EXPIRES_AT = "2026-05-13T14:19:58.000Z"
+TOKEN_VALIDITY = 1788105644852
+TOKEN_EXPIRES_AT = "Sunday, August 30, 2026 at 4:00:44 PM Coordinated Universal Time"
 AUTH_PREFIX = "OpsToken "
 
 OLD_CREDENTIAL_ID = "7b3f9c14-2e5a-4d68-9a01-3c6d5e8f1a20"
 NEW_CREDENTIAL_ID = "2d9e4a71-6c08-4f3b-8b52-90a7d1e4c6f5"
 
-# How many drain polls an adapter instance keeps reporting against the outgoing
-# credential after it has been repointed. This stands in for collection cycles
-# that were already in flight on the old secret when the PATCH landed.
-DRAIN_LAG_POLLS = 2
-
-
 def _resource_key(name, vc_url):
+    values = {
+        "AUTODISCOVERY": "true",
+        "PROCESSCHANGEEVENTS": "true",
+        "VCURL": vc_url,
+    }
+    names = [
+        "AUTO_ENABLE_VSPHERE_SUPERVISOR_COLLECTION",
+        "AUTODISCOVERY",
+        "CLOUD_TYPE",
+        "DV_PORT_GROUP_DISABLED",
+        "DVS_DISABLED",
+        "ENABLE_ACTIONS",
+        "GFS_SKIP_PATTERNS",
+        "IS_OPS_LITE",
+        "IS_VSTATS_COLLECTION_ENABLED",
+        "LOG_COLLECTION",
+        "PDRS_STATS_PROVIDER",
+        "PROCESSCHANGEEVENTS",
+        "PROCESSTASKS",
+        "VCURL",
+        "VM_FOLDER_DISABLED",
+        "VM_LIMIT",
+        "VMC_CONFIG_LIMITS_FILE_NAME",
+        "VMEntityVCID",
+        "VSTATS_SAMPLING_INTERVAL_SECONDS",
+    ]
     return {
         "name": name,
         "adapterKindKey": "VMWARE",
@@ -50,94 +70,61 @@ def _resource_key(name, vc_url):
         "resourceIdentifiers": [
             {
                 "identifierType": {
-                    "name": "AUTODISCOVERY",
+                    "name": identifier_name,
                     "dataType": "STRING",
-                    "isPartOfUniqueness": True,
+                    "isPartOfUniqueness": identifier_name == "VCURL",
                 },
-                "value": "true",
+                "value": values.get(identifier_name, ""),
+            }
+            for identifier_name in names
+        ],
+    }
+
+
+COLLECTOR_GROUP_ID = "0e76444b-954c-46af-bf1c-e2fceab8f571"
+
+
+def _adapter(adapter_id, name, vc_url):
+    return {
+        "resourceKey": _resource_key(name, vc_url),
+        "collectorId": 1,
+        "collectorGroupId": COLLECTOR_GROUP_ID,
+        "credentialInstanceId": OLD_CREDENTIAL_ID,
+        "lastHeartbeat": 1788084668672,
+        "messageFromAdapterInstance": "",
+        "links": [
+            {
+                "href": "/suite-api/api/adapters/%s" % adapter_id,
+                "rel": "SELF",
+                "name": "linkToSelf",
             },
             {
-                "identifierType": {
-                    "name": "VCURL",
-                    "dataType": "STRING",
-                    "isPartOfUniqueness": True,
-                },
-                "value": vc_url,
+                "href": "/suite-api/api/credentials/%s" % OLD_CREDENTIAL_ID,
+                "rel": "RELATED",
+                "name": "linkToCredential",
             },
         ],
+        "id": adapter_id,
     }
 
 
 def initial_adapters():
     return [
-        {
-            "id": "a1c5e930-4b71-4f2e-9d83-1e6f0b27c845",
-            "resourceKey": _resource_key(
+        _adapter(
+            "a1c5e930-4b71-4f2e-9d83-1e6f0b27c845",
                 "Adapter for VC@https://vc-lab01.example.com/sdk",
                 "https://vc-lab01.example.com/sdk",
-            ),
-            "credentialInstanceId": OLD_CREDENTIAL_ID,
-            # Read-side noise. A client that echoes the read back into the PATCH
-            # will drag these along, which is exactly what the contract forbids.
-            "description": None,
-            "collectorId": 1,
-            "collectorGroupId": "0f2e6f0b-27c8-45a1-9c5e-930b714f2e9d",
-            "monitoringInterval": 5,
-            "monitoringIntervalSeconds": 0,
-            "numberOfMetricsCollected": 148213,
-            "numberOfResourcesCollected": 2044,
-            "lastCollected": 1778000041000,
-            "lastHeartbeat": 1778000053000,
-            "messageFromAdapterInstance": None,
-            "links": [
-                {"href": "/suite-api/api/adapters/a1c5e930-4b71-4f2e-9d83-1e6f0b27c845",
-                 "rel": "SELF", "name": "linkToSelf"}
-            ],
-        },
-        {
-            "id": "b2d6fa41-5c82-4a3f-8e94-2f70c138d956",
-            "resourceKey": _resource_key(
+        ),
+        _adapter(
+            "b2d6fa41-5c82-4a3f-8e94-2f70c138d956",
                 "Adapter for VC@https://vc-lab02.example.com/sdk",
                 "https://vc-lab02.example.com/sdk",
-            ),
-            "credentialInstanceId": OLD_CREDENTIAL_ID,
-            "description": "Secondary lab vCenter",
-            "collectorId": 1,
-            "collectorGroupId": "0f2e6f0b-27c8-45a1-9c5e-930b714f2e9d",
-            "monitoringInterval": 5,
-            "monitoringIntervalSeconds": 0,
-            "numberOfMetricsCollected": 90117,
-            "numberOfResourcesCollected": 1318,
-            "lastCollected": 1778000039000,
-            "lastHeartbeat": 1778000052000,
-            "messageFromAdapterInstance": None,
-            "links": [
-                {"href": "/suite-api/api/adapters/b2d6fa41-5c82-4a3f-8e94-2f70c138d956",
-                 "rel": "SELF", "name": "linkToSelf"}
-            ],
-        },
-        {
-            "id": "c3e70b52-6d93-4b40-9fa5-3081d249ea67",
-            "resourceKey": _resource_key(
+        ),
+        _adapter(
+            "c3e70b52-6d93-4b40-9fa5-3081d249ea67",
                 "Adapter for VC@https://vc-lab03.example.com/sdk",
                 "https://vc-lab03.example.com/sdk",
-            ),
-            "credentialInstanceId": OLD_CREDENTIAL_ID,
-            "description": None,
-            "collectorId": 2,
-            "collectorGroupId": "0f2e6f0b-27c8-45a1-9c5e-930b714f2e9d",
-            "monitoringInterval": 5,
-            "monitoringIntervalSeconds": 0,
-            "numberOfMetricsCollected": 51002,
-            "numberOfResourcesCollected": 806,
-            "lastCollected": 1778000037000,
-            "lastHeartbeat": 1778000050000,
-            "messageFromAdapterInstance": None,
-            "links": [
-                {"href": "/suite-api/api/adapters/c3e70b52-6d93-4b40-9fa5-3081d249ea67",
-                 "rel": "SELF", "name": "linkToSelf"}
-            ],
-        },
+        ),
     ]
 
 
@@ -149,9 +136,12 @@ def initial_credentials():
             "adapterKindKey": "VMWARE",
             "credentialKindKey": "PRINCIPALCREDENTIAL",
             "editable": True,
-            # The server never hands a secret back; only the field names survive
-            # a read, which is why a rotation has to be told the new values.
-            "fields": [{"name": "USER", "value": "svc-vcops@vsphere.local"}],
+            "fields": [
+                {"name": "USER", "value": "svc-vcops@vsphere.local"},
+                {"name": "PASSWORD", "value": PASSWORD},
+                {"name": "ACTION_USER"},
+                {"name": "ACTION_PASSWORD"},
+            ],
         }
     }
 
@@ -199,8 +189,9 @@ class State:
         self.seq = 0
         self.credentials = initial_credentials()
         self.adapters = initial_adapters()
-        # adapter id -> {"target": <new credential id>, "remaining": int}
-        self.pending = {}
+        self.inject_late_binding = False
+        self.initial_old_listing_served = False
+        self.late_binding_injected = False
 
     def next_seq(self):
         self.seq += 1
@@ -213,28 +204,12 @@ class State:
         return None
 
     def adapters_reported_for(self, credential_id):
-        """Adapters an operator would still consider bound to this credential.
-
-        A repointed adapter keeps showing up here until its lag expires, which
-        is the whole reason a rotation has to drain before it deletes.
-        """
+        """Return the adapters whose configured credential is this ID."""
         out = []
         for adapter in self.adapters:
             if adapter["credentialInstanceId"] == credential_id:
                 out.append(adapter)
         return out
-
-    def tick_drain(self, credential_id):
-        """One drain poll against `credential_id` advances in-flight cutovers."""
-        for adapter_id, entry in list(self.pending.items()):
-            adapter = self.adapter(adapter_id)
-            if adapter is None or adapter["credentialInstanceId"] != credential_id:
-                continue
-            entry["remaining"] -= 1
-            if entry["remaining"] <= 0:
-                adapter["credentialInstanceId"] = entry["target"]
-                del self.pending[adapter_id]
-
 
 STATE = State()
 
@@ -293,11 +268,12 @@ def handle_acquire_token(ctx):
             "when no auth source is configured")
     if body["username"] != USERNAME or body["password"] != PASSWORD:
         return 401, _error("authentication failed")
+    STATE.inject_late_binding = bool(body.get("authSource"))
     return 200, {
         "token": TOKEN,
         "validity": TOKEN_VALIDITY,
         "expiresAt": TOKEN_EXPIRES_AT,
-        "roles": ["Administrator"],
+        "roles": [],
     }
 
 
@@ -349,8 +325,8 @@ def handle_create_credential(ctx):
         "adapterKindKey": body["adapterKindKey"],
         "credentialKindKey": body["credentialKindKey"],
         "editable": True,
-        # Secret values are accepted but never echoed.
-        "fields": [{"name": f["name"], "value": ""} for f in fields],
+        "fields": ([dict(f) for f in fields]
+                   + [{"name": "ACTION_USER"}, {"name": "ACTION_PASSWORD"}]),
     }
     STATE.credentials[created["id"]] = created
     return 201, created
@@ -360,7 +336,18 @@ def handle_get_adapters_using_credential(ctx):
     credential_id = ctx["params"]["id"]
     if credential_id not in STATE.credentials:
         return 404, _error("no credential instance with id %s" % credential_id)
-    STATE.tick_drain(credential_id)
+    if credential_id == OLD_CREDENTIAL_ID:
+        if not STATE.initial_old_listing_served:
+            STATE.initial_old_listing_served = True
+        elif (STATE.inject_late_binding and not STATE.late_binding_injected
+              and not STATE.adapters_reported_for(credential_id)):
+            late = _adapter(
+                "d4f81c63-7ea4-4c51-a0b6-4192e35afb78",
+                "Adapter concurrently bound during rotation",
+                "https://vc-late.example.com/sdk",
+            )
+            STATE.adapters.append(late)
+            STATE.late_binding_injected = True
     bound = STATE.adapters_reported_for(credential_id)
     return 200, {"adapterInstancesInfoDto": bound}
 
@@ -369,7 +356,7 @@ def handle_patch_adapter_instance(ctx):
     body = ctx["body_json"]
     if not isinstance(body, dict):
         return 400, _error("request body must be an adapter-instance object")
-    permitted = {"id", "resourceKey", "credentialInstanceId"}
+    permitted = {"id", "resourceKey", "credentialInstanceId", "adapter-certificates"}
     extra = set(body) - permitted
     if extra:
         return 400, _error(
@@ -378,6 +365,8 @@ def handle_patch_adapter_instance(ctx):
             % ", ".join(sorted(extra)))
     if "resourceKey" not in body:
         return 400, _error("adapter-instance.resourceKey is required")
+    if body.get("adapter-certificates") != []:
+        return 400, _error("'AdapterInstanceInfoDto.certificates' cannot be null.")
     adapter_id = body.get("id")
     if not isinstance(adapter_id, str) or not adapter_id:
         return 400, _error(
@@ -394,15 +383,18 @@ def handle_patch_adapter_instance(ctx):
         return 400, _error("adapter-instance.credentialInstanceId is required")
     if target not in STATE.credentials:
         return 400, _error("no credential instance with id %s" % target)
-    if target != adapter["credentialInstanceId"]:
-        # The rebind is accepted immediately but does not take effect until the
-        # collections already running on the previous secret have wound down.
-        STATE.pending[adapter_id] = {"target": target,
-                                     "remaining": DRAIN_LAG_POLLS}
+    adapter["credentialInstanceId"] = target
+    adapter["links"][1]["href"] = "/suite-api/api/credentials/%s" % target
     echo = {
-        "id": adapter["id"],
         "resourceKey": adapter["resourceKey"],
+        "collectorId": adapter["collectorId"],
+        "collectorGroupId": adapter["collectorGroupId"],
         "credentialInstanceId": adapter["credentialInstanceId"],
+        "monitoringInterval": 5,
+        "lastHeartbeat": adapter["lastHeartbeat"],
+        "messageFromAdapterInstance": adapter["messageFromAdapterInstance"],
+        "links": adapter["links"],
+        "id": adapter["id"],
     }
     return 200, echo
 
@@ -416,10 +408,6 @@ def handle_delete_credential(ctx):
         return 400, _error(
             "credential instance %s is still in use by %d adapter instance(s): "
             "%s" % (credential_id, len(still_bound), ", ".join(still_bound)))
-    if credential_id in {entry["target"] for entry in STATE.pending.values()}:
-        return 400, _error(
-            "credential instance %s is the target of a cutover that has not "
-            "completed" % credential_id)
     del STATE.credentials[credential_id]
     return 204, None
 
@@ -455,6 +443,12 @@ class Handler(BaseHTTPRequestHandler):
             handle.write(json.dumps(entry, sort_keys=True) + "\n")
 
     def _respond(self, status, body_obj, entry, reject_reason=None):
+        if isinstance(body_obj, dict) and "message" in body_obj:
+            body_obj.setdefault("type", "Error")
+            if body_obj.get("httpStatusCode") is None:
+                body_obj["httpStatusCode"] = status
+            if body_obj.get("apiErrorCode") is None:
+                body_obj["apiErrorCode"] = status
         payload = b""
         if body_obj is not None:
             payload = json.dumps(body_obj).encode("utf-8")

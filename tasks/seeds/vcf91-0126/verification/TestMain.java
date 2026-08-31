@@ -11,7 +11,8 @@ public class TestMain {
 
     public static void main(String[] args) throws Exception {
         checkProtectedProvenance();
-        checkEvidenceBasedDiagnosisAndWireShape();
+        checkLiveAbsentTpmStopsWorkflow();
+        checkContractEvidenceBasedDiagnosisAndWireShape();
         checkNonFailedTaskStopsWorkflow();
         checkTerminalApiFailureStopsWorkflow();
         System.out.println("ALL VCENTER ATTESTATION CONTRACT CHECKS PASSED (" + checks + ")");
@@ -50,8 +51,8 @@ public class TestMain {
                 "top-level and per-operation source paths");
     }
 
-    private static void checkEvidenceBasedDiagnosisAndWireShape() throws Exception {
-        String session = "session-secret-91";
+    private static void checkContractEvidenceBasedDiagnosisAndWireShape() throws Exception {
+        String session = "0123456789abcdef0123456789abcdef";
         String task = "task attest/42";
         String host = "host 17/edge";
         String tpm = "tpm#0";
@@ -69,8 +70,8 @@ public class TestMain {
                     client.diagnoseFailedAttestation(task, host, tpm, description);
 
             equal("FAILED", diagnosis.taskStatus(), "failed task status");
-            equal("FAILED_ATTESTATION", diagnosis.taskErrorType(), "task error type");
-            equal("Host trust check failed; inspect TPM events",
+            equal("INVALID_ARGUMENT", diagnosis.taskErrorType(), "task error type");
+            equal("EVC mode is empty.",
                     diagnosis.taskMessage(), "task message");
             equal("EFI_TCG2_EVENT_LOG_FORMAT_TCG_2",
                     diagnosis.eventLogType(), "event log type");
@@ -128,6 +129,33 @@ public class TestMain {
             absent(requests.get(2).bodyUtf8(), ":\"\"", "empty string substitute");
             absent(requests.get(2).bodyUtf8(), ":[]", "empty array substitute");
             absent(requests.get(2).bodyUtf8(), ":{}", "empty object substitute");
+        }
+    }
+
+    private static void checkLiveAbsentTpmStopsWorkflow() throws Exception {
+        String session = "fedcba9876543210fedcba9876543210";
+        String task = "task-4272:7978ee81-a66c-4c37-8653-c577c0161e9d";
+        try (ContractMock mock = new ContractMock(
+                CONTRACT, ContractMock.Scenario.EVENT_NOT_FOUND)) {
+            VcenterAttestationDiagnosticsClient client =
+                    new VcenterAttestationDiagnosticsClient(
+                            mock.baseUrl(), session, HttpClient.newHttpClient());
+            try {
+                client.diagnoseFailedAttestation(
+                        task, "host-12", "missing-vcf-tpm", "not collected");
+                throw new AssertionError("absent TPM was accepted");
+            } catch (VcenterAttestationDiagnosticsClient.VcenterApiException expected) {
+                equal(404, expected.statusCode(), "live absent-TPM status");
+                contains(expected.responseBody(),
+                        "com.vmware.esx.trusted_infrastructure.hardware.tpm.not_found",
+                        "live absent-TPM message ID");
+            }
+            List<ContractMock.LoggedRequest> requests = mock.requests();
+            equal(2, requests.size(), "absent TPM stops before support bundle");
+            equal("/api/cis/tasks/task-4272%3A7978ee81-a66c-4c37-8653-c577c0161e9d",
+                    requests.get(0).rawPath(), "live-shaped task path");
+            equal("/api/vcenter/trusted-infrastructure/hosts/host-12/hardware/tpm/missing-vcf-tpm/event-log",
+                    requests.get(1).rawPath(), "live absent-TPM path");
         }
     }
 

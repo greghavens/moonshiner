@@ -163,6 +163,21 @@ class Handler(BaseHTTPRequestHandler):
             if captures != [config["supervisorNamespace"]]:
                 self._respond(404, {"error": "namespace not found"})
                 return
+            if config["scenario"] == "live_namespace_404":
+                self._respond(
+                    404,
+                    {
+                        "error_type": "NOT_FOUND",
+                        "messages": [
+                            {
+                                "args": [],
+                                "default_message": "Namespace was not found.",
+                                "id": "vcenter.wcp.workload.notfound",
+                            }
+                        ],
+                    },
+                )
+                return
             status = (
                 "ERROR"
                 if config["scenario"] == "namespace_not_ready"
@@ -216,6 +231,21 @@ class Handler(BaseHTTPRequestHandler):
         if operation == "createSupervisorBackup":
             if captures != [config["supervisor"]]:
                 self._respond(404, {"error": "supervisor not found"})
+                return
+            if config["scenario"] == "live_backup_unavailable":
+                self._respond(
+                    404,
+                    {
+                        "error_type": "NOT_FOUND",
+                        "messages": [
+                            {
+                                "args": [],
+                                "default_message": "Supervisor was not found.",
+                                "id": "vcenter.wcp.supervisor.notfound",
+                            }
+                        ],
+                    },
+                )
                 return
             self._respond(200, config["taskId"])
             return

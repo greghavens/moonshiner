@@ -1,24 +1,19 @@
 Set-StrictMode -Version Latest
 
 function New-VcfVcenterCloneInventoryClient {
-    [CmdletBinding(DefaultParameterSetName = 'Token')]
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory, ParameterSetName = 'Connection')]
-        [object] $Connection,
-
-        [Parameter(Mandatory, ParameterSetName = 'Token')]
-        [Parameter(ParameterSetName = 'Connection')]
+        [Parameter(Mandatory)]
         [uri] $Server,
 
-        [Parameter(Mandatory, ParameterSetName = 'Token')]
+        [Parameter(Mandatory)]
         [string] $SessionToken,
 
-        [Parameter(ParameterSetName = 'Token')]
         [switch] $SkipCertificateCheck
     )
 
     throw [NotImplementedException]::new(
-        'TODO: create a VCF PowerCLI-backed vCenter clone-inventory client.'
+        'TODO: create a direct vCenter clone-inventory client.'
     )
 }
 

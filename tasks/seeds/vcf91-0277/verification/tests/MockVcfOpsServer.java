@@ -189,8 +189,8 @@ public final class MockVcfOpsServer implements AutoCloseable {
             return;
         }
         issuedToken = "ops-" + UUID.randomUUID();
-        respond(exchange, 200, "{\"token\":\"" + issuedToken + "\",\"validity\":1893456000000,"
-                + "\"expiresAt\":\"2030-01-01T00:00:00.000Z\",\"roles\":[\"ContentAdmin\"]}");
+        respond(exchange, 200, "{\"token\":\"" + issuedToken + "\",\"validity\":1788104855428,"
+                + "\"expiresAt\":\"Sunday, August 30, 2026 at 3:47:35 PM Coordinated Universal Time\",\"roles\":[]}");
     }
 
     private void getResources(HttpExchange exchange, RecordedRequest recorded, String rawQuery)
@@ -218,7 +218,9 @@ public final class MockVcfOpsServer implements AutoCloseable {
 
         List<Row> matched = new ArrayList<>();
         for (Row row : ESTATE) {
-            if (!names.isEmpty() && !names.contains(row.name())) {
+            // The specification types name as an array but explicitly says the service currently
+            // supports only one element. The live appliance applies the first repeated value.
+            if (!names.isEmpty() && !names.get(0).equals(row.name())) {
                 continue;
             }
             if (!adapterKinds.isEmpty() && !adapterKinds.contains(row.adapterKindKey())) {

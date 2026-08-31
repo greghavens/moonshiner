@@ -1,3 +1,3 @@
-module moonshiner.local/vcf91-0329
+module vcfcredrotate
 
 go 1.22

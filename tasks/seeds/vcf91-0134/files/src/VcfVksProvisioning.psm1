@@ -6,8 +6,7 @@ function New-VcfVksCluster {
     Creates a VKS cluster after validating its Supervisor namespace.
 
     .DESCRIPTION
-    This scaffold is intentionally incomplete. Implement the contract described
-    in docs/contract.json and the task instructions.
+    This scaffold is intentionally incomplete. Implement the task requirements.
     #>
     [CmdletBinding(
         DefaultParameterSetName = 'Inventory',
@@ -47,11 +46,14 @@ function New-VcfVksCluster {
 
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
-        [string] $VmClass,
+        [hashtable] $TopologyVariables,
 
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
-        [string] $StorageClass,
+        [string] $WorkerClass,
+
+        [ValidateNotNullOrEmpty()]
+        [string] $WorkerName = 'workers',
 
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
@@ -62,10 +64,10 @@ function New-VcfVksCluster {
         [string] $KubeBearerToken,
 
         [ValidateRange(1, 100)]
-        [Nullable[int]] $ControlPlaneReplicas,
+        [int] $ControlPlaneReplicas = 3,
 
-        [ValidateRange(0, 1000)]
-        [Nullable[int]] $WorkerReplicas,
+        [ValidateRange(1, 1000)]
+        [int] $WorkerReplicas = 3,
 
         [string[]] $PodCidrBlocks,
 

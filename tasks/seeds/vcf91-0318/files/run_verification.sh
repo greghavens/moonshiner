@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the protected contract verifier against the loopback mock.
+# Runs the task's checks.
 # Standard library only; no network access beyond 127.0.0.1.
 set -euo pipefail
 cd "$(dirname "$0")"

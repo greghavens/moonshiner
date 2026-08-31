@@ -438,6 +438,65 @@ func TestRequestWireShape(t *testing.T) {
 	}
 }
 
+func TestCloseReleasesTheCurrentToken(t *testing.T) {
+	t.Run("unused client closes without acquiring", func(t *testing.T) {
+		srv := startMock(t, mock.Script{Resources: inventory})
+		client := newClient(t, srv, "")
+		if err := client.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if got := len(srv.Requests()); got != 0 {
+			t.Fatalf("unused Close sent %d requests, want none", got)
+		}
+		if _, err := client.ListAllResources(context.Background(), opsapi.ResourceFilter{}); err == nil {
+			t.Fatal("ListAllResources after Close succeeded, want a closed-client error")
+		}
+		if got := len(srv.Requests()); got != 0 {
+			t.Fatalf("operation after Close sent %d requests, want none", got)
+		}
+	})
+
+	t.Run("active token is released exactly once", func(t *testing.T) {
+		srv := startMock(t, mock.Script{Resources: inventory})
+		client := newClient(t, srv, "")
+		if _, err := client.ListAllResources(context.Background(), opsapi.ResourceFilter{}); err != nil {
+			t.Fatalf("ListAllResources: %v", err)
+		}
+		if err := client.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		releases := srv.RequestsFor("releaseToken")
+		if len(releases) != 1 {
+			t.Fatalf("releaseToken called %d times, want 1", len(releases))
+		}
+		release := releases[0]
+		if release.Method != http.MethodPost || release.Path != "/suite-api/api/auth/token/release" {
+			t.Errorf("releaseToken route = %s %s, want POST /suite-api/api/auth/token/release", release.Method, release.Path)
+		}
+		if got := release.Header.Get("Authorization"); got != mock.AuthScheme+" ops-token-1" {
+			t.Errorf("releaseToken Authorization = %q, want %q", got, mock.AuthScheme+" ops-token-1")
+		}
+		if len(release.Body) != 0 {
+			t.Errorf("releaseToken sent a %d-byte body, want none", len(release.Body))
+		}
+		if got := release.Header.Get("Content-Type"); got != "" {
+			t.Errorf("releaseToken Content-Type = %q, want none", got)
+		}
+		assertJSONHeaders(t, release)
+
+		if err := client.Close(context.Background()); err != nil {
+			t.Fatalf("second Close: %v", err)
+		}
+		if got := len(srv.RequestsFor("releaseToken")); got != 1 {
+			t.Errorf("releaseToken called %d times after a second Close, want 1", got)
+		}
+		if _, err := client.ListAllResources(context.Background(), opsapi.ResourceFilter{}); err == nil {
+			t.Fatal("ListAllResources after Close succeeded, want a closed-client error")
+		}
+	})
+}
+
 // TestPropertyBatching checks how samples are grouped and split.
 func TestPropertyBatching(t *testing.T) {
 	cases := []struct {

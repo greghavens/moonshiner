@@ -4,6 +4,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.List;
 import java.util.Objects;
 
@@ -12,10 +13,17 @@ import java.util.Objects;
  * docs/contract.json. No third-party JSON or HTTP dependencies are used.
  */
 public final class NsxPolicyClient {
-    public interface AccessTokenProvider {
-        String currentToken();
+    public record BasicCredentials(String username, String password) {
+        public BasicCredentials {
+            Objects.requireNonNull(username, "username");
+            Objects.requireNonNull(password, "password");
+        }
+    }
 
-        String refreshToken() throws IOException;
+    public interface BasicCredentialProvider {
+        BasicCredentials currentCredentials();
+
+        BasicCredentials refreshCredentials() throws IOException;
     }
 
     public record Condition(
@@ -44,12 +52,12 @@ public final class NsxPolicyClient {
     }
 
     private final URI endpoint;
-    private final AccessTokenProvider tokens;
+    private final BasicCredentialProvider credentials;
     private final HttpClient http;
 
-    public NsxPolicyClient(URI endpoint, AccessTokenProvider tokens) {
+    public NsxPolicyClient(URI endpoint, BasicCredentialProvider credentials) {
         this.endpoint = Objects.requireNonNull(endpoint, "endpoint");
-        this.tokens = Objects.requireNonNull(tokens, "tokens");
+        this.credentials = Objects.requireNonNull(credentials, "credentials");
         this.http = HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_1_1)
                 .build();
@@ -62,7 +70,7 @@ public final class NsxPolicyClient {
                 "PATCH",
                 groupUri(domainId, groupId),
                 groupJson(group),
-                tokens.currentToken());
+                credentials.currentCredentials());
         requireSuccess(response);
     }
 
@@ -72,16 +80,25 @@ public final class NsxPolicyClient {
                 "GET",
                 groupUri(domainId, groupId),
                 null,
-                tokens.currentToken());
+                credentials.currentCredentials());
+        if (response.statusCode() == 403) {
+            response = send("GET", groupUri(domainId, groupId), null,
+                    credentials.refreshCredentials());
+        }
         requireSuccess(response);
         return response.body();
     }
 
-    private HttpResponse<String> send(String method, URI uri, String body, String token)
+    private HttpResponse<String> send(
+            String method, URI uri, String body, BasicCredentials credential)
             throws IOException, InterruptedException {
+        validateCredentials(credential);
+        String encoded = Base64.getEncoder().encodeToString(
+                (credential.username() + ":" + credential.password())
+                        .getBytes(StandardCharsets.UTF_8));
         HttpRequest.Builder request = HttpRequest.newBuilder(uri)
                 .header("Accept", "application/json")
-                .header("Authorization", "Bearer " + token);
+                .header("Authorization", "Basic " + encoded);
         if (body == null) {
             request.GET();
         } else {
@@ -89,6 +106,16 @@ public final class NsxPolicyClient {
             request.method(method, HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
         }
         return http.send(request.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+    }
+
+    private static void validateCredentials(BasicCredentials credential) {
+        Objects.requireNonNull(credential, "credential");
+        if (credential.username().isBlank() || credential.password().isBlank()
+                || credential.username().contains(":")
+                || credential.username().contains("\r") || credential.username().contains("\n")
+                || credential.password().contains("\r") || credential.password().contains("\n")) {
+            throw new IllegalArgumentException("invalid Basic credentials");
+        }
     }
 
     private URI groupUri(String domainId, String groupId) {

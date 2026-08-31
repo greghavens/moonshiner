@@ -15,10 +15,10 @@ from urllib.parse import quote
 
 PROJECT = Path(__file__).resolve().parents[1]
 PROTECTED_HASHES = {
-    "docs/contract.json": "ff59ae61f086d03b1dc4ba49c51d54c035c49a50f0a3cb59d1b79b2ea008fcf4",
+    "docs/contract.json": "cea9abe4763f450e46dc86c996aff3c4232d429b80bdfd30fb00337372488a2a",
     "docs/official_sources.json": "b468dddd175f22e98fa06823a4f05233858da1aab7808f88a0b16ed6b4a4b0d7",
     "tests/TestMain.java": "be49d63f06e5daa667a0a7861d954b6a20d3e03d02db704ac45ee2a336a3f567",
-    "tests/mock_server.py": "7d3fcf8bc8f8fd61878ec7835ae897a2243dbd6468f02de04d5917c315ae9ed0",
+    "tests/mock_server.py": "0e4576b7f34d70a1fce9a464914b73314f757187237783fa983c235bd389b542",
 }
 
 

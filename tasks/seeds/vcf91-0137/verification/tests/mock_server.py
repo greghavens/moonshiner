@@ -82,6 +82,7 @@ class ContractServer(ThreadingHTTPServer):
         self.collection_calls = 0
         self.poll_calls = 0
         self.created = False
+        self.namespace_list_calls = 0
 
     def match_route(
         self, method: str, path: str
@@ -185,6 +186,13 @@ class Handler(BaseHTTPRequestHandler):
         decoded = tuple(unquote(value) for value in captures)
 
         if name == "namespace.listAuthorized":
+            self.server.namespace_list_calls += 1
+            if self.server.namespace_list_calls == 1:
+                self._json(
+                    200,
+                    [{"control_plane_api_server_port": 6443, "master_host": "", "namespace": ""}],
+                )
+                return
             self._json(
                 200,
                 [
@@ -258,6 +266,14 @@ class Handler(BaseHTTPRequestHandler):
                 "name": name,
                 "namespace": self.server.config["namespace"],
                 "uid": self.server.config["cluster_uids"][name],
+            },
+            "spec": {
+                "topology": {
+                    "classRef": {
+                        "name": self.server.config["cluster_class"],
+                    },
+                    "version": self.server.config["kubernetes_version"],
+                }
             },
             "status": {
                 "phase": phase,

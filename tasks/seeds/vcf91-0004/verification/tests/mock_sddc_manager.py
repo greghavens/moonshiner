@@ -19,7 +19,7 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 PINNED_COMMIT = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
 PINNED_SPEC_PATH = "specifications/sddc-manager/sddc-manager-openapi.json"
-EXPECTED_OPERATION_IDS = {"createToken", "updateDepotSettings"}
+EXPECTED_OPERATION_IDS = {"createToken", "updateServicesConfig"}
 
 
 @dataclass(frozen=True)
@@ -78,7 +78,12 @@ class MockState:
         self.password = "pw-" + secrets.token_urlsafe(15)
         self.access_token = "at-" + secrets.token_urlsafe(20)
         self.refresh_token = "rt-" + secrets.token_urlsafe(18)
-        self.download_token = "dl-" + secrets.token_hex(12)
+        self.service_name = "VCF Depot"
+        self.service_type = "VCF_DEPOT"
+        self.service_key = "depot-" + secrets.token_hex(12)
+        self.node_name = "VCF Depot"
+        self.address_type = "Fqdn"
+        self.address_value = "depot-" + secrets.token_hex(8) + ".example.test"
         self.desired_canonical: bytes | None = None
         self.effect_count = 0
         self.put_count = 0
@@ -189,8 +194,8 @@ class ContractHandler(BaseHTTPRequestHandler):
     ) -> tuple[int, Any]:
         if operation_id == "createToken":
             return self._create_token(body)
-        if operation_id == "updateDepotSettings":
-            return self._update_depot(body)
+        if operation_id == "updateServicesConfig":
+            return self._update_services(body)
         return 500, self._error("HANDLER_MISSING", "Handler missing", "handler")
 
     def _create_token(self, body: bytes) -> tuple[int, Any]:
@@ -206,7 +211,7 @@ class ContractHandler(BaseHTTPRequestHandler):
             return 400, self._error(
                 "INVALID_CREDENTIALS", "Invalid loopback credentials", "auth"
             )
-        return 201, {
+        return 200, {
             "accessToken": self.server.state.access_token,
             "refreshToken": {"id": self.server.state.refresh_token},
         }
@@ -220,7 +225,7 @@ class ContractHandler(BaseHTTPRequestHandler):
             )
         return 200, {"version": self.server.state.contract["derived_from"]["info_version"]}
 
-    def _update_depot(self, body: bytes) -> tuple[int, Any]:
+    def _update_services(self, body: bytes) -> tuple[int, Any]:
         if not self._authorized():
             return 401, self._error("UNAUTHORIZED", "Bearer token required", "auth")
         try:
@@ -228,24 +233,33 @@ class ContractHandler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError):
             return 400, self._error("INVALID_JSON", "Malformed JSON", "json")
 
-        account_schema = self.server.state.contract["schemas"]["DepotAccount"]
-        allowed_account = set(account_schema["properties"])
-        if not isinstance(payload, dict) or set(payload) != {"vmwareAccount"}:
+        if not isinstance(payload, dict) or set(payload) != {"services"}:
             return 400, self._error(
                 "WIRE_SHAPE_MISMATCH", "Unexpected top-level members", "shape"
             )
-        account = payload.get("vmwareAccount")
-        if not isinstance(account, dict) or not set(account).issubset(allowed_account):
+        expected = {
+            "services": [
+                {
+                    "name": self.server.state.service_name,
+                    "type": self.server.state.service_type,
+                    "key": self.server.state.service_key,
+                    "nodes": [
+                        {
+                            "name": self.server.state.node_name,
+                            "addresses": [
+                                {
+                                    "type": self.server.state.address_type,
+                                    "value": self.server.state.address_value,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+        if payload != expected:
             return 400, self._error(
-                "WIRE_SHAPE_MISMATCH", "Unexpected account members", "shape"
-            )
-        if account.get("downloadToken") != self.server.state.download_token:
-            return 400, self._error(
-                "WIRE_SHAPE_MISMATCH", "Download token is missing", "shape"
-            )
-        if any(value in (None, "", [], {}) for value in account.values()):
-            return 400, self._error(
-                "WIRE_SHAPE_MISMATCH", "Empty account values are not allowed", "shape"
+                "WIRE_SHAPE_MISMATCH", "Unexpected services configuration", "shape"
             )
 
         canonical = json.dumps(
@@ -260,11 +274,11 @@ class ContractHandler(BaseHTTPRequestHandler):
 
         if put_number == 1:
             return 500, self._error(
-                "DEPOT_UPDATE_TRANSIENT",
+                "SERVICES_CONFIG_TRANSIENT",
                 "Desired state was applied before a transient failure",
                 "transient",
             )
-        return 202, payload
+        return 200, payload
 
     def _authorized(self) -> bool:
         expected = f"Bearer {self.server.state.access_token}"
@@ -311,7 +325,12 @@ def main() -> int:
         "username": state.username,
         "password": state.password,
         "accessToken": state.access_token,
-        "downloadToken": state.download_token,
+        "serviceName": state.service_name,
+        "serviceType": state.service_type,
+        "serviceKey": state.service_key,
+        "nodeName": state.node_name,
+        "addressType": state.address_type,
+        "addressValue": state.address_value,
     }
     write_atomic(runtime_info, json.dumps(info, separators=(",", ":")))
     write_atomic(port_file, str(server.server_address[1]))

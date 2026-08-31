@@ -14,7 +14,7 @@ function Get-VcfDomainClusterMap {
     )
 
     throw [System.NotImplementedException]::new(
-        'Implement the contract-pinned refresh-safe domain and cluster map.'
+        'Implement the focused refresh-safe domain and cluster map.'
     )
 }
 

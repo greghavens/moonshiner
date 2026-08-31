@@ -192,10 +192,10 @@ class ContractHandler(BaseHTTPRequestHandler):
             query = parse_qs(raw_query, keep_blank_values=True, strict_parsing=True)
         except ValueError:
             return 400, error_body("WIRE_SHAPE", "query is malformed")
-        expected_page = len(state.successful_pages)
+        expected_page = len(state.successful_pages) + 1
         expected_keys = (
             {"pageSize"}
-            if expected_page == 0
+            if expected_page == 1
             else {"pageNumber", "pageSize"}
         )
         if body or set(query) != expected_keys:
@@ -205,7 +205,7 @@ class ContractHandler(BaseHTTPRequestHandler):
         if query["pageSize"][0] != str(state.page_size):
             return 400, error_body("WIRE_SHAPE", "pageSize changed")
 
-        page_number = 0
+        page_number = 1
         if "pageNumber" in query:
             try:
                 page_number = int(query["pageNumber"][0])
@@ -214,7 +214,7 @@ class ContractHandler(BaseHTTPRequestHandler):
         if page_number != expected_page:
             return 409, error_body("PAGE_SEQUENCE", "page sequence changed")
 
-        start = page_number * state.page_size
+        start = (page_number - 1) * state.page_size
         elements = state.tasks[start : start + state.page_size]
         state.successful_pages.append(page_number)
         return 200, {

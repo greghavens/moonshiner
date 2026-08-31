@@ -1,19 +1,21 @@
 Set-StrictMode -Version Latest
 
-function Set-VcfDepotSettingsRetrySafe {
+function Set-VcfServicesConfigRetrySafe {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] [object] $Server,
-        [Parameter(Mandatory)] [string] $DownloadToken,
-        [string] $Username,
-        [securestring] $Password,
-        [string] $DownloadActivationCode,
+        [Parameter(Mandatory)] [string] $ServiceName,
+        [Parameter(Mandatory)] [string] $ServiceType,
+        [Parameter(Mandatory)] [string] $ServiceKey,
+        [Parameter(Mandatory)] [string] $NodeName,
+        [Parameter(Mandatory)] [string] $AddressType,
+        [Parameter(Mandatory)] [string] $AddressValue,
         [ValidateRange(1, 2147483647)] [int] $MaxAttempts = 2
     )
 
     throw [System.NotImplementedException]::new(
-        'Implement the contract-pinned VMware SDK depot update.'
+        'Implement the focused VMware SDK services-config update.'
     )
 }
 
-Export-ModuleMember -Function 'Set-VcfDepotSettingsRetrySafe'
+Export-ModuleMember -Function 'Set-VcfServicesConfigRetrySafe'

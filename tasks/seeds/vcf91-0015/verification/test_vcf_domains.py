@@ -174,9 +174,9 @@ def verify_complete_export_and_unset_omission():
         check(
             [entry["target"] for entry in log]
             == [
-                "/v1/domains?pageNumber=0&pageSize=2",
                 "/v1/domains?pageNumber=1&pageSize=2",
                 "/v1/domains?pageNumber=2&pageSize=2",
+                "/v1/domains?pageNumber=3&pageSize=2",
             ],
             "exact unfiltered request targets and no empty optionals",
         )
@@ -241,7 +241,7 @@ def verify_filter_wire_shape():
             == (
                 "/v1/domains?type=VI&name=alpha&vcFqdn=vc-alpha.lab.local"
                 "&vcInstanceId=instance%2F01&isManagementSsoDomain=false"
-                "&pageNumber=0&pageSize=10&useCache=false"
+                "&pageNumber=1&pageSize=10&useCache=false"
             ),
             "exact filter names, order, escaping, and false encoding",
         )
@@ -308,7 +308,7 @@ def verify_pagination_error():
     malformed = {
         "elements": [DOMAINS[0]],
         "pageMetadata": {
-            "pageNumber": 1,
+            "pageNumber": 2,
             "pageSize": 1,
             "totalElements": 1,
             "totalPages": 1,
@@ -326,7 +326,7 @@ def verify_pagination_error():
     incomplete = {
         "elements": [],
         "pageMetadata": {
-            "pageNumber": 0,
+            "pageNumber": 1,
             "pageSize": 0,
             "totalElements": 1,
             "totalPages": 1,
@@ -344,7 +344,7 @@ def verify_pagination_error():
     wrong_size = {
         "elements": [DOMAINS[0]],
         "pageMetadata": {
-            "pageNumber": 0,
+            "pageNumber": 1,
             "pageSize": 2,
             "totalElements": 1,
             "totalPages": 1,
@@ -362,7 +362,7 @@ def verify_pagination_error():
     boolean_metadata = {
         "elements": [],
         "pageMetadata": {
-            "pageNumber": 0,
+            "pageNumber": 1,
             "pageSize": 0,
             "totalElements": False,
             "totalPages": 0,
@@ -383,7 +383,7 @@ def verify_pagination_error():
             {
                 "elements": [DOMAINS[0]],
                 "pageMetadata": {
-                    "pageNumber": 0,
+                    "pageNumber": 1,
                     "pageSize": 1,
                     "totalElements": 2,
                     "totalPages": 2,
@@ -395,7 +395,7 @@ def verify_pagination_error():
             {
                 "elements": [DOMAINS[1]],
                 "pageMetadata": {
-                    "pageNumber": 1,
+                    "pageNumber": 2,
                     "pageSize": 1,
                     "totalElements": 3,
                     "totalPages": 2,

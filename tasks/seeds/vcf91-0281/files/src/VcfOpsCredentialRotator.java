@@ -5,10 +5,10 @@ import java.util.Map;
  * Dependency-free, single-file client for the VMware Cloud Foundation
  * Operations 9.1 API.
  *
- * It performs a drain-safe rotation of an adapter credential: the replacement
- * credential is stood up alongside the outgoing one, every adapter instance is
- * repointed at it, and the outgoing credential is retired only once nothing is
- * using it any more.
+ * It performs an association-safe rotation of an adapter credential: the
+ * replacement is stood up alongside the outgoing one, every adapter instance
+ * is repointed at it, and the outgoing credential is retired only after the
+ * appliance reports no remaining association.
  *
  * The operations, paths, base path, authorization header and request body
  * shapes this client must produce are pinned in docs/contract.json, which is
@@ -44,12 +44,12 @@ public final class VcfOpsCredentialRotator {
 
     /**
      * Rotate {@code oldCredentialId} onto a fresh credential instance without
-     * stranding in-flight work on the outgoing secret.
+     * deleting a credential that an adapter association still uses.
      *
      * @param oldCredentialId   identifier of the credential instance to retire
      * @param newCredentialName name for the replacement credential instance
      * @param newFields         credential field name to value, in order
-     * @param maxDrainPolls     upper bound on drain polls before giving up
+     * @param maxDrainPolls     upper bound on association-confirmation polls
      * @return what the rotation did
      */
     public RotationResult rotate(String oldCredentialId, String newCredentialName,

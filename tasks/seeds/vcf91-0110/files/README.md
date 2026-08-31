@@ -1,21 +1,11 @@
 # Resumable vCenter inventory client
 
-Implement package `example.com/vcfinventory/vcenter` using only the Go standard
-library. The reduced VCF 9.1 wire contract in
-[`docs/contract.json`](docs/contract.json) was projected directly from
-`specifications/vsphere/openapi/automation/vcenter.yaml` in VMware's
-Apache-2.0 `vmware/vcf-api-specs` repository. Its immutable source commit and
-the exact operationIds are recorded in
-[`docs/official_sources.json`](docs/official_sources.json). The YAML
-specification, not a rendered documentation page, is authoritative.
-
-The supplied `internal/mockvcenter` package starts an ephemeral IPv4 loopback
-server, serves only the three operations named by the focused contract, and
-offers a race-safe request log. Tests must not contact a live VMware endpoint.
+Implement package `example.com/vcfinventory/vcenter` for the VCF 9.1 vSphere
+Automation API using only the Go standard library.
 
 ## Required API
 
-The protected `vcenter/types.go` declares all public data types. Implement:
+`vcenter/types.go` declares all public data types. Implement:
 
 ```go
 func NewClient(
@@ -81,7 +71,7 @@ the caller's element order. Percent-encode UTF-8 values using RFC 3986 query
 encoding (`%20`, never `+`, for a space).
 
 Require exactly HTTP 200 and validate the required summary fields and VM power
-state. Optional `cpu_count` and `memory_size_mib` may be absent or JSON null;
+state. Optional `cpu_count` and `memory_size_MiB` may be absent or JSON null;
 when present, each must be an integer. Return fresh slices sorted
 deterministically by `(name, datacenter)` for datacenters and `(name, vm)` for
 VMs.
@@ -108,8 +98,7 @@ tokens, response payloads, response bytes, or underlying transport error text.
 Always close response bodies.
 
 Add table-driven tests covering filter validation and both unset and populated
-wire shapes. The protected verifier adds further contract, expiry,
-concurrency, retained-work, and exact request-log checks. Run:
+wire shapes. Run:
 
 ```sh
 go test -race ./...

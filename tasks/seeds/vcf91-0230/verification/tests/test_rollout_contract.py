@@ -274,6 +274,18 @@ class Rollout:
 
 
 class ContractTest(unittest.TestCase):
+    def test_plan_rejects_non_uuid_correlation_before_a_request(self):
+        from vcf_lcm.rollout import PlanError, load_plan
+
+        plan = load_json(PLAN_PATH)
+        plan["correlationId"] = "not-a-uuid"
+        with tempfile.TemporaryDirectory(prefix="invalid-vcf-plan-") as directory:
+            path = os.path.join(directory, "plan.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(plan, handle)
+            with self.assertRaises(PlanError):
+                load_plan(path)
+
     rollout = None
     setup_error = None
 

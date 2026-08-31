@@ -42,6 +42,11 @@ EXPECTED_OPERATIONS = [
         "method": "GET",
         "path": "/v1/credentials/tasks/{id}/resource-credentials",
     },
+    {
+        "operationId": "getCredentials",
+        "method": "GET",
+        "path": "/v1/credentials",
+    },
 ]
 CREATED = "2026-07-28T18:00:00.000Z"
 
@@ -225,6 +230,7 @@ class RotationTests(unittest.TestCase):
         self.old_secret = "old-" + secrets.token_urlsafe(15)
         self.new_secret = "new-" + secrets.token_urlsafe(15)
         self.resource_id = "resource-" + secrets.token_hex(8)
+        self.resource_name = "vc-" + secrets.token_hex(5)
         self.username = "svc-" + secrets.token_hex(5)
         self.task_id = "rotation/" + secrets.token_hex(7) + " queued"
 
@@ -282,22 +288,43 @@ class RotationTests(unittest.TestCase):
                             200,
                             [
                                 {
-                                    "resourceId": self.resource_id,
+                                    "resourceName": self.resource_name,
                                     "resourceType": "VCENTER",
                                     "credentials": [
                                         {
                                             "username": "decoy-"
                                             + secrets.token_hex(4),
-                                            "password": "decoy-"
-                                            + secrets.token_urlsafe(8),
                                         },
                                         {
                                             "username": self.username,
-                                            "password": self.new_secret,
                                         }
                                     ],
                                 }
                             ],
+                        )
+                    ],
+                )
+                server.script(
+                    "getCredentials",
+                    [
+                        (
+                            200,
+                            {
+                                "elements": [
+                                    {
+                                        "username": self.username,
+                                        "credentialType": "SSO",
+                                        "accountType": "SERVICE",
+                                        "password": self.new_secret,
+                                        "resource": {
+                                            "resourceId": self.resource_id,
+                                            "name": self.resource_name,
+                                            "type": "VCENTER",
+                                        },
+                                    }
+                                ],
+                                "pageMetadata": {"totalElements": 1},
+                            },
                         )
                     ],
                 )
@@ -446,6 +473,15 @@ class RotationTests(unittest.TestCase):
                         "/resource-credentials"
                     ),
                 ),
+                (
+                    "getCredentials",
+                    "GET",
+                    (
+                        "/v1/credentials?resourceName="
+                        + self.resource_name
+                        + "&resourceType=VCENTER"
+                    ),
+                ),
             ],
         )
         patch_request = requests[0]
@@ -488,7 +524,7 @@ class RotationTests(unittest.TestCase):
         self.assertNotIn("credentialType", credential_wire)
         self.assertNotIn("accountType", credential_wire)
         self.assertNotIn("password", credential_wire)
-        for request in requests[1:]:
+        for request in requests[1:4]:
             self.assertEqual(
                 request["headers"]["authorization"],
                 f"Bearer {self.token}",
@@ -500,6 +536,21 @@ class RotationTests(unittest.TestCase):
             self.assertNotIn("content-type", request["headers"])
             self.assertEqual(request["body"], "")
             self.assertEqual(request["query"], "")
+        credentials_request = requests[4]
+        self.assertEqual(
+            credentials_request["headers"]["authorization"],
+            f"Bearer {self.token}",
+        )
+        self.assertEqual(
+            credentials_request["headers"]["accept"],
+            "application/json",
+        )
+        self.assertNotIn("content-type", credentials_request["headers"])
+        self.assertEqual(credentials_request["body"], "")
+        self.assertEqual(
+            credentials_request["query"],
+            "resourceName=" + self.resource_name + "&resourceType=VCENTER",
+        )
 
     def test_failed_task_reopens_with_old_secret_and_preserves_task(
         self,
@@ -673,16 +724,37 @@ class RotationTests(unittest.TestCase):
                             200,
                             [
                                 {
-                                    "resourceId": self.resource_id,
+                                    "resourceName": self.resource_name,
                                     "resourceType": "VCENTER",
                                     "credentials": [
                                         {
                                             "username": self.username,
-                                            "password": "",
                                         }
                                     ],
                                 }
                             ],
+                        )
+                    ],
+                )
+                server.script(
+                    "getCredentials",
+                    [
+                        (
+                            200,
+                            {
+                                "elements": [
+                                    {
+                                        "username": self.username,
+                                        "password": "",
+                                        "resource": {
+                                            "resourceId": self.resource_id,
+                                            "name": self.resource_name,
+                                            "type": "VCENTER",
+                                        },
+                                    }
+                                ],
+                                "pageMetadata": {"totalElements": 1},
+                            },
                         )
                     ],
                 )
@@ -696,7 +768,7 @@ class RotationTests(unittest.TestCase):
                     )
                 requests = server.read_request_log()
 
-        self.assertEqual(len(requests), 3)
+        self.assertEqual(len(requests), 4)
         with credential.lease() as current:
             self.assertEqual(current, self.old_secret)
 

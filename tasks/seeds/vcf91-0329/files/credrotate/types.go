@@ -1,5 +1,5 @@
 // Package credrotate rotates the stored credentials of a VCF Automation cloud
-// account over the focused contract recorded in docs/contract.json.
+// account over the focused API contract.
 //
 // Two different secrets appear in this package and they must not be confused:
 //

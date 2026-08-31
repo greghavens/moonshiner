@@ -89,6 +89,8 @@ public final class TestMain {
         List<NsxPolicyClient.ListOptions> invalid =
                 List.of(
                         new NsxPolicyClient.ListOptions(
+                                0, null, null, null),
+                        new NsxPolicyClient.ListOptions(
                                 -1, null, null, null),
                         new NsxPolicyClient.ListOptions(
                                 1001, null, null, null),

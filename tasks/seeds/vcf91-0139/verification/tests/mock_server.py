@@ -59,11 +59,13 @@ class ContractState:
         ):
             raise ValueError("the verifier fixture requires two Cluster values")
         self.subject_token = args.subject_token
+        self.audience = args.audience
+        self.requested_token_type = args.requested_token_type
+        self.kubernetes_bearer_token = args.kubernetes_bearer_token
         self.old_token = args.old_access_token
         self.new_token = args.new_access_token
         self.token_issues = 0
-        self.successful_patches = 0
-        self.old_expired = False
+        self.namespace_calls = 0
         self.authority = ""
         self.lock = threading.Lock()
 
@@ -177,7 +179,7 @@ class Handler(BaseHTTPRequestHandler):
         if operation is None:
             return self._json(404, {"error": "operation_not_in_contract"})
         if operation == "vcenter.token.issue":
-            return self._issue_token()
+            return self._issue_token(body)
         if operation == "vcenter.namespace.listAuthorized":
             return self._list_namespaces()
         if operation == "kubernetes.cluster.get":
@@ -186,17 +188,50 @@ class Handler(BaseHTTPRequestHandler):
             return self._patch_cluster(values, body)
         return self._json(404, {"error": "operation_not_in_contract"})
 
-    def _issue_token(self) -> tuple[int, bytes, str]:
+    def _issue_token(self, body: bytes) -> tuple[int, bytes, str]:
         authorization = self.headers.get("Authorization")
         if authorization != f"Bearer {self.state.subject_token}":
             return self._json(400, {"error": "invalid_request"})
+        try:
+            fields = urllib.parse.parse_qsl(
+                body.decode("ascii"), keep_blank_values=True
+            )
+        except UnicodeDecodeError:
+            return self._json(400, {"error": "invalid_request"})
+        expected = [
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("audience", self.state.audience),
+            ("requested_token_type", self.state.requested_token_type),
+            ("subject_token", self.state.subject_token),
+            (
+                "subject_token_type",
+                "urn:ietf:params:oauth:token-type:jwt",
+            ),
+        ]
+        if fields != expected:
+            return self._json(400, {"error": "invalid_request"})
         with self.state.lock:
+            issue_number = self.state.token_issues
+            self.state.token_issues += 1
+            if issue_number == 0:
+                return self._json(
+                    400,
+                    {
+                        "error": "invalid_request",
+                        "error_description": (
+                            "Unknown token type: "
+                            "urn:ietf:params:oauth:token-type:jwt"
+                        ),
+                    },
+                )
             token = (
                 self.state.old_token
-                if self.state.token_issues == 0
+                if issue_number == 1
                 else self.state.new_token
             )
-            self.state.token_issues += 1
         return self._json(
             200,
             {
@@ -211,8 +246,21 @@ class Handler(BaseHTTPRequestHandler):
         if token not in (self.state.old_token, self.state.new_token):
             return self._json(401, {"error_type": "UNAUTHENTICATED"})
         with self.state.lock:
-            if token == self.state.old_token and self.state.old_expired:
+            self.state.namespace_calls += 1
+            namespace_call = self.state.namespace_calls
+            if token == self.state.old_token:
                 return self._json(401, {"error_type": "UNAUTHENTICATED"})
+        if namespace_call == 2:
+            return self._json(
+                200,
+                [
+                    {
+                        "control_plane_api_server_port": 6443,
+                        "master_host": "",
+                        "namespace": "",
+                    }
+                ],
+            )
         return self._json(
             200,
             [
@@ -234,13 +282,7 @@ class Handler(BaseHTTPRequestHandler):
         return value[7:]
 
     def _authorized_for_kubernetes(self) -> bool:
-        token = self._bearer()
-        if token not in (self.state.old_token, self.state.new_token):
-            return False
-        with self.state.lock:
-            return not (
-                token == self.state.old_token and self.state.old_expired
-            )
+        return self._bearer() == self.state.kubernetes_bearer_token
 
     def _cluster_index(self, values: dict[str, str]) -> int | None:
         if values.get("namespace") != self.state.namespace:
@@ -278,10 +320,6 @@ class Handler(BaseHTTPRequestHandler):
             patch = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return self._json(422, {"kind": "Status", "reason": "Invalid"})
-        with self.state.lock:
-            self.state.successful_patches += 1
-            if self.state.successful_patches == 1:
-                self.state.old_expired = True
         return self._json(
             200,
             self._cluster_resource(
@@ -334,6 +372,9 @@ def main() -> None:
     parser.add_argument("--before-versions-json", required=True)
     parser.add_argument("--after-versions-json", required=True)
     parser.add_argument("--subject-token", required=True)
+    parser.add_argument("--audience", required=True)
+    parser.add_argument("--requested-token-type", required=True)
+    parser.add_argument("--kubernetes-bearer-token", required=True)
     parser.add_argument("--old-access-token", required=True)
     parser.add_argument("--new-access-token", required=True)
     args = parser.parse_args()

@@ -15,24 +15,25 @@ import (
 )
 
 const (
-	pinnedCommit = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
-	pinnedPath   = "specifications/vcf-installer/vcf-installer-openapi.json"
+	pinnedCommit        = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
+	pinnedInstallerPath = "specifications/vcf-installer/vcf-installer-openapi.json"
+	pinnedManagerPath   = "specifications/sddc-manager/sddc-manager-openapi.json"
 )
 
 type contractDocument struct {
-	Source struct {
+	Sources []struct {
 		RepositoryCommitSHA string `json:"repositoryCommitSha"`
 		SpecPath            string `json:"specPath"`
-		InfoVersion         string `json:"infoVersion"`
-	} `json:"source"`
+	} `json:"sources"`
 	Operations []operation `json:"operations"`
 }
 
 type operation struct {
-	OperationID string `json:"operationId"`
-	Method      string `json:"method"`
-	Path        string `json:"path"`
-	Responses   map[string]struct {
+	OperationID   string `json:"operationId"`
+	Method        string `json:"method"`
+	Path          string `json:"path"`
+	SuccessStatus int    `json:"successStatus"`
+	Responses     map[string]struct {
 		Description string `json:"description"`
 	} `json:"responses"`
 }
@@ -77,8 +78,15 @@ func Start(t testing.TB, contractPath string, scenario Scenario) *Server {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatalf("decode focused contract: %v", err)
 	}
-	if document.Source.RepositoryCommitSHA != pinnedCommit || document.Source.SpecPath != pinnedPath || document.Source.InfoVersion != "9.1.0.0" {
-		t.Fatal("focused contract is not pinned to the VCF Installer 9.1 source")
+	paths := map[string]bool{}
+	for _, source := range document.Sources {
+		if source.RepositoryCommitSHA != pinnedCommit {
+			t.Fatal("focused contract source commit is not pinned")
+		}
+		paths[source.SpecPath] = true
+	}
+	if len(paths) != 2 || !paths[pinnedInstallerPath] || !paths[pinnedManagerPath] {
+		t.Fatal("focused contract must record Installer and SDDC Manager sources")
 	}
 	want := map[string]operation{
 		"updateProxyConfiguration": {
@@ -86,10 +94,10 @@ func Start(t testing.TB, contractPath string, scenario Scenario) *Server {
 			Method:      http.MethodPatch,
 			Path:        "/v1/system/proxy-configuration",
 		},
-		"updateDepotSettings": {
-			OperationID: "updateDepotSettings",
+		"updateServicesConfig": {
+			OperationID: "updateServicesConfig",
 			Method:      http.MethodPut,
-			Path:        "/v1/system/settings/depot",
+			Path:        "/v1/services-config",
 		},
 		"syncDepotMetadata": {
 			OperationID: "syncDepotMetadata",
@@ -119,7 +127,7 @@ func Start(t testing.TB, contractPath string, scenario Scenario) *Server {
 		if !ok {
 			t.Fatalf("failure operation %q is outside focused contract", scenario.FailOperation)
 		}
-		if _, ok := op.Responses[fmt.Sprint(scenario.FailStatus)]; !ok || scenario.FailStatus == http.StatusAccepted {
+		if _, ok := op.Responses[fmt.Sprint(scenario.FailStatus)]; !ok || scenario.FailStatus == op.SuccessStatus {
 			t.Fatalf("failure status %d is not a declared failure for %s", scenario.FailStatus, scenario.FailOperation)
 		}
 	}
@@ -202,22 +210,24 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch operationID {
 	case "updateProxyConfiguration":
-		s.writeJSON(w, http.StatusAccepted, map[string]any{
+		s.writeJSON(w, op.SuccessStatus, map[string]any{
 			"id":                "task-proxy-0213",
 			"name":              "Update Proxy Configuration",
-			"status":            "IN_PROGRESS",
-			"creationTimestamp": "2026-05-13T12:00:00Z",
+			"status":            "COMPLETED_WITH_SUCCESS",
+			"creationTimestamp": "2026-08-30T12:00:00Z",
 		})
-	case "updateDepotSettings":
-		s.writeJSON(w, http.StatusAccepted, map[string]any{
-			"vmwareAccount": map[string]string{
-				"status":  "DEPOT_CONNECTION_SUCCESSFUL",
-				"message": "Credentials accepted",
-			},
-			"depotConfiguration": map[string]bool{"isOfflineDepot": false},
+	case "updateServicesConfig":
+		s.writeJSON(w, op.SuccessStatus, map[string]any{
+			"services": []any{map[string]any{
+				"name": "VCF Depot", "type": "VCF_DEPOT", "key": "depot-service-key",
+				"nodes": []any{map[string]any{
+					"name":      "VCF Depot",
+					"addresses": []any{map[string]string{"type": "Fqdn", "value": "vcf-flt01.vcf.lab"}},
+				}},
+			}},
 		})
 	case "syncDepotMetadata":
-		s.writeJSON(w, http.StatusAccepted, map[string]string{"syncStatus": "IN_PROGRESS"})
+		s.writeJSON(w, op.SuccessStatus, map[string]string{"syncStatus": "SYNC_IN_PROGRESS"})
 	default:
 		panic("unhandled focused operation " + operationID)
 	}
@@ -233,12 +243,12 @@ func failureDocument(operationID string) map[string]string {
 			"remediationMessage": "Correct the proxy endpoint.",
 			"referenceToken":     "ref-proxy-0213",
 		}
-	case "updateDepotSettings":
+	case "updateServicesConfig":
 		return map[string]string{
-			"errorCode":          "VCF_DEPOT_SETTINGS_FAILED",
+			"errorCode":          "VCF_SERVICES_CONFIG_FAILED",
 			"errorType":          "INTERNAL_SERVER_ERROR",
-			"message":            "Depot credentials could not be saved",
-			"remediationMessage": "Verify the activation code.",
+			"message":            "External service configuration could not be saved",
+			"remediationMessage": "Verify the service configuration.",
 			"referenceToken":     "ref-settings-0213",
 		}
 	case "syncDepotMetadata":

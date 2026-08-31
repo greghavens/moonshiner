@@ -25,6 +25,9 @@ public final class VcfBackupClient {
             String sshFingerprint) {
     }
 
+    public record Encryption(String passphrase) {
+    }
+
     public record Task(
             String id,
             String name,
@@ -48,6 +51,7 @@ public final class VcfBackupClient {
      */
     public Task updateBackupConfigurationAndWait(
             BackupLocation location,
+            Encryption encryption,
             int maxPolls,
             Duration pollInterval) throws IOException, InterruptedException {
         // TODO: implement the spec-derived request body, PATCH, and polling loop.

@@ -258,11 +258,26 @@ class ContractRequestHandler(BaseHTTPRequestHandler):
             return
 
         if route["name"] == "getSupervisorNamespace":
+            status = server.next_namespace_status()
+            if status == "NOT_FOUND":
+                self._send_json(
+                    404,
+                    {
+                        "error_type": "NOT_FOUND",
+                        "messages": [
+                            {
+                                "id": "vcenter.wcp.workload.notfound",
+                                "default_message": "Namespace not found.",
+                            }
+                        ],
+                    },
+                )
+                return
             self._send_json(
                 200,
                 {
                     "supervisor": server.supervisor,
-                    "config_status": server.next_namespace_status(),
+                    "config_status": status,
                     "messages": [],
                     "stats": {},
                     "description": "",

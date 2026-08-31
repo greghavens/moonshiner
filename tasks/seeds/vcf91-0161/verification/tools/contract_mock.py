@@ -115,6 +115,15 @@ class ContractHandler(BaseHTTPRequestHandler):
             self._respond(404, {"error": "fixture namespace mismatch"})
             return
         scenario = fixture["scenario"]
+        if scenario == "live_namespace_404":
+            self._respond(404, {
+                "error_type": "NOT_FOUND",
+                "messages": [{
+                    "id": "vcenter.wcp.workload.notfound",
+                    "default_message": "Workload not found.",
+                }],
+            })
+            return
         if scenario == "namespace_not_ready":
             status = "ERROR"
         else:
@@ -159,6 +168,16 @@ class ContractHandler(BaseHTTPRequestHandler):
             self._respond(404, {"error": "fixture namespace mismatch"})
             return
         scenario = fixture["scenario"]
+        if scenario == "live_admission_422":
+            self._respond(422, {
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "reason": "Invalid",
+                "code": 422,
+                "message": "Cluster failed strict server-side admission",
+            })
+            return
         if scenario == "create_rejected":
             self._respond(409, {"message": "fixture conflict contains a secret"})
             return

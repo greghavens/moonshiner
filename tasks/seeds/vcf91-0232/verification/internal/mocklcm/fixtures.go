@@ -59,13 +59,13 @@ const (
 )
 
 // DefaultInventory is the component inventory the mock serves unless a test
-// overrides it. VCF_OPERATIONS_FLEET_MANAGEMENT is already installed, so a plan
+// overrides it. VCF_FLEET_LCM is already installed, so a plan
 // naming it has nothing to do for it.
 func DefaultInventory() []InventoryComponent {
 	return []InventoryComponent{
 		{
 			ID:             "2f0f2a2c-6c1f-4a3e-9a1d-0a5b6c7d8e90",
-			ComponentType:  "VCF_OPERATIONS_FLEET_MANAGEMENT",
+			ComponentType:  "VCF_FLEET_LCM",
 			DeploymentType: "OVA",
 			Version:        "9.1.0.0",
 			FQDN:           "fleet-mgmt.vcf.example.com",
@@ -82,24 +82,24 @@ func DefaultInventory() []InventoryComponent {
 	}
 }
 
-// DefaultDepot is the depot catalogue the mock resolves against. VCF_AUTOMATION
+// DefaultDepot is the depot catalogue the mock resolves against. VCFA
 // resolves to a version but to no binary, which is what makes the resolved entry
 // carry no binaryUrl.
 func DefaultDepot() []DepotEntry {
 	return []DepotEntry{
 		{
-			Component: "VCF_OPERATIONS",
+			Component: "OPS",
 			Version:   "9.1.0.0",
-			BinaryURL: "https://depot.vcf.example.com/PROD/COMP/VCF_OPERATIONS/9.1.0.0/vcf-operations-9.1.0.0.ova",
+			BinaryURL: "https://depot.vcf.example.com/PROD/COMP/OPS/9.1.0.0/vcf-operations-9.1.0.0.ova",
 		},
 		{
-			Component: "VCF_AUTOMATION",
+			Component: "VCFA",
 			Version:   "9.1.0.0",
 		},
 		{
-			Component: "VCF_OPERATIONS_FLEET_MANAGEMENT",
+			Component: "VCF_FLEET_LCM",
 			Version:   "9.1.0.0",
-			BinaryURL: "https://depot.vcf.example.com/PROD/COMP/VCF_OPERATIONS_FLEET_MANAGEMENT/9.1.0.0/vcf-fleet-management-9.1.0.0.ova",
+			BinaryURL: "https://depot.vcf.example.com/PROD/COMP/VCF_FLEET_LCM/9.1.0.0/vcf-fleet-management-9.1.0.0.ova",
 		},
 	}
 }

@@ -134,7 +134,7 @@ func (r Request) SortedQuery() []string {
 type Config struct {
 	// Token is the bearer token the server requires.
 	Token string
-	// Pages holds the task elements for page 0, page 1, ... in order.
+	// Pages holds the task elements for page 1, page 2, ... in order.
 	Pages [][]map[string]any
 	// TotalElements is reported in pageMetadata. Zero means "sum of Pages".
 	TotalElements int
@@ -326,7 +326,7 @@ func (s *Server) handleTasks(r *http.Request) (int, any) {
 	if raw := q.Get(s.contract.Pagination.PageNumberParam); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < s.contract.Pagination.FirstPageNumber {
-			return http.StatusBadRequest, errorBody("pageNumber must be a non-negative integer")
+			return http.StatusBadRequest, errorBody("pageNumber must be a positive integer")
 		}
 		pageNumber = n
 	}
@@ -354,8 +354,9 @@ func (s *Server) handleTasks(r *http.Request) (int, any) {
 	}
 
 	elements := []map[string]any{}
-	if pageNumber < len(s.cfg.Pages) {
-		elements = s.cfg.Pages[pageNumber]
+	pageIndex := pageNumber - s.contract.Pagination.FirstPageNumber
+	if pageIndex >= 0 && pageIndex < len(s.cfg.Pages) {
+		elements = s.cfg.Pages[pageIndex]
 	}
 	total := s.cfg.TotalElements
 	if total == 0 {

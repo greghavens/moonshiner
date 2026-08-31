@@ -194,9 +194,9 @@ public final class TestMain {
         }
         VcenterCredentialRotationClient.ClusterSummary cluster = clusters.get(0);
         checkEquals(label + " cluster", mock.clusterId(), cluster.cluster(), failures);
-        checkEquals(label + " name", "Rotation cluster", cluster.name(), failures);
-        checkEquals(label + " ha_enabled", true, cluster.haEnabled(), failures);
-        checkEquals(label + " drs_enabled", false, cluster.drsEnabled(), failures);
+        checkEquals(label + " name", "VCF-Mgmt-Cluster", cluster.name(), failures);
+        checkEquals(label + " ha_enabled", false, cluster.haEnabled(), failures);
+        checkEquals(label + " drs_enabled", true, cluster.drsEnabled(), failures);
     }
 
     private static void verifyWireLog(

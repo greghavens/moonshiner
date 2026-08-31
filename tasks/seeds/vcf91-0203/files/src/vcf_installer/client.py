@@ -48,8 +48,11 @@ class BundleDownloadSpec:
 class VcfInstallerClient:
     """Client for the two operations in docs/contract.json."""
 
-    def __init__(self, base_url: str, *, request_timeout_seconds: float = 10.0):
+    def __init__(self, base_url: str, access_token: str, *, request_timeout_seconds: float = 10.0):
+        if not isinstance(access_token, str) or not access_token.strip() or "\r" in access_token or "\n" in access_token:
+            raise ValueError("access_token must be a nonblank header-safe string")
         self.base_url = base_url.rstrip("/")
+        self.access_token = access_token
         self.request_timeout_seconds = request_timeout_seconds
 
     def start_bundle_download(

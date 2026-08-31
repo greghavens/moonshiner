@@ -1,7 +1,7 @@
 """VCF Operations report client.
 
-Every method below is a stub. Implement them against docs/contract.json using
-only the Python standard library.
+Every method below is a stub. Implement them using only the Python standard
+library and the official VMware API contract.
 """
 
 from __future__ import annotations
@@ -20,10 +20,10 @@ class VcfOperationsClient:
     """Drives the createReport / getReport / downloadReport workflow.
 
     The client is responsible for the wire shape of every request it sends.
-    docs/contract.json is the authority: it names the five operations that may
-    be called, their methods and paths, the Authorization header format, the
-    request-body properties, and the rule that an optional field the caller did
-    not set is absent from the request rather than present and empty.
+    The official VCF Operations API contract defines the five operations that
+    may be called, their methods and paths, the Authorization header format,
+    the request-body properties, and the rule that an optional field the caller
+    did not set is absent from the request rather than present and empty.
     """
 
     def __init__(

@@ -6,8 +6,8 @@ import (
 )
 
 const (
-	ReadInfraSegmentOperation  = "ReadInfraSegment"
-	PatchInfraSegmentOperation = "PatchInfraSegment"
+	ReadInfraSegmentOperation            = "ReadInfraSegment"
+	CreateOrReplaceInfraSegmentOperation = "CreateOrReplaceInfraSegment"
 )
 
 // Config contains the NSX Policy origin, Basic-auth credentials, and optional
@@ -20,14 +20,14 @@ type Config struct {
 }
 
 // EnableRequest contains the values that the read precheck must confirm and
-// the sole optional property that may be included in the PATCH.
+// the sole optional property that may be changed in the replacement PUT.
 type EnableRequest struct {
 	ExpectedRevision         int32
 	ExpectedConnectivityPath string
 	Description              *string
 }
 
-// Result describes the confirmed transition after a successful PATCH.
+// Result describes the confirmed transition after a successful PUT.
 type Result struct {
 	SegmentID           string
 	Revision            int32

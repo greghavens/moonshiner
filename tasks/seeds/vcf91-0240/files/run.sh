@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compiles the client, starts the loopback SDDC LCM fixture on an ephemeral port,
+# Runs the task's checks.
 # runs the rollout through TestMain, and stops the fixture.
 #
 # Artifacts land in build/:

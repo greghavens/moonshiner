@@ -316,8 +316,8 @@ def make_cluster(
                 "services": {"cidrBlocks": ["10.96.0.0/12"]}
             },
             "topology": {
-                "class": "tanzukubernetescluster",
-                "version": "v1.33.1+vmware.1-fips-vkr.2",
+                "class": "vsphere-9.1.2668",
+                "version": "v1.34.2",
             },
         },
     }
@@ -407,9 +407,20 @@ def verify_wire(
     kubernetes_token: str,
 ) -> None:
     require(
-        len(requests) == 8,
-        f"expected two complete four-request runs, got {len(requests)} requests",
+        len(requests) == 9,
+        f"expected one live-gap discovery and two complete four-request runs, got {len(requests)} requests",
     )
+    live_gap = requests[0]
+    require(
+        (live_gap["operation"], live_gap["method"], live_gap["raw_target"])
+        == (DISCOVERY_OPERATION, "GET", DISCOVERY_PATH),
+        "live blank-summary case did not use exact namespace discovery",
+    )
+    require(
+        live_gap["query_pairs"] == [] and live_gap["body_length"] == 0,
+        "live blank-summary discovery sent a query or body",
+    )
+    requests = requests[1:]
     encoded_namespace = quote(namespace, safe="")
     expected_cluster_path = CLUSTER_PATH.replace(
         "{namespace}",
@@ -542,9 +553,9 @@ def main() -> int:
         require(shutil.which("pwsh") is not None, "PowerShell 7 is required")
 
         run_id = uuid.uuid4().hex[:20]
-        namespace = f"team-{run_id}"
+        namespace = "vmsp-platform"
         distractor = f"other-{uuid.uuid4().hex[:20]}"
-        session_token = f"vc-{secrets.token_urlsafe(32)}"
+        session_token = secrets.token_hex(16)
         kubernetes_token = f"k8s-{secrets.token_urlsafe(36)}"
         markers = [
             f"cursor/{secrets.token_urlsafe(10)} + =&?",
@@ -558,8 +569,8 @@ def main() -> int:
         clusters = [
             make_cluster(
                 namespace,
-                "zulu",
-                str(uuid.uuid4()),
+                "vcf-msr01",
+                "fcccd77e-e4fa-4ab8-a6a2-4dadf2b34212",
                 verification_marker,
             ),
             make_cluster(
@@ -615,6 +626,7 @@ def main() -> int:
                         "markers": markers,
                         "resource_version": secrets.token_hex(12),
                         "pages": pages,
+                        "live_blank_first": True,
                     },
                     separators=(",", ":"),
                 ),

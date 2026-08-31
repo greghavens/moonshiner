@@ -18,6 +18,8 @@ writes a report of what actually happened.
 | `tools/mockserve/`         | runs that mock so the drill can be driven by hand              |
 | `contracttest/`            | the contract test                                              |
 
+The optional `correlationId` in a restore plan must be a bare UUID.
+
 `fixtures/`, `internal/`, `tools/`, `contracttest/`, `go.mod`, `README.md` and
 `verify.sh` are fixed inputs. Do not edit them.
 

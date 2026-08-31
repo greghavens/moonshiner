@@ -75,7 +75,7 @@ public final class TestMain {
     }
 
     static String tasksQuery(String componentId) {
-        return "resourceId=" + componentId + "&resourceType=COMPONENT";
+        return "name=CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW";
     }
 
     // ---------------------------------------------------------------- scenarios
@@ -86,7 +86,7 @@ public final class TestMain {
         String base = mock.start();
         try {
             SddcLcmClient client = new SddcLcmClient(base, MockSddcLcm.BEARER_TOKEN);
-            String key = "corr-alpha-7f31";
+            String key = "aaaaaaaa-aaaa-4aaa-8aaa-000000000001";
 
             // --- A1: first submission, no look-back window supplied.
             int mark = mock.log.size();
@@ -111,7 +111,7 @@ public final class TestMain {
             eq(pre.method, "GET", "A1 getTasks method");
             eq(pre.path, "/v1/tasks", "A1 getTasks path");
             eq(pre.rawQuery, tasksQuery(COMP_VCFA),
-                    "A1 getTasks query is exactly resourceId then resourceType, no pageNumber");
+                    "A1 getTasks query is exactly the live workflow name, no pageNumber");
 
             MockSddcLcm.Entry post = es.get(2);
             assertCommon(post, "A1 submit");
@@ -210,15 +210,15 @@ public final class TestMain {
         String base = mock.start();
         try {
             SddcLcmClient client = new SddcLcmClient(base, MockSddcLcm.BEARER_TOKEN);
-            String key = "corr-beta";
+            String key = "bbbbbbbb-bbbb-4bbb-8bbb-000000000002";
 
             // A longer key that has the real key as a prefix.
-            mock.seedTask(COMP_OPS, "corr-beta-2", "RUNNING", null);
+            mock.seedTask(COMP_OPS, "bbbbbbbb-bbbb-4bbb-8bbb-000000000003", "RUNNING", null);
             // A different key whose human-readable description quotes the real key.
-            mock.seedTask(COMP_OPS, "corr-gamma", "RUNNING",
-                    "Retry requested with correlationId=\"corr-beta\" by operator svc-lcm");
-            // A key held by another component entirely.
-            mock.seedTask(COMP_VCFA, key, "RUNNING", null);
+            mock.seedTask(COMP_OPS, "bbbbbbbb-bbbb-4bbb-8bbb-000000000004", "RUNNING",
+                    "Retry requested with correlationId=\"" + key + "\" by operator svc-lcm");
+            // A different globally unique key held by another component.
+            mock.seedTask(COMP_VCFA, "bbbbbbbb-bbbb-4bbb-8bbb-000000000005", "RUNNING", null);
             // The one true match -- and it was cancelled, so nothing stands.
             String cancelled = mock.seedTask(COMP_OPS, key, "CANCELED", null);
 
@@ -258,7 +258,7 @@ public final class TestMain {
         }
     }
 
-    /** Paging: zero-based, pageNumber omitted on the first page, early stop on a hit. */
+    /** Paging: one-based, pageNumber omitted on the first page, early stop on a hit. */
     static void scenarioPaging() throws Exception {
         MockSddcLcm mock = newMock();
         mock.pageSize = 2;
@@ -266,22 +266,23 @@ public final class TestMain {
         try {
             SddcLcmClient client = new SddcLcmClient(base, MockSddcLcm.BEARER_TOKEN);
 
-            mock.seedTask(COMP_VCFA, "corr-p0", "RUNNING", null);      // page 0
-            mock.seedTask(COMP_VCFA, "corr-p1", "FAILED", null);       // page 0
-            String target = mock.seedTask(COMP_VCFA, "corr-target", "RUNNING", null); // page 1
-            mock.seedTask(COMP_VCFA, "corr-p3", "RUNNING", null);      // page 1
-            mock.seedTask(COMP_VCFA, "corr-p4", "RUNNING", null);      // page 2
+            mock.seedTask(COMP_VCFA, "cccccccc-cccc-4ccc-8ccc-000000000010", "RUNNING", null); // page 1
+            mock.seedTask(COMP_VCFA, "cccccccc-cccc-4ccc-8ccc-000000000011", "FAILED", null); // page 1
+            String targetKey = "cccccccc-cccc-4ccc-8ccc-000000000012";
+            String target = mock.seedTask(COMP_VCFA, targetKey, "RUNNING", null); // page 2
+            mock.seedTask(COMP_VCFA, "cccccccc-cccc-4ccc-8ccc-000000000013", "RUNNING", null); // page 2
+            mock.seedTask(COMP_VCFA, "cccccccc-cccc-4ccc-8ccc-000000000014", "RUNNING", null); // page 3
 
-            // --- C1: the match sits on page 1; page 2 must never be requested.
+            // --- C1: the match sits on page 2; page 3 must never be requested.
             int mark = mock.log.size();
             SddcLcmClient.SupportBundleRequestResult hit =
-                    client.requestSupportBundle(FQDN_VCFA, "corr-target", null);
+                    client.requestSupportBundle(FQDN_VCFA, targetKey, null);
             List<MockSddcLcm.Entry> es = since(mock, mark);
 
-            eq(es.size(), 3, "C1: getComponents, page 0, page 1 -- then stop");
-            eq(es.get(1).rawQuery, tasksQuery(COMP_VCFA), "C1 page 0 omits pageNumber");
-            eq(es.get(2).rawQuery, tasksQuery(COMP_VCFA) + "&pageNumber=1",
-                    "C1 page 1 appends pageNumber=1 last");
+            eq(es.size(), 3, "C1: getComponents, page 1, page 2 -- then stop");
+            eq(es.get(1).rawQuery, tasksQuery(COMP_VCFA), "C1 page 1 omits pageNumber");
+            eq(es.get(2).rawQuery, tasksQuery(COMP_VCFA) + "&pageNumber=2",
+                    "C1 page 2 appends pageNumber=2 last");
             check(hit.adopted, "C1 adopted the paged match");
             eq(hit.taskId, target, "C1 adopted the right task");
             eq(mock.supportBundlePosts, 0, "C1: nothing submitted");
@@ -289,13 +290,13 @@ public final class TestMain {
             // --- C2: no match anywhere; every page is walked, then the submission goes out.
             mark = mock.log.size();
             SddcLcmClient.SupportBundleRequestResult miss =
-                    client.requestSupportBundle(FQDN_VCFA, "corr-absent", null);
+                    client.requestSupportBundle(FQDN_VCFA, "cccccccc-cccc-4ccc-8ccc-000000000015", null);
             es = since(mock, mark);
 
-            eq(es.size(), 5, "C2: getComponents, pages 0/1/2, submit");
-            eq(es.get(1).rawQuery, tasksQuery(COMP_VCFA), "C2 page 0");
-            eq(es.get(2).rawQuery, tasksQuery(COMP_VCFA) + "&pageNumber=1", "C2 page 1");
-            eq(es.get(3).rawQuery, tasksQuery(COMP_VCFA) + "&pageNumber=2", "C2 page 2");
+            eq(es.size(), 5, "C2: getComponents, pages 1/2/3, submit");
+            eq(es.get(1).rawQuery, tasksQuery(COMP_VCFA), "C2 page 1");
+            eq(es.get(2).rawQuery, tasksQuery(COMP_VCFA) + "&pageNumber=2", "C2 page 2");
+            eq(es.get(3).rawQuery, tasksQuery(COMP_VCFA) + "&pageNumber=3", "C2 page 3");
             eq(es.get(4).op, "generateComponentSupportBundle", "C2 submits after exhausting pages");
             check(!miss.adopted, "C2 is a fresh submission");
             eq(mock.supportBundlePosts, 1, "C2: exactly one submission");
@@ -315,7 +316,7 @@ public final class TestMain {
 
             int mark = mock.log.size();
             try {
-                client.requestSupportBundle(FQDN_VCFA, "corr-preflight", null);
+                client.requestSupportBundle(FQDN_VCFA, "dddddddd-dddd-4ddd-8ddd-000000000020", null);
                 check(false, "D: a failed duplicate check must not be swallowed");
             } catch (SddcLcmClient.SddcLcmException e) {
                 eq(e.httpStatus, 503, "D httpStatus");
@@ -337,7 +338,7 @@ public final class TestMain {
             mock.omitTaskPageMetadataOnce = true;
             mark = mock.log.size();
             try {
-                client.requestSupportBundle(FQDN_VCFA, "corr-preflight-malformed", null);
+                client.requestSupportBundle(FQDN_VCFA, "dddddddd-dddd-4ddd-8ddd-000000000021", null);
                 check(false, "D2: unusable task paging metadata must not be treated as a miss");
             } catch (SddcLcmClient.SddcLcmException e) {
                 eq(e.httpStatus, 0, "D2: malformed success payload is a client-side failure");
@@ -365,7 +366,7 @@ public final class TestMain {
             // --- E1: the FQDN is not a fleet component. Client-side, no HTTP status.
             int mark = mock.log.size();
             try {
-                client.requestSupportBundle("ghost.lab.internal", "corr-e1", null);
+                client.requestSupportBundle("ghost.lab.internal", "eeeeeeee-eeee-4eee-8eee-000000000030", null);
                 check(false, "E1: an unknown FQDN must fail");
             } catch (SddcLcmClient.SddcLcmException e) {
                 eq(e.httpStatus, 0, "E1: a client-side failure reports httpStatus 0");
@@ -381,7 +382,7 @@ public final class TestMain {
             // --- E1b: matching is byte-for-byte, including ASCII case.
             mark = mock.log.size();
             try {
-                client.requestSupportBundle(FQDN_VCFA.toUpperCase(), "corr-e1b", null);
+                client.requestSupportBundle(FQDN_VCFA.toUpperCase(), "eeeeeeee-eeee-4eee-8eee-000000000031", null);
                 check(false, "E1b: component FQDN matching must be byte-for-byte");
             } catch (SddcLcmClient.SddcLcmException e) {
                 eq(e.httpStatus, 0, "E1b: case-mismatched FQDN is a caller error");
@@ -397,7 +398,7 @@ public final class TestMain {
                     "Component inventory is unavailable."));
             mark = mock.log.size();
             try {
-                client.requestSupportBundle(FQDN_VCFA, "corr-e2", null);
+                client.requestSupportBundle(FQDN_VCFA, "eeeeeeee-eeee-4eee-8eee-000000000032", null);
                 check(false, "E2: a 500 on getComponents must fail");
             } catch (SddcLcmClient.SddcLcmException e) {
                 eq(e.httpStatus, 500, "E2 httpStatus");
@@ -423,7 +424,7 @@ public final class TestMain {
                     "Component was removed while the request was in flight."));
             int mark = mock.log.size();
             try {
-                client.requestSupportBundle(FQDN_VCFA, "corr-f", null);
+                client.requestSupportBundle(FQDN_VCFA, "ffffffff-ffff-4fff-8fff-000000000040", null);
                 check(false, "F: a 404 submission must fail");
             } catch (SddcLcmClient.SddcLcmException e) {
                 eq(e.httpStatus, 404, "F httpStatus");
@@ -439,7 +440,7 @@ public final class TestMain {
             mock.postSuccessStatus = 200;
             mark = mock.log.size();
             try {
-                client.requestSupportBundle(FQDN_VCFA, "corr-g", null);
+                client.requestSupportBundle(FQDN_VCFA, "ffffffff-ffff-4fff-8fff-000000000041", null);
                 check(false, "G: a 200 on generateComponentSupportBundle must not be accepted");
             } catch (SddcLcmClient.SddcLcmException e) {
                 eq(e.httpStatus, 200, "G: the unexpected status is surfaced as-is");
@@ -460,11 +461,12 @@ public final class TestMain {
         try {
             SddcLcmClient client = new SddcLcmClient(base, MockSddcLcm.BEARER_TOKEN);
             // IN_PROGRESS belongs to the SDDC Manager task enum, not SDDC LCM 9.1.
-            mock.seedTask(COMP_VCFA, "corr-h", "IN_PROGRESS", null);
+            String badStatusKey = "ffffffff-ffff-4fff-8fff-000000000042";
+            mock.seedTask(COMP_VCFA, badStatusKey, "IN_PROGRESS", null);
 
             int mark = mock.log.size();
             try {
-                client.requestSupportBundle(FQDN_VCFA, "corr-h", null);
+                client.requestSupportBundle(FQDN_VCFA, badStatusKey, null);
                 check(false, "H: an unrecognized TaskStatus must not be guessed at");
             } catch (SddcLcmClient.SddcLcmException e) {
                 eq(e.httpStatus, 0, "H: a protocol violation is a client-side failure");
@@ -488,7 +490,7 @@ public final class TestMain {
             SddcLcmClient client = new SddcLcmClient(base + "/", MockSddcLcm.BEARER_TOKEN);
             int mark = mock.log.size();
             SddcLcmClient.SupportBundleRequestResult r =
-                    client.requestSupportBundle(FQDN_OPS, "corr-slash", 30);
+                    client.requestSupportBundle(FQDN_OPS, "ffffffff-ffff-4fff-8fff-000000000043", 30);
             List<MockSddcLcm.Entry> es = since(mock, mark);
 
             eq(es.size(), 3, "I: resolve, pre-flight, submit");
@@ -497,6 +499,25 @@ public final class TestMain {
             eq(es.get(2).path, "/v1/components/" + COMP_OPS + "/support-bundles", "I submit path");
             check(!r.adopted, "I submitted");
             eq(mock.supportBundlePosts, 1, "I: one submission");
+        } finally {
+            mock.stop();
+        }
+    }
+
+    static void scenarioCorrelationMustBeUuid() throws Exception {
+        MockSddcLcm mock = newMock();
+        String base = mock.start();
+        try {
+            SddcLcmClient client = new SddcLcmClient(base, MockSddcLcm.BEARER_TOKEN);
+            int mark = mock.log.size();
+            try {
+                client.requestSupportBundle(FQDN_VCFA, "not-a-uuid", null);
+                throw new AssertionError("non-UUID correlation id was accepted");
+            } catch (SddcLcmClient.SddcLcmException expected) {
+                check(expected.getMessage().contains("UUID"),
+                        "J: non-UUID correlation failure names the UUID requirement");
+            }
+            eq(mock.log.size(), mark, "J: non-UUID correlation fails before any request");
         } finally {
             mock.stop();
         }
@@ -513,6 +534,7 @@ public final class TestMain {
         scenarioSubmissionStatuses();
         scenarioUnrecognizedStatus();
         scenarioTrailingSlashBaseUrl();
+        scenarioCorrelationMustBeUuid();
 
         // Whole-run sweeps over every request the client made.
         check(!allEntries.isEmpty(), "sweep: requests were recorded");

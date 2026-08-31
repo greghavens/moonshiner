@@ -87,14 +87,18 @@ def verify_log(
     source: str,
     name: str,
     task_id: str,
+    expected_polls: int,
 ) -> None:
     events = [
         json.loads(line)
         for line in log_path.read_text(encoding="utf-8").splitlines()
         if line
     ]
-    if len(events) != 5:
-        fail(f"expected 5 requests, observed {len(events)}")
+    if len(events) != expected_polls + 1:
+        fail(
+            f"expected {expected_polls + 1} requests, "
+            f"observed {len(events)}"
+        )
 
     clone_operation, task_operation = contract["operations"]
     expected_clone_target = (
@@ -165,33 +169,10 @@ def main() -> int:
     if not CLIENT.is_file():
         fail("VcenterCloneClient.java is missing")
 
-    source_digest = hashlib.sha256(
-        CLIENT.read_bytes()
-    ).hexdigest()[:14]
-    nonce = source_digest + "7a"
-    session_id = "session-" + nonce
-    source = "vm-source/" + nonce + r"\gold"
-    name = f'Clone "{nonce}"\nblue \N{SNOWMAN}'
-    task_id = "task:clone/" + nonce + " +blue"
-    virtual_machine_id = "vm-result/" + nonce
-
     with tempfile.TemporaryDirectory(prefix="vcf91-0119-") as raw_tmp:
         tmp = Path(raw_tmp)
         classes = tmp / "classes"
         classes.mkdir()
-        config_path = tmp / "fixture.json"
-        request_log = tmp / "requests.jsonl"
-        config_path.write_text(
-            json.dumps(
-                {
-                    "task_id": task_id,
-                    "virtual_machine_id": virtual_machine_id,
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-
         compile_result = subprocess.run(
             [
                 "javac",
@@ -215,73 +196,123 @@ def main() -> int:
                 + compile_result.stderr
             )
 
-        fixture = subprocess.Popen(
-            [
-                sys.executable,
-                "-B",
-                str(MOCK),
-                "--contract",
-                str(CONTRACT),
-                "--config",
-                str(config_path),
-                "--log",
-                str(request_log),
-            ],
-            cwd=ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        try:
-            banner = read_fixture_banner(fixture)
-            api_root = (
-                f"http://{banner['host']}:{banner['port']}"
-                + contract["server"]["api_root_suffix"]
+        nonce = hashlib.sha256(CLIENT.read_bytes()).hexdigest()[:14] + "7a"
+        scenarios = [
+            {
+                "mode": "live",
+                "session": "0123456789abcdef0123456789abcdef",
+                "source": "vm-39",
+                "name": "moonshiner-live-validation-0119",
+                "task": "task-4232:7978ee81-a66c-4c37-8653-c577c0161e9d",
+                "vm": "vm-1054:7978ee81-a66c-4c37-8653-c577c0161e9d",
+                "states": ["RUNNING"] * 11 + ["SUCCEEDED"],
+                "polls": 12,
+            },
+            {
+                "mode": "states",
+                "session": "89abcdef0123456789abcdef01234567",
+                "source": "vm-source/" + nonce + r"\gold",
+                "name": f'Clone "{nonce}"\nblue \N{SNOWMAN}',
+                "task": "task:clone/" + nonce + " +blue",
+                "vm": "vm-result/" + nonce,
+                "states": ["PENDING", "RUNNING", "BLOCKED", "SUCCEEDED"],
+                "polls": 4,
+            },
+            {
+                "mode": "exhaustion",
+                "session": "abcdef0123456789abcdef0123456789",
+                "source": "vm-39",
+                "name": "poll-exhaustion-contract-coverage",
+                "task": "task-9999:7978ee81-a66c-4c37-8653-c577c0161e9d",
+                "vm": "unused",
+                "states": ["RUNNING"] * 8,
+                "polls": 8,
+            },
+        ]
+
+        for ordinal, scenario in enumerate(scenarios):
+            config_path = tmp / f"fixture-{ordinal}.json"
+            request_log = tmp / f"requests-{ordinal}.jsonl"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "task_id": scenario["task"],
+                        "virtual_machine_id": scenario["vm"],
+                        "states": scenario["states"],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
             )
-            run_result = subprocess.run(
+            fixture = subprocess.Popen(
                 [
-                    "java",
-                    "-cp",
-                    str(classes),
-                    "TestMain",
-                    api_root,
-                    session_id,
-                    source,
-                    name,
-                    task_id,
-                    virtual_machine_id,
+                    sys.executable,
+                    "-B",
+                    str(MOCK),
+                    "--contract",
+                    str(CONTRACT),
+                    "--config",
+                    str(config_path),
+                    "--log",
                     str(request_log),
                 ],
                 cwd=ROOT,
                 text=True,
-                capture_output=True,
-                timeout=20,
-                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
-            if run_result.returncode != 0:
-                fail(
-                    "TestMain failed:\n"
-                    + run_result.stdout
-                    + run_result.stderr
-                )
-            if run_result.stdout.strip() != "TEST_MAIN_OK":
-                fail("unexpected TestMain output")
-            verify_log(
-                request_log,
-                contract,
-                session_id,
-                source,
-                name,
-                task_id,
-            )
-        finally:
-            if fixture.poll() is None:
-                fixture.terminate()
             try:
-                fixture.communicate(timeout=3)
-            except subprocess.TimeoutExpired:
-                fixture.kill()
-                fixture.communicate(timeout=3)
+                banner = read_fixture_banner(fixture)
+                api_root = (
+                    f"http://{banner['host']}:{banner['port']}"
+                    + contract["server"]["api_root_suffix"]
+                )
+                run_result = subprocess.run(
+                    [
+                        "java",
+                        "-cp",
+                        str(classes),
+                        "TestMain",
+                        api_root,
+                        scenario["session"],
+                        scenario["source"],
+                        scenario["name"],
+                        scenario["task"],
+                        scenario["vm"],
+                        str(request_log),
+                        scenario["mode"],
+                    ],
+                    cwd=ROOT,
+                    text=True,
+                    capture_output=True,
+                    timeout=20,
+                    check=False,
+                )
+                if run_result.returncode != 0:
+                    fail(
+                        f"TestMain {scenario['mode']} failed:\n"
+                        + run_result.stdout
+                        + run_result.stderr
+                    )
+                if run_result.stdout.strip() != "TEST_MAIN_OK":
+                    fail("unexpected TestMain output")
+                verify_log(
+                    request_log,
+                    contract,
+                    scenario["session"],
+                    scenario["source"],
+                    scenario["name"],
+                    scenario["task"],
+                    scenario["polls"],
+                )
+            finally:
+                if fixture.poll() is None:
+                    fixture.terminate()
+                try:
+                    fixture.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    fixture.kill()
+                    fixture.communicate(timeout=3)
 
     print("verification passed")
     return 0

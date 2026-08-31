@@ -1,5 +1,5 @@
 // Package opsmock is a loopback stand-in for a VMware Cloud Foundation
-// Operations 9.1 appliance. It serves only the two operations named in
+// Operations 9.1 appliance. It serves only the three operations named in
 // docs/contract.json and records every request it receives so that a test can
 // assert the exact wire shape a client produced.
 //
@@ -23,6 +23,7 @@ const BasePath = "/suite-api"
 // Contract-named operations. Anything else is not served.
 const (
 	PathAcquireToken       = BasePath + "/api/auth/token/acquire" // acquireToken
+	PathReleaseToken       = BasePath + "/api/auth/token/release" // releaseToken
 	PathSymptomDefinitions = BasePath + "/api/symptomdefinitions" // getSymptomDefinitions
 )
 
@@ -88,9 +89,10 @@ type Request struct {
 type Server struct {
 	http *httptest.Server
 
-	mu   sync.Mutex
-	log  []Request
-	data []SymptomDefinition
+	mu          sync.Mutex
+	log         []Request
+	data        []SymptomDefinition
+	activeToken bool
 }
 
 // New starts a mock serving the given symptom definitions. The caller owns
@@ -100,6 +102,7 @@ func New(defs []SymptomDefinition) *Server {
 	s := &Server{data: append([]SymptomDefinition(nil), defs...)}
 	mux := http.NewServeMux()
 	mux.HandleFunc(PathAcquireToken, s.handleAcquireToken)
+	mux.HandleFunc(PathReleaseToken, s.handleReleaseToken)
 	mux.HandleFunc(PathSymptomDefinitions, s.handleSymptomDefinitions)
 	mux.HandleFunc("/", s.handleUnserved)
 	s.http = httptest.NewServer(mux)
@@ -307,6 +310,9 @@ func (s *Server) handleAcquireToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.finish(seq, http.StatusOK, "")
+	s.mu.Lock()
+	s.activeToken = true
+	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"token":     IssuedToken,
@@ -314,6 +320,52 @@ func (s *Server) handleAcquireToken(w http.ResponseWriter, r *http.Request) {
 		"expiresAt": "Wednesday, May 13, 2026 08:00:00 AM UTC",
 		"roles":     []string{"ReadOnly"},
 	})
+}
+
+// handleReleaseToken serves operationId releaseToken.
+func (s *Server) handleReleaseToken(w http.ResponseWriter, r *http.Request) {
+	body := readBody(r)
+	seq := s.record(capture(r, body))
+
+	if r.Method != http.MethodPost {
+		s.fail(w, seq, http.StatusMethodNotAllowed, "releaseToken is POST")
+		return
+	}
+	if r.URL.RawQuery != "" {
+		s.fail(w, seq, http.StatusBadRequest, "releaseToken declares no query parameters")
+		return
+	}
+	if len(body) != 0 {
+		s.fail(w, seq, http.StatusBadRequest, "releaseToken declares no request body")
+		return
+	}
+	if r.Header.Get("Content-Type") != "" {
+		s.fail(w, seq, http.StatusBadRequest, "releaseToken must not carry Content-Type without a body")
+		return
+	}
+	if !acceptsJSON(r.Header.Get("Accept")) {
+		s.fail(w, seq, http.StatusNotAcceptable,
+			fmt.Sprintf("Accept must allow application/json, got %q", r.Header.Get("Accept")))
+		return
+	}
+	if got := r.Header.Get("Authorization"); got != TokenPrefix+IssuedToken {
+		s.fail(w, seq, http.StatusUnauthorized,
+			fmt.Sprintf("Authorization must be %q followed by the acquired token, got %q", TokenPrefix, got))
+		return
+	}
+
+	s.mu.Lock()
+	active := s.activeToken
+	if active {
+		s.activeToken = false
+	}
+	s.mu.Unlock()
+	if !active {
+		s.fail(w, seq, http.StatusUnauthorized, "token is not active")
+		return
+	}
+	s.finish(seq, http.StatusOK, "")
+	w.WriteHeader(http.StatusOK)
 }
 
 // handleSymptomDefinitions serves operationId getSymptomDefinitions.
@@ -333,6 +385,13 @@ func (s *Server) handleSymptomDefinitions(w http.ResponseWriter, r *http.Request
 	if auth[0] != TokenPrefix+IssuedToken {
 		s.fail(w, seq, http.StatusUnauthorized,
 			fmt.Sprintf("Authorization must be %q followed by the acquired token, got %q", TokenPrefix, auth[0]))
+		return
+	}
+	s.mu.Lock()
+	active := s.activeToken
+	s.mu.Unlock()
+	if !active {
+		s.fail(w, seq, http.StatusUnauthorized, "token is not active")
 		return
 	}
 	if !acceptsJSON(r.Header.Get("Accept")) {

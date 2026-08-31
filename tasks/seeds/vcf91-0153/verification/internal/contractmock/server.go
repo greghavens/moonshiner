@@ -37,6 +37,7 @@ type Fixture struct {
 	NewAuth        Auth
 	BlockOperation string
 	ForcedStatus   map[string]int
+	ForcedBody     map[string]string
 }
 
 type Request struct {
@@ -246,6 +247,12 @@ func (s *Server) serveHTTP(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if status := s.fixture.ForcedStatus[matched.name]; status != 0 {
+		if body := s.fixture.ForcedBody[matched.name]; body != "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, body)
+			return
+		}
 		writeJSON(w, status, map[string]string{"status": "forced failure"})
 		return
 	}

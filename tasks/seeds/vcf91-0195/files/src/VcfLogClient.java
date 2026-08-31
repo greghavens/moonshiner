@@ -51,7 +51,7 @@ public final class VcfLogClient implements AutoCloseable {
                         .build());
     }
 
-    /* Package-private transport injection keeps the deterministic harness offline. */
+    /* Package-private transport injection supports focused client testing. */
     VcfLogClient(URI baseUri, String opsToken, String initialSecretName,
                  String initialSecret, HttpClient http) {
         this.baseUri = Objects.requireNonNull(baseUri, "baseUri");

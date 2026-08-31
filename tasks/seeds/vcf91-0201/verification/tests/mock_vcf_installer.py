@@ -157,7 +157,7 @@ class InstallerHandler(BaseHTTPRequestHandler):
         operation_id = route["operationId"]
         if operation_id == "createToken":
             self._send_json(
-                201,
+                200,
                 {
                     "accessToken": ACCESS_TOKEN,
                     "refreshToken": {"id": "loopback-refresh-token"},

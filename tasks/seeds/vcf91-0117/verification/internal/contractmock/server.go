@@ -27,7 +27,7 @@ type VM struct {
 	Name          string `json:"name"`
 	PowerState    string `json:"power_state"`
 	CPUCount      *int64 `json:"cpu_count,omitempty"`
-	MemorySizeMiB *int64 `json:"memory_size_mib,omitempty"`
+	MemorySizeMiB *int64 `json:"memory_size_MiB,omitempty"`
 }
 
 // Scenario is runtime-created service data. Raw bodies, when provided, replace
@@ -376,12 +376,12 @@ func (s *Server) serveTask(writer http.ResponseWriter, request *http.Request) {
 	status := s.scenario.TaskStatuses[index]
 	response := map[string]any{
 		"description": map[string]any{
-			"id":              "com.vmware.vcenter.vm.clone",
-			"default_message": "Clone virtual machine",
+			"id":              "Description",
+			"default_message": "",
 			"args":            []string{},
 		},
-		"service":    "com.vmware.vcenter.vm",
-		"operation":  "clone",
+		"service":    "7978ee81-a66c-4c37-8653-c577c0161e9d",
+		"operation":  "com.vmware.vcenter.vm.clone",
 		"status":     status,
 		"cancelable": status != "SUCCEEDED" && status != "FAILED",
 	}

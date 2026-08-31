@@ -44,7 +44,11 @@ def append_log(path: Path, entry: dict) -> None:
         os.fsync(handle.fileno())
 
 
-def contract_routes(contract: dict, vm: str) -> dict[tuple[str, str, str], str]:
+def contract_routes(
+    contract: dict,
+    vm: str,
+    exotic_vm: str,
+) -> dict[tuple[str, str, str], str]:
     operations = contract.get("operations")
     if not isinstance(operations, list) or len(operations) != 3:
         raise ValueError("the focused contract must name exactly three operations")
@@ -76,6 +80,12 @@ def contract_routes(contract: dict, vm: str) -> dict[tuple[str, str, str], str]:
         if route in routes:
             raise ValueError("focused contract routes must be unique")
         routes[route] = operation_id
+        if operation_id == "Vcenter.Vm.Hardware.Cpu_update":
+            exotic_rendered = target.replace(
+                "{vm}", quote(exotic_vm, safe="")
+            )
+            exotic_split = urlsplit(exotic_rendered)
+            routes[(method, exotic_split.path, exotic_split.query)] = operation_id
 
     if seen != set(EXPECTED_OPERATIONS):
         raise ValueError("the focused contract operation set is incomplete")
@@ -109,10 +119,13 @@ def main() -> int:
     scenario = load_object(Path(sys.argv[4]))
 
     vm = scenario.get("vm")
+    exotic_vm = scenario.get("exotic_vm")
     initial_token = scenario.get("initial_token")
     refreshed_token = scenario.get("refreshed_token")
     if not isinstance(vm, str) or not vm:
         raise ValueError("scenario vm must be a non-empty string")
+    if not isinstance(exotic_vm, str) or not exotic_vm:
+        raise ValueError("scenario exotic_vm must be a non-empty string")
     if not isinstance(initial_token, str) or not initial_token:
         raise ValueError("scenario initial_token must be a non-empty string")
     if (
@@ -127,7 +140,12 @@ def main() -> int:
     if not isinstance(expired_message, str) or not expired_message:
         raise ValueError("scenario expired_message must be a non-empty string")
 
-    routes = contract_routes(contract, vm)
+    routes = contract_routes(contract, vm, exotic_vm)
+    exotic_cpu_path = (
+        "/api/vcenter/vm/"
+        + quote(exotic_vm, safe="")
+        + "/hardware/cpu"
+    )
     expected_bodies = {
         "Vcenter.Vm.Hardware.Cpu_update": json.dumps(
             {"count": cpu_count},
@@ -135,7 +153,7 @@ def main() -> int:
             ensure_ascii=False,
         ).encode("utf-8"),
         "Vcenter.Vm.Hardware.Memory_update": json.dumps(
-            {"size_mib": memory_mib},
+            {"size_MiB": memory_mib},
             separators=(",", ":"),
             ensure_ascii=False,
         ).encode("utf-8"),
@@ -223,6 +241,25 @@ def main() -> int:
                     response = {
                         "error_type": "INVALID_ARGUMENT",
                         "messages": [],
+                    }
+                elif split.path == exotic_cpu_path:
+                    status = 404
+                    response = {
+                        "error_type": "NOT_FOUND",
+                        "messages": [
+                            {
+                                "args": [exotic_vm],
+                                "default_message": (
+                                    f"Virtual machine {exotic_vm} was not found."
+                                ),
+                                "id": "com.vmware.api.vcenter.vm.not_found",
+                            },
+                            {
+                                "args": [],
+                                "default_message": "The object was not found.",
+                                "id": "vmsg.ManagedObjectNotFound.summary",
+                            },
+                        ],
                     }
                 elif (
                     operation_id == "Vcenter.Vm.Hardware.Cpu_update"

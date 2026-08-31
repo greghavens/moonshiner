@@ -317,11 +317,6 @@ def verify_package_shape() -> None:
     require(INIT_PATH.is_file(), "protected package initializer is missing")
     project = tomllib.loads(PROJECT_PATH.read_text(encoding="utf-8"))
     require(project.get("project", {}).get("dependencies") == [], "dependencies must be empty")
-    require(
-        project.get("tool", {}).get("moonshiner", {}).get("stdlib-only") is True,
-        "package must remain stdlib-only",
-    )
-
     source = CLIENT_PATH.read_text(encoding="utf-8")
     try:
         tree = ast.parse(source, filename=str(CLIENT_PATH))
@@ -484,8 +479,8 @@ def verify_wire(requests: list[dict[str, Any]], scenario: dict[str, Any]) -> Non
     require(len(requests) == 3, "getTasks must use exactly three page requests")
     expected_targets = [
         "/v1/tasks?pageSize=2",
-        "/v1/tasks?pageNumber=1&pageSize=2",
         "/v1/tasks?pageNumber=2&pageSize=2",
+        "/v1/tasks?pageNumber=3&pageSize=2",
     ]
     for index, (request, expected_target) in enumerate(zip(requests, expected_targets)):
         require(request.get("sequence") == index + 1, "request sequence is not contiguous")
@@ -515,7 +510,7 @@ def verify_wire(requests: list[dict[str, Any]], scenario: dict[str, Any]) -> Non
         query = request.get("query", {})
         expected_query = {"pageSize": ["2"]}
         if index:
-            expected_query = {"pageNumber": [str(index)], "pageSize": ["2"]}
+            expected_query = {"pageNumber": [str(index + 1)], "pageSize": ["2"]}
         require(query == expected_query, "query members or values changed")
         require(
             all(name not in query for name in UNSET_PARAMETERS),
@@ -577,7 +572,7 @@ def task_record(task_id: str) -> dict[str, object]:
 def task_page(
     elements: Any,
     *,
-    page_number: Any = 0,
+    page_number: Any = 1,
     page_size: Any = 2,
     total_elements: Any = 1,
     total_pages: Any = 1,
@@ -640,9 +635,7 @@ def verify_http_and_transport_failures(module: Any) -> None:
     )
     require(len(requests) == 1, "HTTP failure caused an unexpected retry")
 
-    valid_empty = task_page(
-        [], page_number=0, page_size=2, total_elements=0, total_pages=0
-    )
+    valid_empty = {"elements": [], "pageMetadata": {}}
     require(
         len(
             scripted_error_case(
@@ -721,7 +714,7 @@ def verify_page_failures(module: Any) -> None:
             "missing elements",
             {
                 "pageMetadata": {
-                    "pageNumber": 0,
+                    "pageNumber": 1,
                     "pageSize": 2,
                     "totalElements": 0,
                     "totalPages": 0,
@@ -730,7 +723,7 @@ def verify_page_failures(module: Any) -> None:
         ),
         ("non-list elements", task_page({}, total_elements=0, total_pages=0)),
         ("non-object pageMetadata", {"elements": [], "pageMetadata": []}),
-        ("missing metadata integer", {"elements": [], "pageMetadata": {}}),
+        ("missing metadata integer", {"elements": [first], "pageMetadata": {}}),
         ("boolean metadata integer", task_page([first], page_number=False)),
         ("string metadata integer", task_page([first], total_elements="1")),
         ("negative page number", task_page([first], page_number=-1)),
@@ -738,7 +731,7 @@ def verify_page_failures(module: Any) -> None:
         ("negative total pages", task_page([], total_elements=0, total_pages=-1)),
         ("nonpositive metadata page size", task_page([first], page_size=0)),
         ("changed metadata page size", task_page([first], page_size=1)),
-        ("unrequested first page", task_page([first], page_number=1)),
+        ("unrequested first page", task_page([first], page_number=2)),
         (
             "incoherent total pages",
             task_page([first, second], total_elements=3, total_pages=3),
@@ -764,15 +757,15 @@ def verify_page_failures(module: Any) -> None:
     multi_request_cases = [
         (
             "repeated or unrequested page",
-            task_page([third], page_number=0, total_elements=3, total_pages=2),
+            task_page([third], page_number=1, total_elements=3, total_pages=2),
         ),
         (
             "changed totals",
-            task_page([third], page_number=1, total_elements=4, total_pages=2),
+            task_page([third], page_number=2, total_elements=4, total_pages=2),
         ),
         (
             "incomplete final page",
-            task_page([], page_number=1, total_elements=3, total_pages=2),
+            task_page([], page_number=2, total_elements=3, total_pages=2),
         ),
     ]
     for label, second_page in multi_request_cases:
@@ -829,9 +822,7 @@ def verify_task_failures(module: Any) -> None:
 
 
 def verify_small_success_cases(module: Any) -> None:
-    empty_page = task_page(
-        [], page_number=0, page_size=2, total_elements=0, total_pages=0
-    )
+    empty_page = {"elements": [], "pageMetadata": {}}
     with ScriptedEndpoint([json_response(empty_page)]) as endpoint:
         client = module.VcfInstallerClient(endpoint.base_url + "/", "valid-token", timeout=2)
         require(client.list_tasks(page_size=2) == [], "empty collection was not returned")

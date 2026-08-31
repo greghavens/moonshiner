@@ -85,9 +85,4 @@ synchronization run, and `root_cause_message_key` is its
 
 ## Verification
 
-`python3 -B verify.py` starts the contract-pinned mock on an ephemeral
-`127.0.0.1` port, or falls back to request-level dispatch where the sandbox
-forbids sockets. The mock derives its route table from `docs/contract.json`,
-refuses any operation the contract does not name, and appends every request to a
-JSONL log that the suite reads back to assert the exact wire shape. No live
-VMware endpoint is contacted and only dummy credentials are used.
+Run `python3 -B verify.py`.

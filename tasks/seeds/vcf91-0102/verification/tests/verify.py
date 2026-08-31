@@ -540,7 +540,15 @@ def run_exhaustion_scenario(package: object, scenario: dict, temp: Path) -> None
     )
 
 
-def run_http_error_scenario(package: object, scenario: dict, temp: Path) -> None:
+def run_http_error_scenario(
+    package: object,
+    scenario: dict,
+    temp: Path,
+    *,
+    expected_status: int,
+    expected_error_type: str,
+    expected_message_ids: list[str],
+) -> None:
     process, port, log_file = start_mock(temp, scenario)
     error = None
     try:
@@ -559,16 +567,21 @@ def run_http_error_scenario(package: object, scenario: dict, temp: Path) -> None
     finally:
         stop_process(process)
 
-    require(error is not None, "HTTP 503 must raise VcenterError")
+    require(error is not None, f"HTTP {expected_status} must raise VcenterError")
     require(
         type(error) is package.VcenterError,
-        "HTTP 503 must not be reported as a retry/protocol error",
+        f"HTTP {expected_status} must not be a retry/protocol error",
     )
     require(
         error.operation_id == OPERATION_ID
-        and error.status_code == 503
+        and error.status_code == expected_status
         and isinstance(error.payload, dict)
-        and error.payload.get("error_type") == "SERVICE_UNAVAILABLE",
+        and error.payload.get("error_type") == expected_error_type
+        and [
+            message.get("id")
+            for message in error.payload.get("messages", [])
+        ]
+        == expected_message_ids,
         "VcenterError metadata or decoded payload is incorrect",
     )
     rendered = f"{error!s}\n{error!r}"
@@ -578,7 +591,7 @@ def run_http_error_scenario(package: object, scenario: dict, temp: Path) -> None
         and repr(error.payload) not in rendered,
         "HTTP error text exposes the session or response payload",
     )
-    verify_wire(entries, scenario, ["response"], [503])
+    verify_wire(entries, scenario, ["response"], [expected_status])
     require(
         entries[0]["effectCount"] == 0
         and entries[0]["currentCount"] == scenario["initial_count"],
@@ -604,14 +617,13 @@ def main() -> int:
             f"vcf_cpu_retry does not expose {name}",
         )
 
-    token = f"session-{secrets.token_urlsafe(24)}"
+    token = secrets.token_hex(16)
     verify_local_validation(package, token)
 
-    nonce = secrets.token_hex(8)
-    initial_count = 2 + secrets.randbelow(8)
-    desired_count = initial_count + 2 + secrets.randbelow(8)
+    initial_count = 2
+    desired_count = 6
     common = {
-        "vm": f"vm/{nonce} snow \u03b2?#%",
+        "vm": "vm-1034",
         "session_token": token,
         "initial_count": initial_count,
         "desired_count": desired_count,
@@ -625,21 +637,65 @@ def main() -> int:
 
         exhaustion = dict(
             common,
-            vm=f"vm/{secrets.token_hex(7)} retry \u03bb?#%",
             initial_count=desired_count,
             desired_count=desired_count + 2,
             behavior="disconnect_always",
         )
         run_exhaustion_scenario(package, exhaustion, temp / "exhaustion")
 
-        http_error = dict(
+        invalid_count = dict(
             common,
-            vm=f"vm/{secrets.token_hex(7)} http \u03c0?#%",
-            initial_count=desired_count + 2,
-            desired_count=desired_count + 4,
-            behavior="http_error",
+            initial_count=desired_count,
+            desired_count=2**63 - 1,
+            behavior="http_400",
         )
-        run_http_error_scenario(package, http_error, temp / "http-error")
+        run_http_error_scenario(
+            package,
+            invalid_count,
+            temp / "http-400",
+            expected_status=400,
+            expected_error_type="INVALID_ARGUMENT",
+            expected_message_ids=[
+                "com.vmware.api.vcenter.vm.hardware.cpu.invalid_num_cpu",
+                "vmsg.InvalidArgument.summary",
+            ],
+        )
+
+        unauthenticated = dict(
+            common,
+            initial_count=desired_count,
+            desired_count=desired_count + 2,
+            behavior="http_401",
+        )
+        run_http_error_scenario(
+            package,
+            unauthenticated,
+            temp / "http-401",
+            expected_status=401,
+            expected_error_type="UNAUTHENTICATED",
+            expected_message_ids=[
+                "com.vmware.api.vcenter.unauthenticated",
+            ],
+        )
+
+        missing_vm = dict(
+            common,
+            vm="vm/missing snow \u03b2?#%",
+            initial_count=desired_count,
+            desired_count=desired_count + 2,
+            behavior="http_404",
+        )
+        run_http_error_scenario(
+            package,
+            missing_vm,
+            temp / "http-404",
+            expected_status=404,
+            expected_error_type="NOT_FOUND",
+            expected_message_ids=[
+                "com.vmware.api.vcenter.vm.not_found",
+                "vmsg.ManagedObjectNotFound.summary",
+            ],
+        )
 
     print(
         "PASS: contract provenance, exact retry wire shape, optional omission, "

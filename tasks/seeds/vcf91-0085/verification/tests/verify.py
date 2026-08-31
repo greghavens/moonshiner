@@ -26,10 +26,10 @@ PROTECTED_HASHES = {
         "fe5678f5f452ca6239b45b7fa4864ea17aa69eef591b34fc937e0789f9287a1e"
     ),
     "tests/TestMain.java": (
-        "7ca072f5bbdce20f8340a4ccb12711939217899f3e9cd53341ad76619797edba"
+        "df8b07631ed16b8e20f4b769683142fa35b287ed23abf962774f16ce986b7d76"
     ),
     "tests/mock_nsx_policy.py": (
-        "cc69f9f4345b705d69e841d303e81274f2fa78b2efe5a0cd781313dc0e0590d8"
+        "36b472b7ae493f48e3fc788eeee37e0a768be3e4b5cbc8cf90ea7db1f48c693d"
     ),
 }
 COMMIT = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
@@ -330,6 +330,10 @@ def verify_wire_log(
             "response",
             "retired",
             "request",
+            "response",
+            "request",
+            "response",
+            "request",
             "request",
             "response",
             "response",
@@ -340,9 +344,10 @@ def verify_wire_log(
     )
     requests = [event for event in events if event["event"] == "request"]
     responses = [event for event in events if event["event"] == "response"]
-    require(len(requests) == 5, "exact ListTier1 request count")
+    require(len(requests) == 7, "exact ListTier1 request count")
     require(
-        [event["status"] for event in responses] == [200, 200, 200, 200, 503],
+        [event["status"] for event in responses]
+        == [200, 200, 403, 200, 200, 200, 503],
         "response status sequence",
     )
     path = "/policy/api/v1/infra/tier-1s"
@@ -382,23 +387,35 @@ def verify_wire_log(
         expected_authorization=new_auth,
         expected_query=[("cursor", central_cursor), ("page_size", "0")],
     )
-    timeout_cursor = environment["NSX_TIMEOUT_CURSOR"]
     verify_request(
         requests[2],
+        raw_target=path,
+        expected_authorization=old_auth,
+        expected_query=[],
+    )
+    verify_request(
+        requests[3],
+        raw_target=path,
+        expected_authorization=new_auth,
+        expected_query=[],
+    )
+    timeout_cursor = environment["NSX_TIMEOUT_CURSOR"]
+    verify_request(
+        requests[4],
         raw_target=path + "?cursor=" + encoded(timeout_cursor),
         expected_authorization=timeout_old_auth,
         expected_query=[("cursor", timeout_cursor)],
     )
     release_cursor = environment["NSX_RELEASE_CURSOR"]
     verify_request(
-        requests[3],
+        requests[5],
         raw_target=path + "?cursor=" + encoded(release_cursor),
         expected_authorization=timeout_new_auth,
         expected_query=[("cursor", release_cursor)],
     )
     error_cursor = environment["NSX_ERROR_CURSOR"]
     verify_request(
-        requests[4],
+        requests[6],
         raw_target=path + "?cursor=" + encoded(error_cursor),
         expected_authorization=timeout_new_auth,
         expected_query=[("cursor", error_cursor)],

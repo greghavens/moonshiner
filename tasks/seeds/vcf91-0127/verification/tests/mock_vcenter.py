@@ -71,21 +71,21 @@ class MockState:
                 "name": "zulu",
                 "power_state": "POWERED_OFF",
                 "cpu_count": 4,
-                "memory_size_mib": 8192,
+                "memory_size_MiB": 8192,
             },
             {
                 "vm": "vm-100",
                 "name": "alpha",
                 "power_state": "POWERED_ON",
                 "cpu_count": 2,
-                "memory_size_mib": 4096,
+                "memory_size_MiB": 4096,
             },
             {
                 "vm": "vm-200",
                 "name": "mike",
                 "power_state": "SUSPENDED",
                 "cpu_count": 1,
-                "memory_size_mib": 2048,
+                "memory_size_MiB": 2048,
             },
         ]
         self.list_reversed = False
@@ -241,7 +241,7 @@ class Handler(BaseHTTPRequestHandler):
                 "name": body["name"],
                 "power_state": "POWERED_OFF",
                 "cpu_count": 2,
-                "memory_size_mib": 4096,
+                "memory_size_MiB": 4096,
             },
             "materialized": False,
         }

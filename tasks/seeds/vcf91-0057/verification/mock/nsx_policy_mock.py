@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -21,6 +22,10 @@ EXPECTED_OPERATION_IDS = {
     "PatchInfraSegment",
     "ReadIntentStatus",
 }
+EXPECTED_AUTHORIZATION = "Basic " + base64.b64encode(
+    b"loopback-contract-user:loopback-contract-password"
+).decode("ascii")
+EXPECTED_SESSION = "vcf91-0057-contract-session"
 
 
 def compile_contract_path(path: str) -> tuple[re.Pattern[str], list[str]]:
@@ -138,12 +143,27 @@ class ContractHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:
+        if urlsplit(self.path).path == "/global-manager/api/v1/global-infra/":
+            self._write_json(HTTPStatus.NOT_FOUND, {"error_message": "not global manager"})
+            return
+        if urlsplit(self.path).path == "/api/v1/node/version":
+            self._write_json(
+                HTTPStatus.OK,
+                {
+                    "product_name": "NSX",
+                    "product_version": "9.1.0.0",
+                },
+            )
+            return
         self._dispatch("GET")
 
     def do_PATCH(self) -> None:
         self._dispatch("PATCH")
 
     def do_POST(self) -> None:
+        if urlsplit(self.path).path == "/api/session/create":
+            self._create_session()
+            return
         self._reject_uncontracted("POST")
 
     def do_PUT(self) -> None:
@@ -169,6 +189,28 @@ class ContractHandler(BaseHTTPRequestHandler):
             return None, "request body must be a JSON object"
         return parsed, None
 
+    def _create_session(self) -> None:
+        length_text = self.headers.get("Content-Length", "0")
+        try:
+            length = int(length_text)
+        except ValueError:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error_message": "invalid length"})
+            return
+        payload = self.rfile.read(length).decode("utf-8") if length else ""
+        form = parse_qs(payload, keep_blank_values=True)
+        if form != {
+            "j_username": ["loopback-contract-user"],
+            "j_password": ["loopback-contract-password"],
+        }:
+            self._write_json(HTTPStatus.UNAUTHORIZED, {"error_message": "invalid credentials"})
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Set-Cookie", f"JSESSIONID={EXPECTED_SESSION}; Path=/; HttpOnly")
+        self.send_header("X-XSRF-TOKEN", EXPECTED_SESSION)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
     def _dispatch(self, method: str) -> None:
         target = urlsplit(self.path)
         query = parse_qs(target.query, keep_blank_values=True)
@@ -189,11 +231,17 @@ class ContractHandler(BaseHTTPRequestHandler):
             return
 
         authorization = self.headers.get("Authorization", "")
-        if not authorization.startswith("Bearer ") or len(authorization) <= len("Bearer "):
+        cookie = self.headers.get("Cookie", "")
+        if authorization == EXPECTED_AUTHORIZATION:
+            authorization_scheme = "Basic"
+        elif f"JSESSIONID={EXPECTED_SESSION}" in cookie:
+            authorization_scheme = "Session"
+        else:
             self._write_json(
                 HTTPStatus.UNAUTHORIZED,
-                {"error_message": "Bearer authorization is required"},
+                {"error_message": "authenticated PowerCLI connection is required"},
             )
+            return
             return
 
         body: dict[str, Any] | None = None
@@ -212,7 +260,7 @@ class ContractHandler(BaseHTTPRequestHandler):
             "method": method,
             "path": target.path,
             "query": query,
-            "authorizationScheme": authorization.split(" ", 1)[0],
+            "authorizationScheme": authorization_scheme,
             "contentType": self.headers.get("Content-Type"),
         }
 

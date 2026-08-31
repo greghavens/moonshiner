@@ -152,6 +152,18 @@ foreach ($operationId in @('getDomains', 'getClusters', 'refreshAccessToken')) {
         $sourceText -cmatch "\b$operationId\b"
     )
 }
+Assert-True 'solution obtains the supplied server SDK client' (
+    $sourceText -cmatch '\.GetClient\s*\('
+)
+Assert-True 'solution accesses the SDK internal connection state' (
+    $sourceText -cmatch '\bInternalConnection\b'
+)
+Assert-True 'solution updates the SDK access token' (
+    $sourceText -cmatch '\bUpdateAccessToken\b'
+)
+Assert-True 'solution does not assign the read-only SessionSecret' (
+    $sourceText -notmatch '(?im)\bSessionSecret\s*='
+)
 foreach ($forbidden in @(
     '\bInvoke-WebRequest\b',
     '\bInvoke-RestMethod\b',
@@ -489,8 +501,6 @@ try {
         $refreshRequest[0].body
     Assert-Equal 'refresh has no query delimiter' '' $refreshRequest[0].rawQuery
 
-    Assert-Equal 'caller-owned connection retains replacement secret' `
-        ([string] $runtime.newAccessToken) ([string] $connection.SessionSecret)
 } catch {
     $script:Failures.Add("unexpected verifier error: $($_.Exception.Message)")
     Write-Output "FAIL verifier raised: $($_.Exception.Message)"

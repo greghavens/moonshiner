@@ -102,10 +102,10 @@ $EventOperation = (
 )
 $ExpectedOperationIds = @($ListOperation, $EventOperation)
 $ExpectedListCmdlet = (
-    'Invoke-VcenterTrustedInfrastructureHostsHardwareTpmList'
+    'Invoke-ListHostTrustedInfrastructureHardwareTpm'
 )
 $ExpectedEventCmdlet = (
-    'Invoke-VcenterTrustedInfrastructureHostsHardwareTpmEventLogGet'
+    'Invoke-GetHostTpmHardwareHostEventLog'
 )
 
 $Contract = Get-Content -Raw -LiteralPath $ContractPath | ConvertFrom-Json
@@ -356,7 +356,7 @@ function Invoke-SeamValidation {
 
         [bool] $ThrowEvent = $false,
 
-        [string] $HostId = 'host-exact',
+        [string] $HostId = 'host-12',
 
         [string] $TpmId = 'tpm-exact',
 
@@ -464,7 +464,7 @@ $NullClientFailed = $false
 try {
     [void] (Get-VcfHostTpmFailureEvidence `
         -Client $null `
-        -HostId 'host-exact' `
+        -HostId 'host-12' `
         -TpmId 'tpm-exact')
 }
 catch {
@@ -564,6 +564,10 @@ $NullElementList = [Collections.Generic.List[object]]::new()
 $NullElementList.Add($null)
 $NullElementList.Add($ValidDirectSummary)
 $InvalidListCases = @(
+    [pscustomobject]@{
+        Name = 'live zero-item host inventory'
+        Response = @()
+    },
     [pscustomobject]@{
         Name = 'null list response'
         Response = $null
@@ -908,7 +912,7 @@ Assert-Equal $EventFailureOutcome.EventCalls 1 (
 )
 
 $RunId = [guid]::NewGuid().ToString('N')
-$SessionToken = "session-$([guid]::NewGuid().ToString('N'))"
+$SessionToken = [guid]::NewGuid().ToString('N')
 $Cases = @(
     [pscustomobject] [ordered]@{
         HostId = "host/$RunId west"

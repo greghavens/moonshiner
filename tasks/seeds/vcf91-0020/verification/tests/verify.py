@@ -89,57 +89,72 @@ def make_support_bundle(
     include_match: bool = True,
     duplicate_match: bool = False,
 ) -> bytes:
-    """Create a deterministic in-memory tar.gz containing JSONL logs."""
+    """Create a deterministic archive containing native nested workflow JSON."""
     output = io.BytesIO()
     with gzip.GzipFile(fileobj=output, mode="wb", mtime=0) as compressed:
         with tarfile.open(fileobj=compressed, mode="w") as archive:
-            unrelated = {
-                "timestamp": "2026-07-28T18:01:00.000Z",
-                "taskId": "another-task",
-                "referenceToken": "another-reference",
-                "causeCode": "IRRELEVANT",
-                "cause": "This record must not be selected",
-            }
-            wrong_task = {
-                "timestamp": "2026-07-28T18:02:00.000Z",
-                "taskId": "wrong-task",
-                "referenceToken": reference_token,
-                "causeCode": "WRONG_TASK",
-                "cause": "A shared token is not sufficient",
-            }
-            lines = [
-                json.dumps(unrelated, separators=(",", ":")),
-                json.dumps(wrong_task, separators=(",", ":")),
+            tasks = [
+                {
+                    "id": "another-task",
+                    "errors": [
+                        {
+                            "referenceToken": "another-reference",
+                            "errorCode": "IRRELEVANT",
+                            "message": "This record must not be selected",
+                        }
+                    ],
+                },
+                {
+                    "id": "wrong-task",
+                    "errors": [
+                        {
+                            "referenceToken": reference_token,
+                            "errorCode": "WRONG_TASK",
+                            "message": "A shared token is not sufficient",
+                        }
+                    ],
+                },
             ]
             if include_match:
                 match = {
-                    "timestamp": "2026-07-28T18:03:00.000Z",
-                    "taskId": task_id,
-                    "referenceToken": reference_token,
-                    "causeCode": cause_code,
-                    "cause": cause,
+                    "id": task_id,
+                    "errors": [
+                        {
+                            "referenceToken": reference_token,
+                            "errorCode": cause_code,
+                            "message": cause,
+                        }
+                    ],
                 }
-                lines.append(json.dumps(match, separators=(",", ":")))
+                tasks.append(match)
                 if duplicate_match:
-                    lines.append(json.dumps(match, separators=(",", ":")))
+                    tasks.append(match)
             _add_tar_text(
                 archive,
                 "var/log/vmware/vcf/operationsmanager/operationsmanager.log",
-                "\n".join(lines) + "\n",
+                json.dumps(
+                    {"content": {"workflows": tasks}},
+                    separators=(",", ":"),
+                ),
             )
             _add_tar_text(
                 archive,
                 "var/log/vmware/vcf/nsx/nsx-manager.log",
                 json.dumps(
                     {
-                        "taskId": "noise",
-                        "referenceToken": reference_token,
-                        "causeCode": "NOISE",
-                        "cause": "Reference token alone must not match",
+                        "content": {
+                            "id": "noise",
+                            "errors": [
+                                {
+                                    "referenceToken": reference_token,
+                                    "errorCode": "NOISE",
+                                    "message": "Reference token alone must not match",
+                                }
+                            ],
+                        }
                     },
                     separators=(",", ":"),
-                )
-                + "\n",
+                ),
             )
             _add_tar_text(
                 archive,

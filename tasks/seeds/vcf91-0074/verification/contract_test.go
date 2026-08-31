@@ -55,8 +55,8 @@ func TestOfficialSpecificationProvenance(t *testing.T) {
 		method string
 		path   string
 	}{
-		ReadInfraSegmentOperation:  {http.MethodGet, "/infra/segments/{segment-id}"},
-		PatchInfraSegmentOperation: {http.MethodPatch, "/infra/segments/{segment-id}"},
+		ReadInfraSegmentOperation:            {http.MethodGet, "/infra/segments/{segment-id}"},
+		CreateOrReplaceInfraSegmentOperation: {http.MethodPut, "/infra/segments/{segment-id}"},
 	}
 	if len(contract.Operations) != len(wantOps) {
 		t.Fatalf("contract has %d operations, want %d", len(contract.Operations), len(wantOps))
@@ -101,34 +101,24 @@ func TestOfficialSpecificationProvenance(t *testing.T) {
 
 func TestEnableSegmentExactWireShape(t *testing.T) {
 	tests := []struct {
-		name        string
-		description *string
-		wantBody    func(int32) string
-		wantKeys    []string
+		name            string
+		description     *string
+		wantDescription string
 	}{
 		{
-			name:        "unset optional description is omitted",
-			description: nil,
-			wantBody: func(revision int32) string {
-				return fmt.Sprintf(`{"resource_type":"Segment","_revision":%d,"admin_state":"UP"}`, revision)
-			},
-			wantKeys: []string{"_revision", "admin_state", "resource_type"},
+			name:            "unset optional description preserves the current value",
+			description:     nil,
+			wantDescription: "existing description",
 		},
 		{
-			name:        "explicit description is present",
-			description: stringPointer("enable after maintenance"),
-			wantBody: func(revision int32) string {
-				return fmt.Sprintf(`{"resource_type":"Segment","_revision":%d,"admin_state":"UP","description":"enable after maintenance"}`, revision)
-			},
-			wantKeys: []string{"_revision", "admin_state", "description", "resource_type"},
+			name:            "explicit description is present",
+			description:     stringPointer("enable after maintenance"),
+			wantDescription: "enable after maintenance",
 		},
 		{
-			name:        "multi-byte description at the unicode limit is accepted",
-			description: stringPointer(strings.Repeat("é", 1024)),
-			wantBody: func(revision int32) string {
-				return fmt.Sprintf(`{"resource_type":"Segment","_revision":%d,"admin_state":"UP","description":"%s"}`, revision, strings.Repeat("é", 1024))
-			},
-			wantKeys: []string{"_revision", "admin_state", "description", "resource_type"},
+			name:            "multi-byte description at the unicode limit is accepted",
+			description:     stringPointer(strings.Repeat("é", 1024)),
+			wantDescription: strings.Repeat("é", 1024),
 		},
 	}
 
@@ -142,9 +132,9 @@ func TestEnableSegmentExactWireShape(t *testing.T) {
 			password := fmt.Sprintf("secret-%d", i+1)
 			readBody := segmentDocument(segmentID, revision, connectivity, "DOWN", "NOT_PROTECTED")
 			srv := newMock(t, contractmock.Scenario{
-				SegmentID:   segmentID,
-				ReadBody:    readBody,
-				PatchStatus: http.StatusOK,
+				SegmentID: segmentID,
+				ReadBody:  readBody,
+				PutStatus: http.StatusOK,
 			})
 
 			httpClient := &http.Client{}
@@ -176,7 +166,7 @@ func TestEnableSegmentExactWireShape(t *testing.T) {
 				AdminState:          "UP",
 				Changed:             true,
 				ReadOperationID:     ReadInfraSegmentOperation,
-				MutationOperationID: PatchInfraSegmentOperation,
+				MutationOperationID: CreateOrReplaceInfraSegmentOperation,
 			}
 			if !reflect.DeepEqual(result, wantResult) {
 				t.Fatalf("result mismatch:\n got: %#v\nwant: %#v", result, wantResult)
@@ -189,30 +179,90 @@ func TestEnableSegmentExactWireShape(t *testing.T) {
 			target := "/policy/api/v1/infra/segments/" + url.PathEscape(segmentID)
 			wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
 			assertLoggedRequest(t, log[0], contractmock.ReadOperation, http.MethodGet, target, wantAuth, "", "")
-			wantBody := tt.wantBody(revision)
-			assertLoggedRequest(t, log[1], contractmock.PatchOperation, http.MethodPatch, target, wantAuth, "application/json", wantBody)
+			assertLoggedRequest(t, log[1], contractmock.PutOperation, http.MethodPut, target, wantAuth, "application/json", log[1].Body)
 			if log[0].ContentLength != 0 || len(log[0].TransferEncoding) != 0 {
 				t.Fatalf("GET carried framing for a body: %#v", log[0])
 			}
-			if log[1].ContentLength != int64(len(wantBody)) || len(log[1].TransferEncoding) != 0 {
-				t.Fatalf("PATCH body framing mismatch: %#v", log[1])
+			if log[1].ContentLength != int64(len(log[1].Body)) || len(log[1].TransferEncoding) != 0 {
+				t.Fatalf("PUT body framing mismatch: %#v", log[1])
 			}
-			if got := jsonKeys(t, []byte(log[1].Body)); !reflect.DeepEqual(got, tt.wantKeys) {
-				t.Fatalf("PATCH JSON keys = %v, want %v", got, tt.wantKeys)
+			var gotBody map[string]any
+			if err := json.Unmarshal([]byte(log[1].Body), &gotBody); err != nil {
+				t.Fatalf("decode PUT body: %v", err)
+			}
+			wantBody := map[string]any{
+				"_revision":           revision,
+				"admin_state":         "UP",
+				"advanced_config":     map[string]any{"address_pool_paths": []any{"/infra/ip-pools/pool-1"}},
+				"connectivity_path":   connectivity,
+				"description":         tt.wantDescription,
+				"display_name":        "runtime fixture segment",
+				"id":                  segmentID,
+				"replication_mode":    "MTEP",
+				"resource_type":       "Segment",
+				"subnets":             []any{map[string]any{"gateway_address": "192.0.2.1/24"}},
+				"tags":                []any{map[string]any{"scope": "environment", "tag": "validation"}},
+				"transport_zone_path": "/infra/sites/default/enforcement-points/default/transport-zones/tz-overlay",
+			}
+			wantJSON, err := json.Marshal(wantBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var normalizedWant map[string]any
+			if err := json.Unmarshal(wantJSON, &normalizedWant); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(gotBody, normalizedWant) {
+				t.Fatalf("PUT did not preserve the complete writable segment:\n got: %#v\nwant: %#v", gotBody, normalizedWant)
 			}
 			for _, forbidden := range []string{
-				"id", "display_name", "connectivity_path", "subnets",
-				"transport_zone_path", "vlan_ids", "replication_mode",
-				"tags", "children",
+				"_create_time", "_create_user", "_last_modified_time", "_last_modified_user",
+				"_links", "_protection", "_system_owned", "marked_for_delete", "overridden",
+				"owner_id", "origin_site_id", "parent_path", "path", "realization_id",
+				"relative_path", "remote_path", "unique_id",
 			} {
-				if contains(jsonKeys(t, []byte(log[1].Body)), forbidden) {
-					t.Fatalf("unset optional field %q was sent in %s", forbidden, log[1].Body)
+				if _, found := gotBody[forbidden]; found {
+					t.Fatalf("server-owned field %q was sent in %s", forbidden, log[1].Body)
 				}
 			}
 			if srv.Effects() != 1 {
 				t.Fatalf("mutation effects = %d, want 1", srv.Effects())
 			}
 		})
+	}
+}
+
+func TestPostReadRaceReturnsVersionConflict(t *testing.T) {
+	const (
+		segmentID    = "race-segment"
+		revision     = int32(7)
+		connectivity = "/infra/tier-1s/race-gateway"
+	)
+	srv := newMock(t, contractmock.Scenario{
+		SegmentID:     segmentID,
+		ReadBody:      segmentDocument(segmentID, revision, connectivity, "DOWN", "NOT_PROTECTED"),
+		RaceAfterRead: true,
+	})
+	client, err := NewClient(Config{BaseURL: srv.URL, Username: "race-user", Password: "race-password"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	_, err = client.EnableSegment(context.Background(), segmentID, EnableRequest{
+		ExpectedRevision:         revision,
+		ExpectedConnectivityPath: connectivity,
+	})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.OperationID != CreateOrReplaceInfraSegmentOperation ||
+		apiErr.StatusCode != http.StatusPreconditionFailed || apiErr.ErrorCode == nil || *apiErr.ErrorCode != 500071 {
+		t.Fatalf("race error = %#v, want native 412 version conflict", err)
+	}
+	log := readLog(t, srv.LogPath)
+	if len(log) != 2 || log[0].OperationID != contractmock.ReadOperation ||
+		log[1].OperationID != contractmock.PutOperation || log[1].Method != http.MethodPut {
+		t.Fatalf("race request log = %#v, want one GET followed by one PUT", log)
+	}
+	if srv.Effects() != 0 {
+		t.Fatalf("stale replacement produced %d mutation effects", srv.Effects())
 	}
 }
 
@@ -531,14 +581,35 @@ func readJSONFile(t *testing.T, path string, dst any) {
 
 func segmentDocument(id string, revision int32, connectivity, adminState, protection string) []byte {
 	raw, err := json.Marshal(map[string]any{
-		"resource_type":     "Segment",
-		"id":                id,
-		"display_name":      "runtime fixture segment",
-		"_revision":         revision,
-		"connectivity_path": connectivity,
-		"admin_state":       adminState,
-		"_protection":       protection,
-		"description":       "existing description",
+		"resource_type":       "Segment",
+		"id":                  id,
+		"display_name":        "runtime fixture segment",
+		"_revision":           revision,
+		"connectivity_path":   connectivity,
+		"admin_state":         adminState,
+		"_protection":         protection,
+		"description":         "existing description",
+		"transport_zone_path": "/infra/sites/default/enforcement-points/default/transport-zones/tz-overlay",
+		"subnets":             []any{map[string]any{"gateway_address": "192.0.2.1/24"}},
+		"replication_mode":    "MTEP",
+		"advanced_config":     map[string]any{"address_pool_paths": []any{"/infra/ip-pools/pool-1"}},
+		"tags":                []any{map[string]any{"scope": "environment", "tag": "validation"}},
+		"_create_time":        1720000000000,
+		"_create_user":        "admin",
+		"_last_modified_time": 1720000001000,
+		"_last_modified_user": "admin",
+		"_links":              []any{},
+		"_system_owned":       false,
+		"marked_for_delete":   false,
+		"overridden":          false,
+		"owner_id":            "owner",
+		"origin_site_id":      "site",
+		"parent_path":         "/infra",
+		"path":                "/infra/segments/" + id,
+		"realization_id":      "realization",
+		"relative_path":       id,
+		"remote_path":         "",
+		"unique_id":           "unique",
 	})
 	if err != nil {
 		panic(err)

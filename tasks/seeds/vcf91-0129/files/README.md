@@ -47,16 +47,8 @@ Return one object after readiness with at least `Namespace`,
 `NamespaceStatus`, `Cluster`, `ClusterPhase`, `Ready`,
 `NamespacePollCount`, and `ClusterPollCount`.
 
-The normative vCenter subset is in `docs/contract.json`. Its two exact
-operationIds, source path, and pinned repository commit are recorded in
-`docs/official_sources.json`. The separately labeled Kubernetes routes reflect
-the VKS Cluster API surface and are not represented as VMware operationIds.
-
 Run:
 
 ```text
 python3 grader_tests/verify.py
 ```
-
-The verifier launches only the loopback mock in `tools/mock_server.py`; it
-does not contact a live VMware endpoint.

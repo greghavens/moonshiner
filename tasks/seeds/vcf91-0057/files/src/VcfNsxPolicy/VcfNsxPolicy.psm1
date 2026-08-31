@@ -1,25 +1,14 @@
 Set-StrictMode -Version Latest
 
 function New-VcfNsxPolicyClient {
-    [CmdletBinding(DefaultParameterSetName = 'Token')]
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory, ParameterSetName = 'Connection')]
-        [VMware.Sdk.OpenApi.Cmdlets.IServerConnection] $Connection,
-
-        [Parameter(Mandatory, ParameterSetName = 'Token')]
-        [Parameter(ParameterSetName = 'Connection')]
-        [uri] $Server,
-
-        [Parameter(Mandatory, ParameterSetName = 'Token')]
-        [ValidateNotNullOrEmpty()]
-        [string] $AccessToken,
-
-        [Parameter(ParameterSetName = 'Token')]
-        [switch] $SkipCertificateCheck
+        [Parameter(Mandatory)]
+        [VMware.Sdk.Nsx.Policy.Types.NsxServer] $Connection
     )
 
     throw [System.NotImplementedException]::new(
-        'Create the contract-backed NSX Policy client.'
+        'Create the NSX Policy client from the authenticated PowerCLI connection.'
     )
 }
 

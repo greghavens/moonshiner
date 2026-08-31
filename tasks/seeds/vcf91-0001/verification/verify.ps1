@@ -106,9 +106,9 @@ $contractPath = Join-Path $PSScriptRoot 'docs/contract.json'
 $sourcesPath = Join-Path $PSScriptRoot 'docs/official_sources.json'
 $mockPath = Join-Path $PSScriptRoot 'mock_sddc.py'
 $expectedProtectedHashes = @{
-    $contractPath = '0f5bd3b4f006c617d716bd98a958cc85e907096ed1e7b0a81c62f33ed05d0ff6'
+    $contractPath = 'f77270a9d0a6758fda75d500a4a6c6e444d2d84b6d6ae9efbb88819bcf91ff1e'
     $sourcesPath = 'a9e22a6a3c0d6363798deb5c80af81ebee874d0adb71880a0d5243e4190167b7'
-    $mockPath = '8edddd28a211498c7e1446ac4f390af7224926fd74a32b7833d57c53b1eb584e'
+    $mockPath = 'e17bbe6bc449180c127f56226696055b3215d4a3b407f6fc1f72c29ed5ca447a'
 }
 foreach ($entry in $expectedProtectedHashes.GetEnumerator()) {
     $actualHash = (Get-FileHash -LiteralPath $entry.Key -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -396,7 +396,7 @@ try {
     Assert-Eq 'one SDK token request' 1 $tokenRequests.Count
     Assert-Eq 'token method' 'POST' $tokenRequests[0].method
     Assert-Eq 'token target' '/v1/tokens' $tokenRequests[0].rawTarget
-    Assert-Eq 'token response status' 201 $tokenRequests[0].responseStatus
+    Assert-Eq 'token response status' 200 $tokenRequests[0].responseStatus
     Assert-True 'token content type is JSON' (
         $tokenRequests[0].contentType -like 'application/json*'
     )

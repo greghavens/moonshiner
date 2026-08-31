@@ -19,9 +19,12 @@ const (
 	OperationVMList     = "Vcenter.VM_list"
 	OperationHostList   = "Vcenter.Host_list"
 
-	InitialAccessToken = "access-1"
-	SubjectToken       = "c3ViamVjdC10b2tlbg=="
-	SubjectTokenType   = "urn:ietf:params:oauth:token-type:jwt"
+	InitialAccessToken = "0123456789abcdef0123456789abcdef"
+	RotatedAccessToken = "fedcba9876543210fedcba9876543210"
+	SubjectToken       = "PHNhbWwyOkFzc2VydGlvbiBJRD0iX2NvbnRyYWN0X2NvdmVyYWdlXyIvPg=="
+	SubjectTokenType   = "SAML2"
+	Audience           = "vcf91-contract-coverage"
+	RequestedTokenType = "JWT_ID"
 
 	tokenExchangeGrant = "urn:ietf:params:oauth:grant-type:token-exchange"
 )
@@ -52,6 +55,7 @@ type Server struct {
 	hostResponses int
 	tokenFailure  bool
 	rejectRotated bool
+	extraHost     bool
 }
 
 // Option selects a documented failure mode for error-envelope tests.
@@ -69,6 +73,14 @@ func WithTokenFailure() Option {
 func WithRejectedRotatedAccess() Option {
 	return func(s *Server) {
 		s.rejectRotated = true
+	}
+}
+
+// WithAdditionalHostForSortingCoverage adds a second, deliberately first-
+// sorted host that is not part of the live-shaped primary response.
+func WithAdditionalHostForSortingCoverage() Option {
+	return func(s *Server) {
+		s.extraHost = true
 	}
 }
 
@@ -176,8 +188,10 @@ func operationFor(method, path string) string {
 
 func (s *Server) issueToken(w http.ResponseWriter, r *http.Request, form url.Values) {
 	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	validForm := len(form) == 3 &&
+	validForm := len(form) == 5 &&
+		one(form, "audience") == Audience &&
 		one(form, "grant_type") == tokenExchangeGrant &&
+		one(form, "requested_token_type") == RequestedTokenType &&
 		one(form, "subject_token") == SubjectToken &&
 		one(form, "subject_token_type") == SubjectTokenType
 	if mediaType != "application/x-www-form-urlencoded" ||
@@ -199,13 +213,13 @@ func (s *Server) issueToken(w http.ResponseWriter, r *http.Request, form url.Val
 		return
 	}
 
-	s.validAccess = "access-2"
+	s.validAccess = RotatedAccessToken
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token":      s.validAccess,
 		"token_type":        "Bearer",
 		"expires_in":        300,
 		"refresh_token":     "refresh-2",
-		"issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+		"issued_token_type": RequestedTokenType,
 	})
 }
 
@@ -216,20 +230,17 @@ func (s *Server) listVMs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	items := []map[string]any{
-		{
-			"vm":              "vm-101",
-			"name":            "build-runner",
-			"power_state":     "POWERED_ON",
-			"cpu_count":       4,
-			"memory_size_mib": 8192,
-		},
-		{
-			"vm":              "vm-909",
-			"name":            "release-db",
-			"power_state":     "POWERED_OFF",
-			"cpu_count":       8,
-			"memory_size_mib": 16384,
-		},
+		{"vm": "vm-19", "name": "sddcm01", "power_state": "POWERED_ON", "cpu_count": 4, "memory_size_MiB": 16384},
+		{"vm": "vm-20", "name": "vc01", "power_state": "POWERED_ON", "cpu_count": 4, "memory_size_MiB": 21504},
+		{"vm": "vm-28", "name": "nsx01a", "power_state": "POWERED_ON", "cpu_count": 6, "memory_size_MiB": 24576},
+		{"vm": "vm-33", "name": "vcf-msr01-nxpxf", "power_state": "POWERED_ON", "cpu_count": 4, "memory_size_MiB": 10240},
+		{"vm": "vm-34", "name": "vcf-msr01-5ghdn", "power_state": "POWERED_ON", "cpu_count": 8, "memory_size_MiB": 24576},
+		{"vm": "vm-35", "name": "vcf-msr01-x6j88", "power_state": "POWERED_ON", "cpu_count": 8, "memory_size_MiB": 24576},
+		{"vm": "vm-36", "name": "vcf-msr01-6zpgq", "power_state": "POWERED_ON", "cpu_count": 8, "memory_size_MiB": 24576},
+		{"vm": "vm-37", "name": "vcf01", "power_state": "POWERED_ON", "cpu_count": 4, "memory_size_MiB": 16384},
+		{"vm": "vm-38", "name": "vcf-proxy01", "power_state": "POWERED_ON", "cpu_count": 4, "memory_size_MiB": 16384},
+		{"vm": "vm-39", "name": "vcf-lic01", "power_state": "POWERED_ON", "cpu_count": 2, "memory_size_MiB": 4096},
+		{"vm": "vm-43", "name": "vcf-asr01-szwjz", "power_state": "POWERED_ON", "cpu_count": 8, "memory_size_MiB": 98304},
 	}
 	s.vmResponses++
 	if s.vmResponses%2 == 1 {
@@ -249,21 +260,19 @@ func (s *Server) listHosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items := []map[string]any{
-		{
-			"host":             "host-120",
-			"name":             "esx-a.example.test",
-			"connection_state": "CONNECTED",
-			"power_state":      "POWERED_ON",
-			"host_uuid":        "11111111-1111-1111-1111-111111111111",
-		},
-		{
-			"host":             "host-880",
-			"name":             "esx-z.example.test",
+	items := []map[string]any{{
+		"host":             "host-12",
+		"name":             "esx01.vcf.lab",
+		"connection_state": "CONNECTED",
+		"power_state":      "POWERED_ON",
+		"host_uuid":        "312680c6-8a28-4302-90c6-319869516823",
+	}}
+	if s.extraHost {
+		items = append(items, map[string]any{
+			"host":             "host-01",
+			"name":             "contract-sort-only.example.test",
 			"connection_state": "DISCONNECTED",
-			"power_state":      "POWERED_OFF",
-			"host_uuid":        "99999999-9999-9999-9999-999999999999",
-		},
+		})
 	}
 	s.hostResponses++
 	if s.hostResponses%2 == 1 {
@@ -273,7 +282,7 @@ func (s *Server) listHosts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) validCollectionRequest(r *http.Request) bool {
-	if s.rejectRotated && r.Header.Get("vmware-api-session-id") == "access-2" {
+	if s.rejectRotated && r.Header.Get("vmware-api-session-id") == RotatedAccessToken {
 		return false
 	}
 	return r.URL.RawQuery == "" &&

@@ -2,6 +2,7 @@ package protected_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -9,7 +10,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -33,8 +33,11 @@ func TestOfficialSpecificationProvenance(t *testing.T) {
 			Title   string `json:"title"`
 			Version string `json:"version"`
 		} `json:"info"`
-		BasePath string `json:"basePath"`
-		Source   struct {
+		BasePath            string `json:"basePath"`
+		SecurityDefinitions map[string]struct {
+			Type string `json:"type"`
+		} `json:"securityDefinitions"`
+		Source struct {
 			Repository string `json:"repository"`
 			Commit     string `json:"repository_commit_sha"`
 			Blob       string `json:"spec_blob_sha"`
@@ -71,6 +74,9 @@ func TestOfficialSpecificationProvenance(t *testing.T) {
 		contract.Info.Version != "9.1.0.0" ||
 		contract.BasePath != "/policy/api/v1" {
 		t.Fatalf("unexpected OpenAPI projection metadata: %#v", contract)
+	}
+	if contract.SecurityDefinitions["BasicAuth"].Type != "basic" {
+		t.Fatalf("focused contract does not retain Basic authentication: %#v", contract.SecurityDefinitions)
 	}
 	if contract.Source.Repository != "https://github.com/vmware/vcf-api-specs" ||
 		contract.Source.Commit != pinnedCommit || contract.Source.Blob != pinnedBlob ||
@@ -164,25 +170,15 @@ func TestOfficialSpecificationProvenance(t *testing.T) {
 	}
 }
 
-func TestRefreshResumesInterruptedPageAndSortsEveryTraversal(t *testing.T) {
+func TestBasicAuthPaginationAndSorting(t *testing.T) {
 	const (
-		expiredToken = "expired-access-token-078"
-		freshToken   = "fresh-access-token-078"
+		username = "inventory-user"
+		password = "inventory-password"
 	)
-	srv := newMock(t, contractmock.Scenario{
-		ExpiredToken: expiredToken,
-		FreshToken:   freshToken,
-		ExpireOnce:   true,
-	})
-	source := &recordingTokenSource{
-		current: expiredToken,
-		fresh:   freshToken,
-	}
+	srv := newMock(t, contractmock.Scenario{Username: username, Password: password})
 	callerClient := &http.Client{Timeout: 3 * time.Second}
 	client, err := nsxpolicy.NewClient(nsxpolicy.Config{
-		BaseURL:     srv.URL + "/",
-		TokenSource: source,
-		HTTPClient:  callerClient,
+		BaseURL: srv.URL + "/", Username: username, Password: password, HTTPClient: callerClient,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -192,11 +188,11 @@ func TestRefreshResumesInterruptedPageAndSortsEveryTraversal(t *testing.T) {
 	}
 
 	falseValue := false
-	zero := int64(0)
+	one := int64(1)
 	explicitOptions := nsxpolicy.ListOptions{
 		IncludeMarkedForDelete: &falseValue,
 		IncludedFields:         stringPointer("id,display_name,path"),
-		PageSize:               &zero,
+		PageSize:               &one,
 		SegmentType:            stringPointer("ALL"),
 		SortAscending:          &falseValue,
 		SortBy:                 stringPointer("display_name"),
@@ -218,84 +214,47 @@ func TestRefreshResumesInterruptedPageAndSortsEveryTraversal(t *testing.T) {
 		{ID: "segment-y", DisplayName: "Yankee", Path: "/infra/segments/yankee"},
 		{ID: "segment-z", DisplayName: "Zulu", Path: "/infra/segments/zulu"},
 	}
-	if !reflect.DeepEqual(first, want) {
-		t.Fatalf("first collection is not complete and sorted:\n got: %#v\nwant: %#v", first, want)
-	}
-	if !reflect.DeepEqual(second, want) {
-		t.Fatalf("second collection changed with flipped response order:\n got: %#v\nwant: %#v", second, want)
+	if !reflect.DeepEqual(first, want) || !reflect.DeepEqual(second, want) {
+		t.Fatalf("collections are not complete and deterministic:\nfirst: %#v\nsecond: %#v\nwant: %#v", first, second, want)
 	}
 
-	tokenCalls, refreshes := source.snapshot()
-	if tokenCalls != 2 {
-		t.Fatalf("Token calls = %d, want one per traversal", tokenCalls)
-	}
-	if !reflect.DeepEqual(refreshes, []string{expiredToken}) {
-		t.Fatalf("Refresh rejected-token arguments = %q, want exactly the expired token", refreshes)
-	}
-
-	explicitQuery := "include_mark_for_delete_objects=false&included_fields=id%2Cdisplay_name%2Cpath&page_size=0&segment_type=ALL&sort_ascending=false&sort_by=display_name"
-	explicitTwo := "cursor=cursor-two&" + explicitQuery
-	explicitThree := "cursor=cursor-three&" + explicitQuery
+	explicitQuery := "include_mark_for_delete_objects=false&included_fields=id%2Cdisplay_name%2Cpath&page_size=1&segment_type=ALL&sort_ascending=false&sort_by=display_name"
 	wantQueries := []string{
 		explicitQuery,
-		explicitTwo,
-		explicitTwo,
-		explicitThree,
+		"cursor=cursor-two&" + explicitQuery,
+		"cursor=cursor-three&" + explicitQuery,
 		"",
 		"cursor=cursor-two",
 		"cursor=cursor-three",
 	}
-	wantTokens := []string{
-		expiredToken,
-		expiredToken,
-		freshToken,
-		freshToken,
-		freshToken,
-		freshToken,
-		freshToken,
-	}
-	wantStatuses := []int{200, 401, 200, 200, 200, 200, 200}
+	wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
 	log := srv.Snapshot()
 	if len(log) != len(wantQueries) {
 		t.Fatalf("request log has %d entries, want %d: %#v", len(log), len(wantQueries), log)
 	}
-	for i := range log {
+	for i, query := range wantQueries {
 		target := "/policy/api/v1/infra/segments"
-		if wantQueries[i] != "" {
-			target += "?" + wantQueries[i]
+		if query != "" {
+			target += "?" + query
 		}
-		assertLoggedRequest(t, i, log[i], target, wantQueries[i],
-			"Bearer "+wantTokens[i], wantStatuses[i])
-	}
-	firstPageRequests := 0
-	for _, entry := range log[:4] {
-		if entry.RawQuery == explicitQuery {
-			firstPageRequests++
-		}
-	}
-	if firstPageRequests != 1 {
-		t.Fatalf("first page requested %d times during refresh traversal, want 1", firstPageRequests)
+		assertLoggedRequest(t, i, log[i], target, query, wantAuth, http.StatusOK)
 	}
 }
 
-func TestInputValidationPrecedesTokenAndNetwork(t *testing.T) {
+func TestInputValidationPrecedesNetwork(t *testing.T) {
 	const (
-		expiredToken = "validation-expired-token"
-		freshToken   = "validation-fresh-token"
+		username = "validation-user"
+		password = "validation-password"
 	)
-	srv := newMock(t, contractmock.Scenario{
-		ExpiredToken: expiredToken,
-		FreshToken:   freshToken,
-	})
-	source := &recordingTokenSource{current: expiredToken, fresh: freshToken}
+	srv := newMock(t, contractmock.Scenario{Username: username, Password: password})
 	client, err := nsxpolicy.NewClient(nsxpolicy.Config{
-		BaseURL:     srv.URL,
-		TokenSource: source,
+		BaseURL: srv.URL, Username: username, Password: password,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
 
+	zero := int64(0)
 	negative := int64(-1)
 	tooLarge := int64(1001)
 	cancelledContext, cancel := context.WithCancel(context.Background())
@@ -310,6 +269,7 @@ func TestInputValidationPrecedesTokenAndNetwork(t *testing.T) {
 		{name: "cancelled context", ctx: cancelledContext, is: context.Canceled},
 		{name: "blank included fields", ctx: context.Background(), options: nsxpolicy.ListOptions{IncludedFields: stringPointer("  ")}},
 		{name: "padded included fields", ctx: context.Background(), options: nsxpolicy.ListOptions{IncludedFields: stringPointer(" id ")}},
+		{name: "zero page size", ctx: context.Background(), options: nsxpolicy.ListOptions{PageSize: &zero}},
 		{name: "negative page size", ctx: context.Background(), options: nsxpolicy.ListOptions{PageSize: &negative}},
 		{name: "page size too large", ctx: context.Background(), options: nsxpolicy.ListOptions{PageSize: &tooLarge}},
 		{name: "invalid segment type", ctx: context.Background(), options: nsxpolicy.ListOptions{SegmentType: stringPointer("OVERLAY")}},
@@ -327,30 +287,30 @@ func TestInputValidationPrecedesTokenAndNetwork(t *testing.T) {
 			}
 		})
 	}
-	tokenCalls, refreshes := source.snapshot()
-	if tokenCalls != 0 || len(refreshes) != 0 {
-		t.Fatalf("invalid inputs reached token source: Token=%d Refresh=%q", tokenCalls, refreshes)
-	}
 	if log := srv.Snapshot(); len(log) != 0 {
 		t.Fatalf("invalid inputs reached network: %#v", log)
 	}
 }
 
 func TestNewClientValidationIsLocalAndCallerClientIsImmutable(t *testing.T) {
-	validSource := &recordingTokenSource{current: "current", fresh: "fresh"}
+	valid := nsxpolicy.Config{BaseURL: "https://manager.example", Username: "user", Password: "password"}
 	tests := []struct {
 		name   string
 		config nsxpolicy.Config
 	}{
-		{name: "missing origin", config: nsxpolicy.Config{TokenSource: validSource}},
-		{name: "relative origin", config: nsxpolicy.Config{BaseURL: "manager.example", TokenSource: validSource}},
-		{name: "unsupported scheme", config: nsxpolicy.Config{BaseURL: "ftp://manager.example", TokenSource: validSource}},
-		{name: "userinfo", config: nsxpolicy.Config{BaseURL: "https://user@manager.example", TokenSource: validSource}},
-		{name: "non-root path", config: nsxpolicy.Config{BaseURL: "https://manager.example/policy/api/v1", TokenSource: validSource}},
-		{name: "query", config: nsxpolicy.Config{BaseURL: "https://manager.example?x=1", TokenSource: validSource}},
-		{name: "dangling query", config: nsxpolicy.Config{BaseURL: "https://manager.example?", TokenSource: validSource}},
-		{name: "fragment", config: nsxpolicy.Config{BaseURL: "https://manager.example#fragment", TokenSource: validSource}},
-		{name: "missing token source", config: nsxpolicy.Config{BaseURL: "https://manager.example"}},
+		{name: "missing origin", config: nsxpolicy.Config{Username: "u", Password: "p"}},
+		{name: "relative origin", config: nsxpolicy.Config{BaseURL: "manager.example", Username: "u", Password: "p"}},
+		{name: "unsupported scheme", config: nsxpolicy.Config{BaseURL: "ftp://manager.example", Username: "u", Password: "p"}},
+		{name: "userinfo", config: nsxpolicy.Config{BaseURL: "https://user@manager.example", Username: "u", Password: "p"}},
+		{name: "non-root path", config: nsxpolicy.Config{BaseURL: "https://manager.example/policy/api/v1", Username: "u", Password: "p"}},
+		{name: "query", config: nsxpolicy.Config{BaseURL: "https://manager.example?x=1", Username: "u", Password: "p"}},
+		{name: "dangling query", config: nsxpolicy.Config{BaseURL: "https://manager.example?", Username: "u", Password: "p"}},
+		{name: "fragment", config: nsxpolicy.Config{BaseURL: "https://manager.example#fragment", Username: "u", Password: "p"}},
+		{name: "missing username", config: nsxpolicy.Config{BaseURL: valid.BaseURL, Password: "p"}},
+		{name: "colon username", config: nsxpolicy.Config{BaseURL: valid.BaseURL, Username: "u:name", Password: "p"}},
+		{name: "unsafe username", config: nsxpolicy.Config{BaseURL: valid.BaseURL, Username: "u\nname", Password: "p"}},
+		{name: "missing password", config: nsxpolicy.Config{BaseURL: valid.BaseURL, Username: "u"}},
+		{name: "unsafe password", config: nsxpolicy.Config{BaseURL: valid.BaseURL, Username: "u", Password: "p\rvalue"}},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -360,114 +320,46 @@ func TestNewClientValidationIsLocalAndCallerClientIsImmutable(t *testing.T) {
 			}
 		})
 	}
-	tokenCalls, refreshes := validSource.snapshot()
-	if tokenCalls != 0 || len(refreshes) != 0 {
-		t.Fatalf("configuration validation called token source: Token=%d Refresh=%q", tokenCalls, refreshes)
+
+	caller := &http.Client{Timeout: time.Second}
+	valid.HTTPClient = caller
+	client, err := nsxpolicy.NewClient(valid)
+	if err != nil || client == nil {
+		t.Fatalf("valid NewClient: client=%#v err=%v", client, err)
+	}
+	if caller.CheckRedirect != nil {
+		t.Fatal("NewClient mutated caller-owned HTTP client")
 	}
 }
 
-func TestSecondUnauthorizedResponseIsProjectedAPIError(t *testing.T) {
-	const expiredToken = "still-expired-token"
-	srv := newMock(t, contractmock.Scenario{
-		ExpiredToken: expiredToken,
-		FreshToken:   "unused-fresh-token",
-		ExpireOnce:   true,
-	})
-	source := &recordingTokenSource{
-		current: expiredToken,
-		fresh:   expiredToken,
-	}
+func TestRejectedBasicCredentialsReturnLiveAPIError(t *testing.T) {
+	srv := newMock(t, contractmock.Scenario{Username: "accepted-user", Password: "accepted-password"})
 	client, err := nsxpolicy.NewClient(nsxpolicy.Config{
-		BaseURL:     srv.URL,
-		TokenSource: source,
+		BaseURL: srv.URL, Username: "rejected-user", Password: "rejected-password",
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-
 	_, gotErr := client.ListAllSegments(context.Background(), nsxpolicy.ListOptions{})
 	var apiError *nsxpolicy.APIError
 	if !errors.As(gotErr, &apiError) {
 		t.Fatalf("error = %T %v, want *APIError", gotErr, gotErr)
 	}
 	if apiError.OperationID != nsxpolicy.ListAllInfraSegmentsOperation ||
-		apiError.StatusCode != http.StatusUnauthorized ||
-		apiError.ErrorCode == nil || *apiError.ErrorCode != 40102 ||
-		apiError.ErrorMessage != "access token expired" ||
+		apiError.StatusCode != http.StatusForbidden ||
+		apiError.ErrorCode == nil || *apiError.ErrorCode != 403 ||
 		apiError.ModuleName != "common-services" || apiError.Envelope == nil {
 		t.Fatalf("API error projection mismatch: %#v", apiError)
 	}
-	if strings.Contains(apiError.Error(), "expired") ||
-		strings.Contains(apiError.Error(), expiredToken) {
+	if strings.Contains(apiError.Error(), "rejected-user") ||
+		strings.Contains(apiError.Error(), "rejected-password") ||
+		strings.Contains(apiError.Error(), "incorrect") {
 		t.Fatalf("APIError.Error disclosed protected text: %q", apiError.Error())
 	}
 	log := srv.Snapshot()
-	if len(log) != 3 || log[0].RawQuery != "" ||
-		log[1].RawQuery != "cursor=cursor-two" ||
-		log[2].RawQuery != "cursor=cursor-two" {
-		t.Fatalf("401 retry did not stay on the interrupted page: %#v", log)
+	if len(log) != 1 || log[0].StatusCode != http.StatusForbidden {
+		t.Fatalf("rejected credentials produced unexpected request log: %#v", log)
 	}
-}
-
-func TestTokenErrorsPreserveIdentityWithoutDisclosingText(t *testing.T) {
-	sourceFailure := errors.New("issuer failed while handling sensitive-token-text")
-	source := &recordingTokenSource{
-		current:  "unused-token",
-		fresh:    "unused-fresh",
-		tokenErr: sourceFailure,
-	}
-	client, err := nsxpolicy.NewClient(nsxpolicy.Config{
-		BaseURL:     "https://manager.example",
-		TokenSource: source,
-	})
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-	_, gotErr := client.ListAllSegments(context.Background(), nsxpolicy.ListOptions{})
-	var tokenError *nsxpolicy.TokenError
-	if !errors.As(gotErr, &tokenError) || !errors.Is(gotErr, sourceFailure) {
-		t.Fatalf("error = %T %v, want wrapping *TokenError", gotErr, gotErr)
-	}
-	if strings.Contains(gotErr.Error(), "sensitive-token-text") {
-		t.Fatalf("TokenError disclosed source text: %q", gotErr.Error())
-	}
-}
-
-type recordingTokenSource struct {
-	mu         sync.Mutex
-	current    string
-	fresh      string
-	tokenErr   error
-	refreshErr error
-	tokenCalls int
-	refreshes  []string
-}
-
-func (s *recordingTokenSource) Token(context.Context) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tokenCalls++
-	if s.tokenErr != nil {
-		return "", s.tokenErr
-	}
-	return s.current, nil
-}
-
-func (s *recordingTokenSource) Refresh(_ context.Context, rejected string) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.refreshes = append(s.refreshes, rejected)
-	if s.refreshErr != nil {
-		return "", s.refreshErr
-	}
-	s.current = s.fresh
-	return s.fresh, nil
-}
-
-func (s *recordingTokenSource) snapshot() (int, []string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.tokenCalls, append([]string(nil), s.refreshes...)
 }
 
 func newMock(t *testing.T, scenario contractmock.Scenario) *contractmock.Server {

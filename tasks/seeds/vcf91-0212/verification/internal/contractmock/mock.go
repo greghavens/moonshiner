@@ -10,13 +10,14 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 )
 
 const (
-	pinnedCommit = "c3f3b52c845dd967cabbc21680e893292077d5ba"
-	pinnedPath   = "specifications/vcf-installer/vcf-installer-openapi.json"
+	pinnedCommit = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
+	pinnedPath   = "specifications/sddc-manager/sddc-manager-openapi.json"
 )
 
 type contractDocument struct {
@@ -68,12 +69,12 @@ func Start(t testing.TB, contractPath string, dropFirst bool) *Server {
 		t.Fatalf("decode focused contract: %v", err)
 	}
 	if document.Source.RepositoryCommitSHA != pinnedCommit || document.Source.SpecPath != pinnedPath {
-		t.Fatal("focused contract is not pinned to the VCF Installer 9.1 source")
+		t.Fatal("focused contract is not pinned to the SDDC Manager 9.1 source")
 	}
 	want := operation{
-		OperationID: "deleteDepotSettings",
+		OperationID: "deleteServiceConfigByKey",
 		Method:      http.MethodDelete,
-		Path:        "/v1/system/settings/depot",
+		Path:        "/v1/services-config/{serviceKey}",
 	}
 	if len(document.Operations) != 1 || document.Operations[0] != want {
 		t.Fatalf("focused operations = %+v, want only %+v", document.Operations, want)
@@ -133,7 +134,10 @@ func (s *Server) EffectCount() int {
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	operationID := ""
-	if r.Method == s.route.Method && r.URL.EscapedPath() == s.route.Path {
+	pathPrefix := "/v1/services-config/"
+	if r.Method == s.route.Method && r.URL.RawQuery == "" &&
+		strings.HasPrefix(r.URL.EscapedPath(), pathPrefix) &&
+		len(r.URL.EscapedPath()) > len(pathPrefix) {
 		operationID = s.route.OperationID
 	}
 	record := Request{

@@ -75,31 +75,31 @@ public final class TestMain {
             String base = "/v1/tasks?taskStatus=In%20Progress&completedAfter=0"
                     + "&doLiveRefresh=false&pageSize=2";
             assertGet(requests.get(0), base, INITIAL_TOKEN);
-            assertGet(requests.get(1), base + "&pageNumber=1", INITIAL_TOKEN);
+            assertGet(requests.get(1), base + "&pageNumber=2", INITIAL_TOKEN);
             assertRefresh(requests.get(2), "\"fixture-refresh/\\\"17\\\"\\nline\"");
-            assertGet(requests.get(3), base + "&pageNumber=1",
+            assertGet(requests.get(3), base + "&pageNumber=2",
                     MockVcfInstaller.FRESH_ACCESS_TOKEN);
-            assertGet(requests.get(4), base + "&pageNumber=2",
+            assertGet(requests.get(4), base + "&pageNumber=3",
                     MockVcfInstaller.FRESH_ACCESS_TOKEN);
             eq(1L, requests.stream()
-                    .filter(request -> request.rawTarget().contains("pageNumber=1"))
+                    .filter(request -> request.rawTarget().contains("pageNumber=2"))
                     .filter(request -> request.headerValues("Authorization")
                             .equals(List.of("Bearer " + INITIAL_TOKEN)))
                     .count(), "expired page attempted once with initial token");
             eq(1L, requests.stream()
-                    .filter(request -> request.rawTarget().contains("pageNumber=1"))
+                    .filter(request -> request.rawTarget().contains("pageNumber=2"))
                     .filter(request -> request.headerValues("Authorization")
                             .equals(List.of("Bearer " + MockVcfInstaller.FRESH_ACCESS_TOKEN)))
                     .count(), "same page retried once with fresh token");
             eq(1L, requests.stream()
                     .filter(request -> request.rawTarget().contains("pageSize=2")
                             && !request.rawTarget().contains("pageNumber="))
-                    .count(), "page zero must not restart after refresh");
+                    .count(), "page one must not restart after refresh");
         }
     }
 
     private static void testOptionalOmissionAndExplicitValues() throws Exception {
-        String empty = MockVcfInstaller.page(0, 0, 0, 0, List.of());
+        String empty = MockVcfInstaller.emptyPage();
         try (MockVcfInstaller mock = new MockVcfInstaller(List.of(
                 new MockVcfInstaller.Reply(200, empty)))) {
             VcfInstallerClient client =
@@ -218,7 +218,7 @@ public final class TestMain {
                 one, "refreshAccessToken", "refreshed access token must be nonblank");
 
         String richRefreshId = "quote\" slash/ backslash\\\b\f\n\r\t\u0001 μ";
-        String empty = MockVcfInstaller.page(0, 0, 0, 0, List.of());
+        String empty = MockVcfInstaller.emptyPage();
         try (MockVcfInstaller mock = new MockVcfInstaller(List.of(
                 new MockVcfInstaller.Reply(401, "{}"),
                 new MockVcfInstaller.Reply(200,
@@ -236,7 +236,7 @@ public final class TestMain {
         VcfInstallerClient.TaskQuery one = query(
                 null, null, null, null, null, null,
                 null, null, null, null, 1);
-        String empty = MockVcfInstaller.page(0, 0, 0, 0, List.of());
+        String empty = MockVcfInstaller.emptyPage();
         try (MockVcfInstaller mock = new MockVcfInstaller(List.of(
                 new MockVcfInstaller.Reply(401, "{}"),
                 new MockVcfInstaller.Reply(200,
@@ -289,7 +289,7 @@ public final class TestMain {
 
         assertProtocol(
                 List.of(new MockVcfInstaller.Reply(
-                        200, null, MockVcfInstaller.page(0, 0, 0, 0, List.of()))),
+                        200, null, MockVcfInstaller.emptyPage())),
                 one, "getTasks", "successful page must declare a JSON media type");
         assertProtocol(
                 List.of(
@@ -306,7 +306,7 @@ public final class TestMain {
                 null, null, null, null, 2);
         assertProtocol(
                 List.of(new MockVcfInstaller.Reply(200,
-                        "{\"pageMetadata\":{\"pageNumber\":0,\"pageSize\":0,"
+                        "{\"pageMetadata\":{\"pageNumber\":1,\"pageSize\":0,"
                                 + "\"totalElements\":0,\"totalPages\":0}}")),
                 sizeTwo, "getTasks", "elements is required by the exercise protocol");
         assertProtocol(
@@ -385,7 +385,7 @@ public final class TestMain {
 
         assertProtocol(
                 List.of(new MockVcfInstaller.Reply(
-                        200, "text/plain", MockVcfInstaller.page(0, 0, 0, 0, List.of()))),
+                        200, "text/plain", MockVcfInstaller.emptyPage())),
                 sizeTwo, "getTasks", "successful page must be JSON");
     }
 
@@ -408,12 +408,12 @@ public final class TestMain {
                         "{\"elements\":[{\"id\":\"id\",\"name\":\"Name\","
                                 + "\"type\":false,\"status\":\"Pending\","
                                 + "\"creationTimestamp\":\"t0\"}],"
-                                + "\"pageMetadata\":{\"pageNumber\":0,\"pageSize\":1,"
+                                + "\"pageMetadata\":{\"pageNumber\":1,\"pageSize\":1,"
                                 + "\"totalElements\":1,\"totalPages\":1}}")),
                 one, "getTasks", "Task.type must be a string when present");
         assertProtocol(
                 List.of(new MockVcfInstaller.Reply(200,
-                        "{\"elements\":[null],\"pageMetadata\":{\"pageNumber\":0,"
+                        "{\"elements\":[null],\"pageMetadata\":{\"pageNumber\":1,"
                                 + "\"pageSize\":1,\"totalElements\":1,"
                                 + "\"totalPages\":1}}")),
                 one, "getTasks", "each Task must be an object");

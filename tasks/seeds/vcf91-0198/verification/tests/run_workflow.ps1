@@ -38,6 +38,12 @@ elseif ($SkipValidationsMode -eq 'False') {
     $deploymentParameters.SkipValidations = $false
 }
 
-$result = Invoke-VcfInstallerResilientDeployment @deploymentParameters
+try {
+    $result = Invoke-VcfInstallerResilientDeployment @deploymentParameters
+}
+catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
 
 $result | ConvertTo-Json -Depth 20 -Compress

@@ -76,6 +76,7 @@ function New-Timestamp {
 $script:Tasks     = [ordered]@{}   # taskId -> task object
 $script:Bundles   = [ordered]@{}   # bundleId -> support bundle (materialised)
 $script:Polls     = @{}            # taskId -> poll count
+$script:TaskComponents = @{}       # taskId -> component id (not returned on live tasks)
 
 function New-ErrorResponse {
     param([string]$Code, [string]$Message)
@@ -169,7 +170,7 @@ try {
                     $now = New-Timestamp
                     $task = [ordered]@{
                         id            = $taskId
-                        name          = 'component_support_bundle_generation'
+                        name          = 'CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW'
                         description   = [ordered]@{
                             id               = 'com.broadcom.lcm.ops.component.supportbundle.started'
                             defaultMessage   = "Started support bundle generation for component $componentId"
@@ -177,10 +178,7 @@ try {
                             args             = [ordered]@{ componentId = $componentId }
                         }
                         status        = 'RUNNING'
-                        type          = 'SUPPORT_BUNDLE_GENERATION'
                         createdBy     = 'admin'
-                        resourceId    = $componentId
-                        resourceType  = 'COMPONENT'
                         createTime    = $now
                         startTime     = $now
                         updateTime    = $now
@@ -190,6 +188,7 @@ try {
                     $corr = $req.Headers['X-Correlation-Id']
                     if ($corr) { $task['correlationId'] = $corr }
                     $script:Tasks[$taskId] = $task
+                    $script:TaskComponents[$taskId] = $componentId
                     $script:Polls[$taskId] = 0
                     $status = 202
                     $payload = $task
@@ -199,8 +198,7 @@ try {
                     $q = [System.Web.HttpUtility]::ParseQueryString($rawQuery)
                     $items = @()
                     foreach ($t in $script:Tasks.Values) {
-                        if ($q['resourceId']   -and $t['resourceId']   -ne $q['resourceId'])   { continue }
-                        if ($q['resourceType'] -and $t['resourceType'] -ne $q['resourceType']) { continue }
+                        if ($q['name'] -and $t['name'] -ne $q['name']) { continue }
                         if ($q['status']       -and $t['status']       -ne $q['status'])       { continue }
                         if ($q['type']         -and $t['type']         -ne $q['type'])         { continue }
                         $items += ConvertTo-TaskSummary $t
@@ -208,7 +206,7 @@ try {
                     $payload = [ordered]@{
                         elements     = @($items)
                         pageMetadata = [ordered]@{
-                            pageNumber    = 0
+                            pageNumber    = 1
                             pageSize      = @($items).Count
                             totalElements = @($items).Count
                             totalPages    = 1
@@ -233,11 +231,11 @@ try {
                                 $bundleId = New-DeterministicGuid -Prefix 'b0000000'
                                 $script:Bundles[$bundleId] = [ordered]@{
                                     id               = $bundleId
-                                    name             = "support-bundle-$($task['resourceId']).tgz"
+                                    name             = "support-bundle-$($script:TaskComponents[$taskId]).tgz"
                                     size             = 10485760
                                     createdTimestamp = $task['endTime']
                                     url              = "http://127.0.0.1:$Port/downloads/$bundleId.tgz"
-                                    _componentId     = $task['resourceId']
+                                    _componentId     = $script:TaskComponents[$taskId]
                                 }
                             }
                             $task['updateTime'] = New-Timestamp

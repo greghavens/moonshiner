@@ -1,2 +1,1 @@
-"""Implement the contract-pinned vCenter inventory client here."""
-
+"""Implement the focused vCenter inventory client here."""

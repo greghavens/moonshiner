@@ -323,7 +323,7 @@ class WireContractTestCase(unittest.TestCase):
             "style=form/explode=true repeats groupId; parameters keep their declared order",
         )
 
-    def test_09_create_conflict_surfaces_as_an_api_error(self) -> None:
+    def test_09_duplicate_create_surfaces_live_appliance_error(self) -> None:
         result = self.ensure()
         duplicate = {
             "resourceKey": {
@@ -335,9 +335,11 @@ class WireContractTestCase(unittest.TestCase):
         }
         with self.assertRaises(self.pkg.OperationsApiError) as ctx:
             self.client.create_custom_group(duplicate)
-        self.assertEqual(409, ctx.exception.status)
+        self.assertEqual(500, ctx.exception.status)
         self.assertEqual("createCustomGroup", ctx.exception.operation_id)
-        self.assertIn("already exists", ctx.exception.body)
+        error = json.loads(ctx.exception.body)
+        self.assertEqual(500, error["apiErrorCode"])
+        self.assertEqual("Internal Server error, cause unknown.", error["message"])
         self.assertTrue(result.group_id)
 
     def test_10_client_touches_only_contracted_loopback_operations(self) -> None:
@@ -538,6 +540,66 @@ class WireContractTestCase(unittest.TestCase):
             ],
             [record["path"] for record in records],
         )
+
+    def test_18_empty_membership_is_rejected_before_mutating_traffic(self) -> None:
+        empty = {
+            "resourceKey": {
+                "adapterKindKey": ADAPTER_KIND,
+                "name": "Empty membership",
+                "resourceKindKey": RESOURCE_KIND,
+            },
+            "membershipDefinition": {},
+        }
+
+        self.mock.truncate_log()
+        with self.assertRaises(ValueError):
+            self.client.create_custom_group(empty)
+        with self.assertRaises(ValueError):
+            self.client.modify_custom_group({**empty, "id": RESOURCE_A})
+        with self.assertRaises(ValueError):
+            self.pkg.ensure_custom_group(
+                self.client,
+                name="Missing unmanaged-membership group",
+                adapter_kind_key=ADAPTER_KIND,
+                resource_kind_key=RESOURCE_KIND,
+            )
+
+        self.assertEqual([], self.requests_for("createCustomGroup"))
+        self.assertEqual([], self.requests_for("modifyCustomGroup"))
+
+    def test_19_unmanaged_membership_is_preserved_during_other_updates(self) -> None:
+        old_policy = "9f3c1e77-45aa-4a0e-8f1e-7c2b6d9e4f10"
+        new_policy = "0550d6c8-9c3b-49f2-8cc8-cae9062f7881"
+        created = self.ensure(policy=old_policy)
+        self.mock.truncate_log()
+
+        updated = self.pkg.ensure_custom_group(
+            self.client,
+            name=GROUP_NAME,
+            adapter_kind_key=ADAPTER_KIND,
+            resource_kind_key=RESOURCE_KIND,
+            policy=new_policy,
+        )
+
+        self.assertEqual("updated", updated.action)
+        modify = self.only("modifyCustomGroup")
+        self.assertEqual(
+            sorted([RESOURCE_A, RESOURCE_B]),
+            modify["body"]["membershipDefinition"]["includedResources"],
+        )
+
+    def test_20_modify_identity_collision_matches_live_status_and_code(self) -> None:
+        first = self.ensure()
+        second = self.ensure(name="Payments Tier VMs collision peer")
+        payload = dict(second.group)
+        payload["resourceKey"] = dict(first.group["resourceKey"])
+        self.mock.truncate_log()
+
+        with self.assertRaises(self.pkg.OperationsApiError) as ctx:
+            self.client.modify_custom_group(payload)
+
+        self.assertEqual(400, ctx.exception.status)
+        self.assertEqual(1506, json.loads(ctx.exception.body)["apiErrorCode"])
 
 
 if __name__ == "__main__":

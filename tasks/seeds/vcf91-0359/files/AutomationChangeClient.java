@@ -4,7 +4,7 @@ import java.util.Map;
 
 /**
  * Minimal VCF Automation change client. Implement {@link #runChange} using only
- * the JDK standard library and the contract in docs/contract.json.
+ * the JDK standard library and the API contract.
  */
 public final class AutomationChangeClient {
     public record ChangeStep(String actionId, Map<String, Object> inputs, String reason) {}

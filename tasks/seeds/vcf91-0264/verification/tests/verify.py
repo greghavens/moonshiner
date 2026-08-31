@@ -209,6 +209,11 @@ def verify_contract() -> None:
         gate.get("mutatingOperationId") == "createAdapterInstance",
         "contract mutating operation changed",
     )
+    require(
+        "returned credential id" in gate.get("rule", "")
+        and "replacing credential fields" in gate.get("rule", ""),
+        "contract must record the live precheck credential handoff",
+    )
 
     encoding = contract.get("wireEncoding", {})
     require(
@@ -312,11 +317,20 @@ def verify_contract() -> None:
         )
         nested = profile.get("nestedProfiles", [])
         require(len(nested) == 1, f"{label} nested credential profile changed")
+        expected_bound = (
+            ["adapterKindKey", "credentialKindKey", "fields", "name"]
+            if label == "testConnection"
+            else ["adapterKindKey", "credentialKindKey", "id", "name"]
+        )
+        expected_unset = (
+            ["editable", "id"]
+            if label == "testConnection"
+            else ["editable", "fields"]
+        )
         require(
             nested[0].get("schema") == "credential"
-            and nested[0].get("boundMembers")
-            == ["adapterKindKey", "credentialKindKey", "fields", "name"]
-            and nested[0].get("unsetMembers") == ["editable", "id"]
+            and nested[0].get("boundMembers") == expected_bound
+            and nested[0].get("unsetMembers") == expected_unset
             and nested[0].get("unsetBehavior") == "omit",
             f"{label} credential wire profile changed",
         )
@@ -591,6 +605,7 @@ def make_case(
         "description": description,
         "credentialName": f"cred-{marker}",
         "credentialKindKey": "PrincipalCredential",
+        "precheckCredentialInstanceId": str(uuid.uuid4()),
         "credentialFields": [
             ["USER", f"onboard-{marker}@example.test"],
             ["PASSWORD", "cred-" + secrets.token_urlsafe(14)],
@@ -637,6 +652,7 @@ def make_case(
         return case
 
     tested = adapter_instance(instance_name, adapter_kind)
+    tested["credentialInstanceId"] = case["precheckCredentialInstanceId"]
     if not omit_success_optionals:
         tested["messageFromAdapterInstance"] = f"Connection verified for {marker}"
     case["testedInstance"] = tested
@@ -646,7 +662,7 @@ def make_case(
     )
     if not omit_success_optionals:
         created["collectorId"] = 1 + len(marker) % 5
-        created["credentialInstanceId"] = str(uuid.uuid4())
+        created["credentialInstanceId"] = case["precheckCredentialInstanceId"]
         created["description"] = f"stored description {marker}"
         created["messageFromAdapterInstance"] = "adapter instance created"
     case["createdInstance"] = created
@@ -741,18 +757,22 @@ def expected_auth_body(case: dict[str, Any]) -> str:
     return compact(payload)
 
 
-def expected_create_body(case: dict[str, Any]) -> str:
+def expected_adapter_body(case: dict[str, Any], *, persisted: bool) -> str:
+    credential: dict[str, Any] = {
+        "adapterKindKey": case["adapterKindKey"],
+        "credentialKindKey": case["credentialKindKey"],
+    }
+    if persisted:
+        credential["id"] = case["precheckCredentialInstanceId"]
+    else:
+        credential["fields"] = [
+            {"name": name, "value": value}
+            for name, value in case["credentialFields"]
+        ]
+    credential["name"] = case["credentialName"]
     payload: dict[str, Any] = {
         "adapterKindKey": case["adapterKindKey"],
-        "credential": {
-            "adapterKindKey": case["adapterKindKey"],
-            "credentialKindKey": case["credentialKindKey"],
-            "fields": [
-                {"name": name, "value": value}
-                for name, value in case["credentialFields"]
-            ],
-            "name": case["credentialName"],
-        },
+        "credential": credential,
     }
     if case["description"]:
         payload["description"] = case["description"]
@@ -1025,8 +1045,9 @@ def verify_optional_success(
         "the optional-response success changed a service outcome",
     )
     require(
-        requests[2]["body"] == requests[3]["body"],
-        "the optional-response create body differs from the tested body",
+        requests[2]["body"] == expected_adapter_body(case, persisted=False)
+        and requests[3]["body"] == expected_adapter_body(case, persisted=True),
+        "the optional-response flow did not replace fields with the precheck credential id",
     )
     require(
         sum(item.get("operationId") == "createAdapterInstance" for item in requests)
@@ -1229,7 +1250,7 @@ def verify_wire(scenario: dict[str, Any], requests: list[dict[str, Any]]) -> Non
             one_header(test, "content-type") == "application/json",
             "testConnection Content-Type must be application/json",
         )
-        expected_body = expected_create_body(case)
+        expected_body = expected_adapter_body(case, persisted=False)
         require(
             test["body"] == expected_body,
             f"testConnection body bytes changed for case {case['key']}",
@@ -1297,8 +1318,29 @@ def verify_wire(scenario: dict[str, Any], requests: list[dict[str, Any]]) -> Non
             "an unset optional query member must not appear on the wire",
         )
         require(
-            create["body"] == test["body"],
-            "the created body must be byte-identical to the tested body",
+            create["body"] == expected_adapter_body(case, persisted=True),
+            "createAdapterInstance must replace inline fields with the precheck credential id",
+        )
+        created_payload = json.loads(create["body"])
+        created_credential = created_payload["credential"]
+        require(
+            list(created_credential)
+            == ["adapterKindKey", "credentialKindKey", "id", "name"],
+            "created credential members changed or lost contract order",
+        )
+        require(
+            created_credential["id"] == case["precheckCredentialInstanceId"]
+            and "fields" not in created_credential
+            and "editable" not in created_credential,
+            "create must use the persisted credential id and omit secret fields",
+        )
+        tested_settings = dict(payload)
+        created_settings = dict(created_payload)
+        tested_settings.pop("credential")
+        created_settings.pop("credential")
+        require(
+            tested_settings == created_settings,
+            "create must preserve the adapter settings accepted by testConnection",
         )
         require(
             int(one_header(create, "content-length")) == create["bodyLength"],

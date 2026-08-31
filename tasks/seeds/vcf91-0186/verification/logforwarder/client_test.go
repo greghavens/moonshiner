@@ -13,8 +13,8 @@ import (
 	"strings"
 	"testing"
 
-	"moonshiner.local/vcf91-0186/internal/contractmock"
-	"moonshiner.local/vcf91-0186/logforwarder"
+	"vcflogforwarder/internal/contractmock"
+	"vcflogforwarder/logforwarder"
 )
 
 const contractPath = "../docs/contract.json"

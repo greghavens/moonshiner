@@ -48,7 +48,7 @@ class ContractServer(ThreadingHTTPServer):
         self.access_token = "idp_access_" + secrets.token_hex(18)
         self.blocked_name = f'Blocked "IdP" \\ {suffix}'
         self.allowed_name = f'Federated "IdP" \\ Ω {suffix}'
-        self.provider_type = f'OIDC-"broker"-{suffix}'
+        self.provider_type = "FEDERATED_IDP_BROKER"
 
     def append_log(self, entry: dict) -> None:
         with self.log_lock:
@@ -138,6 +138,23 @@ class Handler(BaseHTTPRequestHandler):
         expected = {
             "name": self.server.allowed_name,
             "type": self.server.provider_type,
+            "fedIdpSpec": {
+                "name": "Broker federation",
+                "directory": {
+                    "name": "Corporate Directory",
+                    "defaultDomain": "corp.example",
+                    "domains": ["corp.example", "example.org"],
+                    "federatedIdpSourceType": "MICROSOFT_ENTRA_ID",
+                },
+                "oidcSpec": {
+                    "clientId": "vcf-client",
+                    "clientSecret": "client-secret-value",
+                    "discoveryEndpoint": (
+                        "https://login.example.org/.well-known/"
+                        "openid-configuration"
+                    ),
+                },
+            },
         }
         if not self.server.mutation_allowed or payload != expected:
             entry["mutationApplied"] = False

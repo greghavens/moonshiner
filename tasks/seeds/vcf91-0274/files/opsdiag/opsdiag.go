@@ -25,7 +25,7 @@ var ErrIncompleteContract = errors.New("opsdiag: contract does not name every re
 // Contract is the loaded projection of the VCF Operations OpenAPI
 // specification that pins every request this package issues.
 type Contract struct {
-	// TODO: model the fields of docs/contract.json that the client needs.
+	// TODO: model the fields required by the documented operations.
 }
 
 // Diagnosis is the result of correlating the records retrieved for one resource.
@@ -49,7 +49,7 @@ type Diagnosis struct {
 	Notes []string
 }
 
-// Client issues contract-pinned requests against a VCF Operations endpoint.
+// Client issues focused requests against a VCF Operations endpoint.
 // A Client is safe for concurrent use by multiple goroutines.
 type Client struct {
 	// TODO

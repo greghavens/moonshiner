@@ -20,10 +20,10 @@ EXPECTED_OPERATIONS = {
 
 # Filled with byte hashes after the protected fixtures are authored.
 PROTECTED_SHA256 = {
-    "docs/contract.json": "517376af7b000384659e224224a9752981b2f1638631e89293c680d128cff9eb",
+    "docs/contract.json": "de015b9934ec2bfa3fe3587eeeb329815ce419d80bcb903cc7388bd8d3fcda07",
     "docs/official_sources.json": "7fbeb917d8bf7c3b8a59d32aa6aca99726d5ad6ebd46d30a06d6b03ef88d6681",
-    "tests/ContractMock.java": "1894fe4dac9b91cd67e80275c780ad488d368d296cf1f859c275bd45b1d9cf6a",
-    "tests/TestMain.java": "d9fb86cf3e839013539422caea0a9c3dbfc93eec3509b4d59c26a2701c67c245",
+    "tests/ContractMock.java": "9358bece0c558562ddc9804f3e464b6df0b09bdf9d911f08d32873897df0ea73",
+    "tests/TestMain.java": "da84def94a1546d21837a92c247815705565515c1c55eebde76a8fc8055fa70f",
 }
 
 

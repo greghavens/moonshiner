@@ -175,10 +175,14 @@ public final class MockVcfInstaller implements AutoCloseable {
     public static String page(
             int pageNumber, int pageSize, int totalElements, int totalPages, List<String> tasks) {
         return "{\"elements\":[" + String.join(",", tasks) + "],\"pageMetadata\":{"
-                + "\"pageNumber\":" + pageNumber
+                + "\"pageNumber\":" + (pageNumber + 1)
                 + ",\"pageSize\":" + pageSize
                 + ",\"totalElements\":" + totalElements
                 + ",\"totalPages\":" + totalPages + "}}";
+    }
+
+    public static String emptyPage() {
+        return "{\"elements\":[],\"pageMetadata\":{}}";
     }
 
     public static String task(

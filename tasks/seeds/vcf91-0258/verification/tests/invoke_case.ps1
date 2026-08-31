@@ -39,6 +39,7 @@ $Common = @{
     ResourceKind = $Config.resource_kind
     AdapterKind  = $Config.adapter_kind
     AuthSource   = $Config.auth_source
+    SkipCertificateCheck = $true
     PageSize     = $Config.page_size
 }
 

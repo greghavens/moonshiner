@@ -576,7 +576,8 @@ class WireShapeTestCase(unittest.TestCase):
 class SuccessfulWorkflowTest(WireShapeTestCase):
     def test_full_workflow_wire_shape(self):
         bundle = self.client.generate_support_bundle_and_wait(
-            COMPONENT_OK, look_back_window=24, correlation_id="corr-7f21a9"
+            COMPONENT_OK, look_back_window=24,
+            correlation_id="7f21a900-0000-4000-8000-000000000001"
         )
 
         self.assertIsInstance(bundle, dict, "the workflow returns the SupportBundle")
@@ -609,7 +610,8 @@ class SuccessfulWorkflowTest(WireShapeTestCase):
 
     def test_post_body_and_headers(self):
         self.client.generate_support_bundle(
-            COMPONENT_OK, look_back_window=24, correlation_id="corr-7f21a9"
+            COMPONENT_OK, look_back_window=24,
+            correlation_id="7f21a900-0000-4000-8000-000000000001"
         )
         entry = self.requests()[0]
         self.assertEqual(entry["method"], "POST")
@@ -621,7 +623,10 @@ class SuccessfulWorkflowTest(WireShapeTestCase):
         )
         headers = entry["headers_lower"]
         self.assertEqual(headers.get("content-type"), "application/json")
-        self.assertEqual(headers.get("x-correlation-id"), "corr-7f21a9")
+        self.assertEqual(
+            headers.get("x-correlation-id"),
+            "7f21a900-0000-4000-8000-000000000001",
+        )
         self.assertEqual(
             headers.get("content-length"),
             str(len(entry["body_raw"].encode("utf-8"))),
@@ -679,6 +684,15 @@ class OptionalFieldOmissionTest(WireShapeTestCase):
             {"lookBackWindow": 0},
             "0 is a supplied value; only None means the property is unset",
         )
+
+    def test_supplied_correlation_id_must_be_a_bare_uuid(self):
+        import vcf_lcm
+
+        with self.assertRaises(vcf_lcm.LcmApiError):
+            self.client.generate_support_bundle(
+                COMPONENT_OK, correlation_id="not-a-uuid"
+            )
+        self.assertEqual(self.requests(), [], "invalid correlation id reached the wire")
 
 
 class PollingTest(WireShapeTestCase):

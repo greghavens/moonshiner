@@ -9,7 +9,7 @@
     PowerShellVersion = '7.4'
     RequiredModules = @(
         @{
-            ModuleName = 'VMware.Sdk.Vcf.SddcManager'
+            ModuleName = 'VMware.Sdk.vSphere'
             ModuleVersion = '13.5.0'
         }
     )

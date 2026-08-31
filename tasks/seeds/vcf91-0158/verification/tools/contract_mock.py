@@ -107,6 +107,20 @@ class ContractMock:
             with self._lock:
                 self._round += 1
                 round_number = self._round
+            if round_number == 1:
+                self._json(handler, 200, [{
+                    "master_host": "",
+                    "namespace": "",
+                    "control_plane_api_server_port": 6443,
+                }])
+                return
+            if round_number == 2:
+                self._json(handler, 200, [{
+                    "namespace": "vm-service-domain-c8",
+                    "master_host": self.base_url,
+                    "control_plane_api_server_port": 6443,
+                }])
+                return
             summaries = [
                 {"namespace": "zeta-team", "master_host": self.base_url},
                 {"namespace": "alpha-team", "master_host": self.base_url},
@@ -124,7 +138,8 @@ class ContractMock:
                 self._json(handler, 404, {"error": "route not found"})
                 return
             namespace = unquote(encoded)
-            if namespace not in {"alpha-team", "zeta-team"}:
+            if namespace not in {
+                    "alpha-team", "zeta-team", "vm-service-domain-c8"}:
                 self._json(handler, 404, {"error": "route not found"})
                 return
             self._serve_cluster_page(handler, namespace, target.query)
@@ -138,6 +153,27 @@ class ContractMock:
             namespace: str,
             query: str) -> None:
         parsed = parse_qs(query, keep_blank_values=True, strict_parsing=True)
+        if namespace == "vm-service-domain-c8":
+            if set(parsed) != {"limit"} or parsed["limit"] != ["200"]:
+                self._failure("invalid live Kubernetes one-page query")
+                self._json(handler, 400, {"error": "invalid pagination"})
+                return
+            self._json(handler, 200, {
+                "apiVersion": "cluster.x-k8s.io/v1beta2",
+                "kind": "ClusterList",
+                "metadata": {
+                    "resourceVersion": "2545994",
+                    "continue": "",
+                },
+                "items": [self._cluster(
+                    namespace,
+                    "vcf-msr01",
+                    "a72f46d6-a0be-41f5-b6e5-2be4207f035f",
+                    "v1.34.2",
+                    "Provisioned",
+                )],
+            })
+            return
         expected_token = f"{namespace}+next/=?&two"
         if set(parsed) == {"limit"} and parsed["limit"] == ["2"]:
             page = 1

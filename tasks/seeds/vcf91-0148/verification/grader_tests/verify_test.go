@@ -115,14 +115,13 @@ func fixture(t *testing.T, mutate func(*mockvcf.Config)) (*mockvcf.Server, *toke
 	ns := sut.NamespaceSpec{Name: value(t, "ns"), Supervisor: value(t, "sup")}
 	cluster := sut.ClusterSpec{
 		Name:                 value(t, "cluster"),
-		Class:                value(t, "class"),
-		Version:              "v1.31.4+vmware.1-fips",
+		Class:                "vsphere-9.1.2668",
+		Version:              "v1.34.2",
 		ControlPlaneReplicas: 3,
-		WorkerClass:          value(t, "worker-class"),
-		WorkerName:           value(t, "worker-name"),
-		WorkerReplicas:       4,
-		VMClass:              value(t, "vm-class"),
-		StorageClass:         value(t, "storage-class"),
+		WorkerClass:          "vsphere-9.1.2668-worker",
+		WorkerName:           "workers",
+		WorkerReplicas:       3,
+		TopologyVariables:    liveTopologyVariables(),
 	}
 	tokens := &tokenSource{old: value(t, "expired"), fresh: value(t, "fresh")}
 	cfg := mockvcf.Config{
@@ -172,17 +171,33 @@ func newScriptClient(t *testing.T, transport http.RoundTripper, tokens sut.Token
 }
 
 func validSpecs() (sut.NamespaceSpec, sut.ClusterSpec) {
-	return sut.NamespaceSpec{Name: "namespace", Supervisor: "supervisor"}, sut.ClusterSpec{
-		Name:                 "cluster",
-		Class:                "cluster-class",
-		Version:              "v1.31.4+vmware.1-fips",
+	return sut.NamespaceSpec{Name: "vmsp-platform", Supervisor: "supervisor"}, sut.ClusterSpec{
+		Name:                 "vcf-msr01",
+		Class:                "vsphere-9.1.2668",
+		Version:              "v1.34.2",
 		ControlPlaneReplicas: 3,
-		WorkerClass:          "worker-class",
-		WorkerName:           "worker-name",
-		WorkerReplicas:       4,
-		VMClass:              "vm-class",
-		StorageClass:         "storage-class",
+		WorkerClass:          "vsphere-9.1.2668-worker",
+		WorkerName:           "workers",
+		WorkerReplicas:       3,
+		TopologyVariables:    liveTopologyVariables(),
 	}
+}
+
+func liveTopologyVariables() []sut.TopologyVariable {
+	names := []string{
+		"datastore", "dnsImageTag", "imageRepository", "infraServerThumbprint",
+		"network", "infraServerURL", "resourcePool", "vmTemplate", "datacenter",
+		"etcdImageTag", "folder", "controlPlaneIpAddr", "credsSecretName",
+		"kubeVipPodManifest",
+	}
+	variables := make([]sut.TopologyVariable, len(names))
+	for index, name := range names {
+		variables[index] = sut.TopologyVariable{
+			Name:  name,
+			Value: map[string]any{"liveValidated": true, "name": name},
+		}
+	}
+	return variables
 }
 
 func TestRefreshReplaysOnlyExpiredRequest(t *testing.T) {
@@ -286,6 +301,44 @@ func TestRefreshReplaysOnlyExpiredRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertClusterOmissions(t, clusterObject)
+}
+
+func TestLiveEnvironmentFailureBoundaries(t *testing.T) {
+	t.Run("absent Supervisor namespace create", func(t *testing.T) {
+		server, tokens, namespace, cluster := fixture(t, func(cfg *mockvcf.Config) {
+			cfg.NamespaceCreate404 = true
+		})
+		defer server.Close()
+		client := newClient(t, server, value(t, "session"), tokens)
+		_, err := client.Ensure(context.Background(), namespace, cluster)
+		var apiError *sut.APIError
+		if !errors.As(err, &apiError) ||
+			apiError.OperationID != createNamespaceID ||
+			apiError.StatusCode != http.StatusNotFound {
+			t.Fatalf("error = %#v, want live namespace-create 404", err)
+		}
+		if requests := server.Requests(); len(requests) != 2 {
+			t.Fatalf("request count = %d, want 2", len(requests))
+		}
+	})
+
+	t.Run("strict Kubernetes admission rejection", func(t *testing.T) {
+		server, tokens, namespace, cluster := fixture(t, func(cfg *mockvcf.Config) {
+			cfg.ClusterCreate422 = true
+		})
+		defer server.Close()
+		client := newClient(t, server, value(t, "session"), tokens)
+		_, err := client.Ensure(context.Background(), namespace, cluster)
+		var apiError *sut.APIError
+		if !errors.As(err, &apiError) ||
+			apiError.OperationID != "Kubernetes.Cluster.create" ||
+			apiError.StatusCode != http.StatusUnprocessableEntity {
+			t.Fatalf("error = %#v, want live Kubernetes admission 422", err)
+		}
+		if requests := server.Requests(); len(requests) != 4 {
+			t.Fatalf("request count = %d, want 4", len(requests))
+		}
+	})
 }
 
 func TestUnauthorizedClusterGETIsRefreshedInPlace(t *testing.T) {
@@ -510,8 +563,10 @@ func TestEnsureValidatesEverySpecFieldBeforeIO(t *testing.T) {
 		{"worker name", func(_ *sut.NamespaceSpec, cluster *sut.ClusterSpec) { cluster.WorkerName = "" }},
 		{"worker replicas zero", func(_ *sut.NamespaceSpec, cluster *sut.ClusterSpec) { cluster.WorkerReplicas = 0 }},
 		{"worker replicas negative", func(_ *sut.NamespaceSpec, cluster *sut.ClusterSpec) { cluster.WorkerReplicas = -1 }},
-		{"VM class", func(_ *sut.NamespaceSpec, cluster *sut.ClusterSpec) { cluster.VMClass = "" }},
-		{"storage class", func(_ *sut.NamespaceSpec, cluster *sut.ClusterSpec) { cluster.StorageClass = "" }},
+		{"missing topology variables", func(_ *sut.NamespaceSpec, cluster *sut.ClusterSpec) { cluster.TopologyVariables = nil }},
+		{"wrong topology variable order", func(_ *sut.NamespaceSpec, cluster *sut.ClusterSpec) {
+			cluster.TopologyVariables[0], cluster.TopologyVariables[1] = cluster.TopologyVariables[1], cluster.TopologyVariables[0]
+		}},
 	}
 	transport := &scriptedTransport{}
 	tokens := &tokenSource{old: "token", fresh: "fresh"}
@@ -519,6 +574,9 @@ func TestEnsureValidatesEverySpecFieldBeforeIO(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			invalidNamespace, invalidCluster := namespace, cluster
+			invalidCluster.TopologyVariables = append(
+				[]sut.TopologyVariable(nil), cluster.TopologyVariables...,
+			)
 			tc.mutate(&invalidNamespace, &invalidCluster)
 			if _, err := client.Ensure(context.Background(), invalidNamespace, invalidCluster); err == nil {
 				t.Fatal("Ensure returned nil error")
@@ -665,14 +723,17 @@ func expectedClusterBody(cluster sut.ClusterSpec) string {
 	}
 	type variable struct {
 		Name  string `json:"name"`
-		Value string `json:"value"`
+		Value any    `json:"value"`
+	}
+	type classReference struct {
+		Name string `json:"name"`
 	}
 	type topology struct {
-		Class        string       `json:"class"`
-		Version      string       `json:"version"`
-		ControlPlane controlPlane `json:"controlPlane"`
-		Workers      workers      `json:"workers"`
-		Variables    []variable   `json:"variables"`
+		ClassRef     classReference `json:"classRef"`
+		Version      string         `json:"version"`
+		ControlPlane controlPlane   `json:"controlPlane"`
+		Workers      workers        `json:"workers"`
+		Variables    []variable     `json:"variables"`
 	}
 	type spec struct {
 		Topology topology `json:"topology"`
@@ -688,16 +749,19 @@ func expectedClusterBody(cluster sut.ClusterSpec) string {
 		Kind:       "Cluster",
 		Metadata:   metadata{Name: cluster.Name},
 		Spec: spec{Topology: topology{
-			Class:        cluster.Class,
+			ClassRef:     classReference{Name: cluster.Class},
 			Version:      cluster.Version,
 			ControlPlane: controlPlane{Replicas: cluster.ControlPlaneReplicas},
 			Workers: workers{MachineDeployments: []machineDeployment{{
 				Class: cluster.WorkerClass, Name: cluster.WorkerName, Replicas: cluster.WorkerReplicas,
 			}}},
-			Variables: []variable{
-				{Name: "vmClass", Value: cluster.VMClass},
-				{Name: "storageClass", Value: cluster.StorageClass},
-			},
+			Variables: func() []variable {
+				result := make([]variable, len(cluster.TopologyVariables))
+				for index, item := range cluster.TopologyVariables {
+					result[index] = variable{Name: item.Name, Value: item.Value}
+				}
+				return result
+			}(),
 		}},
 	}
 	value, _ := json.Marshal(object)
@@ -763,7 +827,9 @@ func assertClusterOmissions(t *testing.T, object map[string]any) {
 	spec := object["spec"].(map[string]any)
 	assertExactKeys(t, spec, "topology")
 	topology := spec["topology"].(map[string]any)
-	assertExactKeys(t, topology, "class", "version", "controlPlane", "workers", "variables")
+	assertExactKeys(t, topology, "classRef", "version", "controlPlane", "workers", "variables")
+	classRef := topology["classRef"].(map[string]any)
+	assertExactKeys(t, classRef, "name")
 	controlPlane := topology["controlPlane"].(map[string]any)
 	assertExactKeys(t, controlPlane, "replicas")
 	workers := topology["workers"].(map[string]any)

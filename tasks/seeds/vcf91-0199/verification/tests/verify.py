@@ -294,20 +294,20 @@ def verify_wire(requests: list[dict[str, object]]) -> None:
     )
 
     task_requests = [item for item in requests if item["operationId"] == "getTasks"]
-    require(len(task_requests) == 7, "getTasks pagination/filter request count is wrong")
+    require(len(task_requests) == 8, "getTasks pagination/filter request count is wrong")
     require(
         [item["query"] for item in task_requests[:3]]
         == [
-            {"pageNumber": ["0"], "pageSize": ["3"], "taskStatus": ["FAILED"]},
             {"pageNumber": ["1"], "pageSize": ["3"], "taskStatus": ["FAILED"]},
             {"pageNumber": ["2"], "pageSize": ["3"], "taskStatus": ["FAILED"]},
+            {"pageNumber": ["3"], "pageSize": ["3"], "taskStatus": ["FAILED"]},
         ],
         "getTasks query shape is wrong or an unset optional field was serialized",
     )
     require(
         task_requests[3]["query"]
         == {
-            "pageNumber": ["0"],
+            "pageNumber": ["1"],
             "pageSize": ["100"],
             "taskStatus": ["FAILED"],
             "taskType": ["HOST_COMMISSION"],
@@ -321,19 +321,28 @@ def verify_wire(requests: list[dict[str, object]]) -> None:
     )
     require(
         task_requests[4]["query"]
-        == {"pageNumber": ["0"], "pageSize": ["100"], "taskStatus": ["FAILED"]},
+        == {"pageNumber": ["1"], "pageSize": ["100"], "taskStatus": ["FAILED"]},
         "the default page size was not sent as 100",
     )
     require(
-        [item["query"] for item in task_requests[5:]]
+        task_requests[5]["query"]
+        == {
+            "pageNumber": ["1"],
+            "pageSize": ["3"],
+            "taskName": ["MOONSHINER_EMPTY"],
+        },
+        "live empty-collection check did not use exact SDK query parameters",
+    )
+    require(
+        [item["query"] for item in task_requests[6:]]
         == [
             {
-                "pageNumber": ["0"],
+                "pageNumber": ["1"],
                 "pageSize": ["3"],
                 "taskName": ["MOONSHINER_MISSING_METADATA"],
             },
             {
-                "pageNumber": ["0"],
+                "pageNumber": ["1"],
                 "pageSize": ["3"],
                 "taskName": ["MOONSHINER_WRONG_PAGE"],
             },
@@ -345,7 +354,7 @@ def verify_wire(requests: list[dict[str, object]]) -> None:
         require(item["body"] == "", "GET /v1/tasks must not have a request body")
         authorization = item["headers"].get("authorization")
         require(authorization == f"Bearer {ACCESS_TOKEN}", "getTasks bearer token is missing")
-    require(len(requests) == 10, "client made unexpected duplicate loopback requests")
+    require(len(requests) == 11, "client made unexpected duplicate loopback requests")
 
 
 def main() -> int:

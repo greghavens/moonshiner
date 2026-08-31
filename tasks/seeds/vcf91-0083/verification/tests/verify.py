@@ -34,9 +34,10 @@ EXPECTED_GROUP_BODY = (
 EXPECTED_POLICY_BODY = (
     b'{"resource_type":"SecurityPolicy","display_name":"Application policy",'
     b'"category":"Application","sequence_number":120,"stateful":true,"rules":['
-    b'{"resource_type":"Rule","display_name":"Allow app\\ntraffic",'
+    b'{"resource_type":"Rule","id":"allow-app-traffic",'
+    b'"display_name":"Allow app\\ntraffic",'
     b'"sequence_number":10,'
-    b'"source_groups":["/infra/domains/prod east/groups/source+blue"],'
+    b'"source_groups":["/infra/domains/prod-east/groups/source-blue"],'
     b'"destination_groups":["/infra/domains/default/groups/destination"],'
     b'"services":["ANY"],"scope":["ANY"],"action":"ALLOW",'
     b'"direction":"IN_OUT"}]}'
@@ -125,15 +126,15 @@ def verify_wire(log_path: Path, contract: dict[str, Any]) -> None:
         (
             contract["operations"][0]["operationId"],
             "PATCH",
-            "/policy/api/v1/infra/domains/prod%20east/"
-            "groups/source%2Bblue",
+            "/policy/api/v1/infra/domains/prod-east/"
+            "groups/source-blue",
             EXPECTED_GROUP_BODY,
         ),
         (
             contract["operations"][1]["operationId"],
             "PATCH",
-            "/policy/api/v1/infra/domains/prod%20east/"
-            "security-policies/allow%2Fedge",
+            "/policy/api/v1/infra/domains/prod-east/"
+            "security-policies/allow-edge",
             EXPECTED_POLICY_BODY,
         ),
     ]
@@ -202,6 +203,7 @@ def verify_wire(log_path: Path, contract: dict[str, Any]) -> None:
         list(policy["rules"][0])
         == [
             "resource_type",
+            "id",
             "display_name",
             "sequence_number",
             "source_groups",
@@ -218,7 +220,6 @@ def verify_wire(log_path: Path, contract: dict[str, Any]) -> None:
         "description",
         "notes",
         "tags",
-        "id",
         "_revision",
         "_create_time",
         "_create_user",

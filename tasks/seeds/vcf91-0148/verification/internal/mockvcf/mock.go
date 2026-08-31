@@ -24,6 +24,8 @@ type Config struct {
 	ClusterExists         bool
 	ExpireOnClusterCreate bool
 	RejectFreshToken      bool
+	NamespaceCreate404    bool
+	ClusterCreate422      bool
 }
 
 type Request struct {
@@ -201,7 +203,14 @@ func (s *Server) getNamespace(w http.ResponseWriter, r *http.Request) {
 	exists := s.namespaceExists
 	s.mu.Unlock()
 	if !strings.HasSuffix(r.URL.Path, "/"+s.cfg.Namespace) || !exists {
-		http.NotFound(w, r)
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"error_type": "NOT_FOUND",
+			"messages": []any{map[string]any{
+				"args":            []any{},
+				"default_message": "Namespace was not found.",
+				"id":              "vcenter.wcp.workload.notfound",
+			}},
+		})
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -222,6 +231,17 @@ func (s *Server) createNamespace(w http.ResponseWriter, r *http.Request, body []
 	}
 	if json.Unmarshal(body, &got) != nil || got.Namespace != s.cfg.Namespace || got.Supervisor != s.cfg.Supervisor {
 		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if s.cfg.NamespaceCreate404 {
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"error_type": "NOT_FOUND",
+			"messages": []any{map[string]any{
+				"args":            []any{},
+				"default_message": "Supervisor was not found.",
+				"id":              "vcenter.wcp.supervisor.notfound",
+			}},
+		})
 		return
 	}
 	s.mu.Lock()
@@ -249,7 +269,13 @@ func (s *Server) getCluster(w http.ResponseWriter, r *http.Request) {
 	exists := s.clusterExists
 	s.mu.Unlock()
 	if !strings.HasSuffix(r.URL.Path, "/"+s.cfg.Cluster) || !exists {
-		http.NotFound(w, r)
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"apiVersion": "v1",
+			"code":       404,
+			"kind":       "Status",
+			"reason":     "NotFound",
+			"status":     "Failure",
+		})
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -274,6 +300,16 @@ func (s *Server) createCluster(w http.ResponseWriter, r *http.Request, body []by
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
+	if s.cfg.ClusterCreate422 {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"apiVersion": "v1",
+			"code":       422,
+			"kind":       "Status",
+			"reason":     "Invalid",
+			"status":     "Failure",
+		})
+		return
+	}
 	var got struct {
 		APIVersion string `json:"apiVersion"`
 		Kind       string `json:"kind"`
@@ -290,6 +326,18 @@ func (s *Server) createCluster(w http.ResponseWriter, r *http.Request, body []by
 	}
 	s.clusterExists = true
 	w.WriteHeader(http.StatusCreated)
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	body, err := json.Marshal(value)
+	if err != nil {
+		http.Error(w, "encoding failure", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

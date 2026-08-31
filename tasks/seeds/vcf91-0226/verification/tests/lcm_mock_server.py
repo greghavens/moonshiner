@@ -194,16 +194,13 @@ class State:
         fixture = COMPONENTS[component_id]
         task = {
             "id": task_id,
-            "name": "Generate support bundle",
+            "name": "CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW",
             "description": _message(
                 "com.broadcom.lcm.ops.supportbundle.generate.started",
                 "Support bundle generation for component %s" % component_id,
             ),
             "status": status,
-            "type": "SUPPORT_BUNDLE_GENERATION",
             "createdBy": "admin",
-            "resourceId": fixture["bundle_id"],
-            "resourceType": "SUPPORT_BUNDLE",
             "createTime": FIXED_TIME,
             "startTime": FIXED_TIME,
             "updateTime": FIXED_TIME,
@@ -215,6 +212,9 @@ class State:
             task["correlationId"] = entry["correlation_id"]
         if status in ("SUCCEEDED", "FAILED", "CANCELED"):
             task["endTime"] = FIXED_TIME
+        if status == "SUCCEEDED":
+            task["resourceId"] = fixture["bundle_id"]
+            task["resourceType"] = "SUPPORT_BUNDLE"
         if status == "FAILED":
             task["messages"] = [
                 _message(
@@ -392,6 +392,11 @@ def make_handler(routes, state, token, log_path):
                     404,
                 )
             correlation_id = self.headers.get("X-Correlation-Id")
+            if correlation_id is not None and re.fullmatch(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                correlation_id,
+            ) is None:
+                return _error("VCF_LCM_500_INTERNAL_SERVER_ERROR", "correlation ID must be a UUID"), 500
             task = state.start_task(component_id, correlation_id)
             return task, route.spec["success_status"]
 

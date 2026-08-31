@@ -4,10 +4,9 @@ A Go client for the VMware Cloud Foundation Operations API.
 
 ```
 docs/       contract and provenance documents (you create these)
-opsapi/     shared request and response types (fixed)
-mock/       loopback stand-in for a VCF Operations appliance (fixed)
-verify/     acceptance tests (fixed)
-vcfops/     the client (yours)
+opsapi/     shared request and response types
+verify/     acceptance tests
+vcfops/     the client
 ```
 
 Run everything with:

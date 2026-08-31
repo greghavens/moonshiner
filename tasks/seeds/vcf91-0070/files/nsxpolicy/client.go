@@ -7,15 +7,12 @@ import (
 	"net/http"
 )
 
-// RefreshFunc exchanges an access token rejected by the server for a new one.
-type RefreshFunc func(context.Context, string) (string, error)
-
 // Config configures a Client without performing an API request.
 type Config struct {
-	BaseURL     string
-	AccessToken string
-	HTTPClient  *http.Client
-	Refresh     RefreshFunc
+	BaseURL    string
+	Username   string
+	Password   string
+	HTTPClient *http.Client
 }
 
 // Group is the response projection used by ListGroupForDomain.
@@ -58,5 +55,5 @@ func NewClient(cfg Config) (*Client, error) {
 
 // ListAllGroups lists every page for one domain.
 func (c *Client) ListAllGroups(ctx context.Context, domainID string) ([]Group, error) {
-	return nil, &ProtocolError{Message: "TODO: implement ListGroupForDomain pagination and token refresh"}
+	return nil, &ProtocolError{Message: "TODO: implement ListGroupForDomain pagination with Basic authentication"}
 }

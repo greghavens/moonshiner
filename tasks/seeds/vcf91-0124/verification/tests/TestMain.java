@@ -79,24 +79,24 @@ public final class TestMain {
         VcenterEvcClient.ApplyResult setResult =
                 client.applySafely(setCluster, mode);
         check(setResult.precheckTaskId().equals(
-                        taskPrefix + "/set task?#\u03a9"),
+                        "task-5001:" + taskPrefix),
                 "set precheck task ID was not preserved");
         check(setResult.mutationTaskId().equals(
-                        taskPrefix + "/mutation-set accepted"),
+                        "task-5002:" + taskPrefix),
                 "set mutation task ID was not preserved");
         check(!setResult.clearing(), "set result was marked as clear");
 
         VcenterEvcClient.ApplyResult clearResult =
                 client.applySafely(clearCluster, null);
         check(clearResult.precheckTaskId().equals(
-                        taskPrefix + "/clear task?#\u03a9"),
+                        "task:clear/" + taskPrefix + " +coverage"),
                 "clear precheck task ID was not preserved");
         check(clearResult.mutationTaskId().equals(
-                        taskPrefix + "/mutation-clear accepted"),
+                        "task:mutation-clear/" + taskPrefix + " +coverage"),
                 "clear mutation task ID was not preserved");
         check(clearResult.clearing(), "clear result was not marked as clear");
 
-        String rejectedTask = taskPrefix + "/reject task?#\u03a9";
+        String rejectedTask = "task-4271:" + taskPrefix;
         try {
             client.applySafely(rejectCluster, mode);
             throw new AssertionError(
@@ -136,11 +136,11 @@ public final class TestMain {
             202, 200, 202, 202, 200
         };
         String setTaskTarget = "/api/cis/tasks/"
-                + encodeSegment(taskPrefix + "/set task?#\u03a9");
+                + encodeSegment("task-5001:" + taskPrefix);
         String clearTaskTarget = "/api/cis/tasks/"
-                + encodeSegment(taskPrefix + "/clear task?#\u03a9");
+                + encodeSegment("task:clear/" + taskPrefix + " +coverage");
         String rejectTaskTarget = "/api/cis/tasks/"
-                + encodeSegment(taskPrefix + "/reject task?#\u03a9");
+                + encodeSegment("task-4271:" + taskPrefix);
         String[] targets = {
             checkTarget(setCluster),
             setTaskTarget,

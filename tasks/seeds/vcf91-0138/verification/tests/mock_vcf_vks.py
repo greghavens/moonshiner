@@ -155,6 +155,7 @@ def main() -> int:
     expected_namespace_bytes = compact(expected_namespace)
     expected_cluster_bytes = compact(expected_cluster)
     state = {
+        "namespace_create_calls": 0,
         "namespace_created": False,
         "namespace_ready": False,
         "namespace_polls": 0,
@@ -174,15 +175,22 @@ def main() -> int:
             "storage_specs": [],
         }
 
-    def cluster_resource(ready_status: str) -> dict:
-        condition = {
-            "type": "Ready",
-            "status": ready_status,
-            "reason": (
-                "Provisioned" if ready_status == "True" else "Creating"
-            ),
-            "observedGeneration": 1,
-        }
+    def cluster_resource(phase: str) -> dict:
+        available = phase == "Provisioned"
+        conditions = [
+            {
+                "type": "Available",
+                "status": "True" if available else "False",
+                "reason": "Available" if available else "NotAvailable",
+                "observedGeneration": 1,
+            },
+            {
+                "type": "TopologyReconciled",
+                "status": "True" if available else "False",
+                "reason": "ReconcileSucceeded" if available else "Reconciling",
+                "observedGeneration": 1,
+            },
+        ]
         return {
             "apiVersion": "cluster.x-k8s.io/v1beta2",
             "kind": "Cluster",
@@ -193,10 +201,8 @@ def main() -> int:
             },
             "spec": expected_cluster["spec"],
             "status": {
-                "phase": (
-                    "Provisioned" if ready_status == "True" else "Provisioning"
-                ),
-                "conditions": [condition],
+                "phase": phase,
+                "conditions": conditions,
             },
         }
 
@@ -274,7 +280,19 @@ def main() -> int:
                 else:
                     with state_lock:
                         if operation_name == "createSupervisorNamespace":
-                            if state["namespace_created"]:
+                            state["namespace_create_calls"] += 1
+                            if state["namespace_create_calls"] == 1:
+                                status = 404
+                                response = {
+                                    "error_type": "NOT_FOUND",
+                                    "messages": [
+                                        {
+                                            "id": "vcenter.wcp.supervisor.notfound",
+                                            "default_message": "The specified Supervisor was not found.",
+                                        }
+                                    ],
+                                }
+                            elif state["namespace_created"]:
                                 status = 409
                                 response = {
                                     "error_type": "ALREADY_EXISTS",
@@ -321,7 +339,7 @@ def main() -> int:
                             else:
                                 state["cluster_created"] = True
                                 status = 201
-                                response = cluster_resource("False")
+                                response = cluster_resource("Provisioning")
                         elif operation_name == "getVksCluster":
                             if not state["cluster_created"]:
                                 status = 404
@@ -332,13 +350,13 @@ def main() -> int:
                                 }
                             else:
                                 state["cluster_polls"] += 1
-                                ready_status = (
-                                    "Unknown"
+                                phase = (
+                                    "Provisioning"
                                     if state["cluster_polls"] == 1
-                                    else "True"
+                                    else "Provisioned"
                                 )
                                 status = 200
-                                response = cluster_resource(ready_status)
+                                response = cluster_resource(phase)
 
             entry = {
                 "contractName": operation_name,

@@ -76,12 +76,12 @@ public final class TestMain {
 
             String query = exchange.getRequestURI().getRawQuery();
             int page;
-            if (query == null || query.equals("pageNumber=0&pageSize=25")) {
-                page = query == null ? -1 : 0;
-            } else if (query.equals("pageNumber=1&pageSize=25")) {
-                page = 1;
+            if (query == null || query.equals("pageNumber=1&pageSize=25")) {
+                page = query == null ? -1 : 1;
             } else if (query.equals("pageNumber=2&pageSize=25")) {
                 page = 2;
+            } else if (query.equals("pageNumber=3&pageSize=25")) {
+                page = 3;
             } else {
                 page = -1;
             }
@@ -104,13 +104,13 @@ public final class TestMain {
 
         private List<String> pageElements(int page) {
             return switch (page) {
-                case 0 -> List.of(
+                case 1 -> List.of(
                         domain("d-60", "zulu-domain", "VI", "ACTIVE"),
                         domain("d-10", "alpha-domain", "MANAGEMENT", "ACTIVE"));
-                case 1 -> List.of(
+                case 2 -> List.of(
                         domain("d-40", "echo-domain", "VI", "UPGRADING"),
                         domain("d-30", "charlie-domain", "VI", "ACTIVE"));
-                case 2 -> List.of(
+                case 3 -> List.of(
                         domain("d-21", "bravo-domain", "VI", "ACTIVE"),
                         domain("d-20", "bravo-domain", "VI", "ACTIVATING"));
                 default -> throw new AssertionError("unexpected page");
@@ -222,8 +222,8 @@ public final class TestMain {
             List<RequestLog> log = fake.requestLog();
             check(log.size() == 9, "each of three complete scans requests exactly three pages");
             for (int scan = 0; scan < 3; scan++) {
-                for (int page = 0; page < 3; page++) {
-                    RequestLog request = log.get(scan * 3 + page);
+                for (int page = 1; page <= 3; page++) {
+                    RequestLog request = log.get(scan * 3 + page - 1);
                     check(request.method().equals("GET"), "contract method is GET");
                     check(request.rawPath().equals(
                                     "/v1/domains?pageNumber=" + page + "&pageSize=25"),

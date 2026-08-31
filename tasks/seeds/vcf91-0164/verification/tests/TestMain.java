@@ -151,6 +151,14 @@ public final class TestMain {
         private VksNamespaceBackupClient.WireResponse namespaceResponse(
                 List<String> captures) {
             require(captures.equals(List.of(namespace)), "fallback namespace capture");
+            if ("live_namespace_404".equals(scenario)) {
+                return response(404,
+                        "{\"error_type\":\"NOT_FOUND\","
+                                + "\"messages\":[{\"id\":"
+                                + "\"vcenter.wcp.workload.notfound\","
+                                + "\"default_message\":"
+                                + "\"Workload not found.\"}]}");
+            }
             String status = "namespace_not_ready".equals(scenario)
                     ? "ERROR"
                     : "RUNNING";
@@ -173,6 +181,9 @@ public final class TestMain {
             int read = listReads++;
             List<VksNamespaceBackupClient.Cluster> responseItems =
                     new ArrayList<>(clusters);
+            if ("live_backup_404".equals(scenario)) {
+                responseItems = new ArrayList<>(List.of(clusters.get(0)));
+            }
             boolean initialReverse = Set.of(
                     "empty_comment", "inventory_changed", "result_value")
                     .contains(scenario);
@@ -219,6 +230,14 @@ public final class TestMain {
         private VksNamespaceBackupClient.WireResponse backupResponse(
                 List<String> captures) {
             require(captures.equals(List.of(supervisor)), "fallback supervisor capture");
+            if ("live_backup_404".equals(scenario)) {
+                return response(404,
+                        "{\"error_type\":\"NOT_FOUND\","
+                                + "\"messages\":[{\"id\":"
+                                + "\"vcenter.wcp.supervisor.notfound\","
+                                + "\"default_message\":"
+                                + "\"Supervisor not found.\"}]}");
+            }
             if ("api_error".equals(scenario)) {
                 return response(
                         503,
@@ -536,6 +555,19 @@ public final class TestMain {
                 require(
                         !error.getMessage().contains("runtime-secret-body"),
                         "response body leaked");
+            }
+            case "live_namespace_404", "live_backup_404" -> {
+                VksNamespaceBackupClient.ApiException error = expect(
+                        VksNamespaceBackupClient.ApiException.class,
+                        () -> client.backupNamespace(request));
+                String operation = "live_namespace_404".equals(scenario)
+                        ? VksNamespaceBackupClient.GET_NAMESPACE_OPERATION
+                        : VksNamespaceBackupClient.CREATE_BACKUP_OPERATION;
+                assertEquals(operation, error.operation(),
+                        "live failure operation");
+                assertEquals(Integer.valueOf(404), error.statusCode(),
+                        "live failure status");
+                assertRedacted(error, session, token);
             }
             default -> throw new AssertionError("unknown scenario: " + scenario);
         }

@@ -27,7 +27,7 @@ public final class TestMain {
 
             List<ContractMock.RequestRecord> requests = mock.requests();
             assertEquals(5, requests.size(), "unexpected request count");
-            assertRequest(requests.get(0), "createToken", "POST", "/v1/tokens", null, 201);
+            assertRequest(requests.get(0), "createToken", "POST", "/v1/tokens", null, 200);
             assertRequest(requests.get(1), "getDomains", "GET", "/v1/domains",
                     "Bearer access-expiring", 200);
             assertRequest(requests.get(2), "getDomains", "GET", "/v1/domains",
@@ -37,9 +37,9 @@ public final class TestMain {
             assertRequest(requests.get(4), "getDomains", "GET", "/v1/domains",
                     "Bearer access-renewed", 200);
 
-            assertEquals("pageNumber=0&pageSize=2", normalizedQuery(requests.get(1).rawQuery()),
+            assertEquals("pageNumber=1&pageSize=2", normalizedQuery(requests.get(1).rawQuery()),
                     "first page query");
-            assertEquals("pageNumber=1&pageSize=2", normalizedQuery(requests.get(2).rawQuery()),
+            assertEquals("pageNumber=2&pageSize=2", normalizedQuery(requests.get(2).rawQuery()),
                     "expired page query");
             assertEquals(requests.get(2).rawQuery(), requests.get(4).rawQuery(),
                     "the exact failed page must be retried after refresh");

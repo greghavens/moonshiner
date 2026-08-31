@@ -108,7 +108,15 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 self.send_json(400, {"message": "Malformed JSON"})
                 return
-            if not isinstance(payload, dict) or not isinstance(payload.get("backupLocations"), list):
+            if (
+                not isinstance(payload, dict)
+                or not isinstance(payload.get("backupLocations"), list)
+                or not payload["backupLocations"]
+                or not payload["backupLocations"][0].get("password")
+                or not isinstance(payload.get("encryption"), dict)
+                or not payload["encryption"].get("passphrase")
+                or payload.get("backupSchedules") != []
+            ):
                 self.send_json(400, {"message": "backupLocations is required by this scenario"})
                 return
             self.send_json(202, task("PENDING", self.server.task_id))

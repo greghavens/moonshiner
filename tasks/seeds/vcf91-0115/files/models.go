@@ -1,4 +1,4 @@
-// Package sessionrotation implements a focused, contract-pinned vCenter client.
+// Package sessionrotation implements a focused, focused vCenter client.
 package sessionrotation
 
 import (
@@ -44,7 +44,7 @@ type VMSummary struct {
 	Name          string `json:"name"`
 	PowerState    string `json:"power_state"`
 	CPUCount      *int64 `json:"cpu_count,omitempty"`
-	MemorySizeMiB *int64 `json:"memory_size_mib,omitempty"`
+	MemorySizeMiB *int64 `json:"memory_size_MiB,omitempty"`
 }
 
 // ValidationError reports invalid local input.

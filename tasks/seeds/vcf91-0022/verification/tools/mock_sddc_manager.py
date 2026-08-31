@@ -201,7 +201,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json(
             entry,
-            201,
+            200,
             {
                 "accessToken": scenario["first_access_token"],
                 "refreshToken": {"id": scenario["refresh_token_id"]},
@@ -271,7 +271,7 @@ class Handler(BaseHTTPRequestHandler):
             page_size = -1
         valid = (
             valid_query
-            and page_number >= 0
+            and page_number >= 1
             and page_size == scenario["page_size"]
             and not body
             and entry["contentType"] is None
@@ -297,7 +297,7 @@ class Handler(BaseHTTPRequestHandler):
         )
         with state.state_lock:
             if authorization == first_authorization:
-                if page_number >= 1:
+                if page_number >= 2:
                     state.first_token_expired = True
                 authorized = not state.first_token_expired
             else:
@@ -316,7 +316,7 @@ class Handler(BaseHTTPRequestHandler):
         domains = scenario["domains"]
         total_elements = len(domains)
         total_pages = math.ceil(total_elements / page_size)
-        if page_number >= total_pages:
+        if page_number > total_pages:
             self._send_json(
                 entry,
                 400,
@@ -327,7 +327,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        start = page_number * page_size
+        start = (page_number - 1) * page_size
         elements = list(domains[start : start + page_size])
         with state.state_lock:
             reverse = state.reverse_next_page

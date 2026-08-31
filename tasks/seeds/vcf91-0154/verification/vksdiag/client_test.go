@@ -309,6 +309,60 @@ func TestNamespaceReadinessStopsBeforeKubernetesEvidence(t *testing.T) {
 	}
 }
 
+func TestLiveNamespaceAndNoEvidenceCases(t *testing.T) {
+	t.Run("namespace not found", func(t *testing.T) {
+		server := newServer(t, contractmock.Fixture{
+			Namespace:  "vmsp-platform",
+			Pod:        "antrea-controller",
+			Supervisor: "supervisor-42",
+			ForcedStatus: map[string]int{
+				vksdiag.OperationGetSupervisorNamespace: http.StatusNotFound,
+			},
+			ForcedBody: map[string]string{
+				vksdiag.OperationGetSupervisorNamespace: `{"error_type":"NOT_FOUND","messages":[{"args":[],"default_message":"Namespace was not found.","id":"vcenter.wcp.workload.notfound"}]}`,
+			},
+		})
+		client := newClient(t, server)
+		_, err := client.Diagnose(context.Background(), vksdiag.DiagnoseRequest{
+			Supervisor: "supervisor-42",
+			Namespace:  "vmsp-platform",
+			Pod:        "antrea-controller",
+		})
+		var apiError *vksdiag.APIError
+		if !errors.As(err, &apiError) ||
+			apiError.Operation != vksdiag.OperationGetSupervisorNamespace ||
+			apiError.StatusCode != http.StatusNotFound {
+			t.Fatalf("error = %#v, want live namespace 404", err)
+		}
+		if requests := server.Requests(); len(requests) != 1 {
+			t.Fatalf("namespace 404 made %d requests, want 1", len(requests))
+		}
+	})
+
+	t.Run("no BackOff or matching log evidence", func(t *testing.T) {
+		server := newServer(t, contractmock.Fixture{
+			Namespace:  "vmsp-platform",
+			Pod:        "antrea-controller",
+			Supervisor: "supervisor-42",
+			Events:     []contractmock.Event{},
+			Log:        "controller running normally\n",
+		})
+		client := newClient(t, server)
+		diagnosis, err := client.Diagnose(context.Background(), vksdiag.DiagnoseRequest{
+			Supervisor: "supervisor-42",
+			Namespace:  "vmsp-platform",
+			Pod:        "antrea-controller",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if diagnosis.Outcome != vksdiag.OutcomeInconclusive ||
+			diagnosis.Cause != "" || diagnosis.MissingEnvironmentVariable != "" || diagnosis.EventName != "" {
+			t.Fatalf("diagnosis = %#v, want inconclusive", diagnosis)
+		}
+	})
+}
+
 func TestNonSuccessPreservesOperationAndStops(t *testing.T) {
 	t.Parallel()
 

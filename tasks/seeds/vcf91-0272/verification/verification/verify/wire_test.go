@@ -174,7 +174,7 @@ func TestRegisterHappyPath(t *testing.T) {
 		t.Error("createAdapterInstance sent extractIdentifierDefaults, which was never set")
 	}
 
-	// The precheck and the create must describe the same adapter instance.
+	// With no credential, the precheck and create bodies are identical.
 	if !reflect.DeepEqual(decodeObject(t, precheck.Body), decodeObject(t, create.Body)) {
 		t.Errorf("precheck body %q differs from create body %q", string(precheck.Body), string(create.Body))
 	}
@@ -392,12 +392,40 @@ func TestRequestBodyOmitsUnsetOptionalMembers(t *testing.T) {
 			}
 
 			wantKeys := sorted(tc.wantKeys)
-			for _, rec := range []opsmock.RequestRecord{idx["testConnection"][0], idx["createAdapterInstance"][0]} {
+			precheck := idx["testConnection"][0]
+			create := idx["createAdapterInstance"][0]
+			for _, rec := range []opsmock.RequestRecord{precheck, create} {
 				if got := objectKeys(t, rec.Body); !reflect.DeepEqual(got, wantKeys) {
 					t.Errorf("%s body members = %v, want %v (body %q)", rec.OperationID, got, wantKeys, string(rec.Body))
 				}
-				if tc.check != nil {
-					tc.check(t, decodeObject(t, rec.Body))
+			}
+			preBody := decodeObject(t, precheck.Body)
+			createBody := decodeObject(t, create.Body)
+			if tc.check != nil {
+				tc.check(t, preBody)
+			}
+			if tc.spec.Credential == nil {
+				if !reflect.DeepEqual(preBody, createBody) {
+					t.Errorf("credential-free bodies differ: precheck=%v create=%v", preBody, createBody)
+				}
+			} else {
+				createCredential, ok := createBody["credential"].(map[string]any)
+				if !ok {
+					t.Fatalf("create credential = %v, want object", createBody["credential"])
+				}
+				wantCredential := map[string]any{
+					"id":                cfg.CredentialID,
+					"name":              tc.spec.Credential.Name,
+					"adapterKindKey":    tc.spec.Credential.AdapterKindKey,
+					"credentialKindKey": tc.spec.Credential.CredentialKindKey,
+				}
+				if !reflect.DeepEqual(createCredential, wantCredential) {
+					t.Errorf("create credential = %v, want %v", createCredential, wantCredential)
+				}
+				delete(preBody, "credential")
+				delete(createBody, "credential")
+				if !reflect.DeepEqual(preBody, createBody) {
+					t.Errorf("adapter settings differ: precheck=%v create=%v", preBody, createBody)
 				}
 			}
 		})
@@ -440,10 +468,9 @@ func TestAcquireTokenOmitsUnsetAuthSource(t *testing.T) {
 	}
 }
 
-// TestFailedPrecheckChangesNothing is the gate: when the precheck rejects the
-// adapter instance the create must never be sent and the server must hold no
-// adapter instance.
-func TestFailedPrecheckChangesNothing(t *testing.T) {
+// TestFailedPrecheckCreatesNoAdapter is the gate: when the precheck rejects the
+// adapter instance the create must never be sent and no adapter is persisted.
+func TestFailedPrecheckCreatesNoAdapter(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -546,6 +573,39 @@ func TestFailedPrecheckChangesNothing(t *testing.T) {
 				t.Errorf("server holds %d adapter instances after a failed precheck, want 0", len(got))
 			}
 		})
+	}
+}
+
+func TestFailedPrecheckMayPersistInlineCredential(t *testing.T) {
+	srv := opsmock.Start(opsmock.Config{
+		PrecheckStatus:  http.StatusInternalServerError,
+		PrecheckMessage: "Internal Server error, cause unknown.",
+	})
+	defer srv.Close()
+	c := newClient(t, srv.URL, srv.HTTPClient())
+	token, err := c.AcquireToken(context.Background(), srv.Config().Username, srv.Config().Password, "")
+	if err != nil {
+		t.Fatalf("AcquireToken: %v", err)
+	}
+	_, err = c.Register(context.Background(), token, opsadapter.CreateAdapterInstance{
+		Name: "unreachable-vc", AdapterKindKey: "VMWARE",
+		Credential: &opsadapter.Credential{
+			Name: "disposable", AdapterKindKey: "VMWARE", CredentialKindKey: "PRINCIPALCREDENTIAL",
+			Fields: []opsadapter.NameValue{{Name: "USER", Value: "nobody"}},
+		},
+	})
+	if err == nil {
+		t.Fatal("Register succeeded, want precheck failure")
+	}
+	idx := byOperation(t, srv.Requests())
+	if len(idx["testConnection"]) != 1 || len(idx["createAdapterInstance"]) != 0 {
+		t.Fatalf("precheck/create counts = %d/%d, want 1/0", len(idx["testConnection"]), len(idx["createAdapterInstance"]))
+	}
+	if len(srv.Instances()) != 0 {
+		t.Fatal("failed precheck persisted an adapter instance")
+	}
+	if srv.CredentialCount() != 1 {
+		t.Fatalf("credential count = %d, want the live precheck side effect", srv.CredentialCount())
 	}
 }
 

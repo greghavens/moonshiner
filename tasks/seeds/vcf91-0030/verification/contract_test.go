@@ -200,6 +200,7 @@ func TestProtectedContractProvenance(t *testing.T) {
 		"clusterFqdn",
 		"clusterName",
 		"formFactor",
+		"nodes",
 		"nsxIds",
 	}
 	if !reflect.DeepEqual(clusterSchema.Required, wantRequired) {
@@ -236,6 +237,7 @@ func TestGuardedDeployExactWireShape(t *testing.T) {
 	nodes := []albdeploy.AlbControllerNodeSpec{
 		{IPAddress: "192.0.2.10"},
 		{IPAddress: "192.0.2.11"},
+		{IPAddress: "192.0.2.12"},
 	}
 	tests := []struct {
 		name      string
@@ -245,16 +247,17 @@ func TestGuardedDeployExactWireShape(t *testing.T) {
 		wantBody  string
 	}{
 		{
-			name: "unset optionals are omitted",
+			name: "required nodes are present",
 			spec: albdeploy.AlbControllerClusterSpec{
 				NSXIDs:        []string{"nsx-a"},
 				ClusterName:   "alb-a",
 				ClusterFQDN:   "alb-a.example.test",
 				FormFactor:    "SMALL",
 				AdminPassword: "admin-secret-a",
+				Nodes:         &nodes,
 				BundleID:      "bundle-a",
 			},
-			wantBody: `{"nsxIds":["nsx-a"],"clusterName":"alb-a","clusterFqdn":"alb-a.example.test","formFactor":"SMALL","adminPassword":"admin-secret-a","bundleId":"bundle-a"}`,
+			wantBody: `{"nsxIds":["nsx-a"],"clusterName":"alb-a","clusterFqdn":"alb-a.example.test","formFactor":"SMALL","adminPassword":"admin-secret-a","nodes":[{"ipAddress":"192.0.2.10"},{"ipAddress":"192.0.2.11"},{"ipAddress":"192.0.2.12"}],"bundleId":"bundle-a"}`,
 		},
 		{
 			name: "explicit false and optional body members are present",
@@ -272,7 +275,7 @@ func TestGuardedDeployExactWireShape(t *testing.T) {
 				SkipCompatibilityCheck: &explicitFalse,
 			},
 			wantQuery: "skipCompatibilityCheck=false",
-			wantBody:  `{"nsxIds":["nsx-b"],"clusterName":"alb-b","clusterFqdn":"alb-b.example.test","formFactor":"LARGE","adminPassword":"admin-secret-b","nodes":[{"ipAddress":"192.0.2.10"},{"ipAddress":"192.0.2.11"}],"bundleId":"bundle-b","vcfopsAdminPassword":"ops-secret-b"}`,
+			wantBody:  `{"nsxIds":["nsx-b"],"clusterName":"alb-b","clusterFqdn":"alb-b.example.test","formFactor":"LARGE","adminPassword":"admin-secret-b","nodes":[{"ipAddress":"192.0.2.10"},{"ipAddress":"192.0.2.11"},{"ipAddress":"192.0.2.12"}],"bundleId":"bundle-b","vcfopsAdminPassword":"ops-secret-b"}`,
 		},
 	}
 
@@ -568,7 +571,7 @@ func TestLocalValidationPreventsTraffic(t *testing.T) {
 			spec: emptyRequired,
 		},
 		{
-			name: "provided nodes violates min items",
+			name: "nodes must contain exactly three entries",
 			ctx:  context.Background(),
 			spec: badNodes,
 		},
@@ -675,6 +678,11 @@ func minimalSpec() albdeploy.AlbControllerClusterSpec {
 		ClusterFQDN:   "alb-minimal.example.test",
 		FormFactor:    "SMALL",
 		AdminPassword: "admin-secret",
+		Nodes: &[]albdeploy.AlbControllerNodeSpec{
+			{IPAddress: "192.0.2.20"},
+			{IPAddress: "192.0.2.21"},
+			{IPAddress: "192.0.2.22"},
+		},
 		BundleID:      "bundle-minimal",
 	}
 }

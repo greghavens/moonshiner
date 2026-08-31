@@ -38,20 +38,20 @@ public final class ContractMock implements AutoCloseable {
 
     /** Fleet component under lifecycle in this fixture. */
     public static final String COMPONENT_ID = "2f1c0f6a-9a3e-4e0e-8f2a-6f0d3a5c7b41";
-    public static final String COMPONENT_TYPE = "VCF_OPERATIONS";
+    public static final String COMPONENT_TYPE = "OPS";
     public static final String COMPONENT_FQDN = "ops-a.vcf.example.com";
     public static final String CURRENT_VERSION = "9.1.0.0000.24000001";
     public static final String TARGET_VERSION = "9.1.1.0000.24500123";
 
     /** Instance-scoped component that a {@code scope=FLEET} listing must not return. */
     public static final String INSTANCE_COMPONENT_ID = "9d5e7f21-4b0c-4a6e-bb31-8c2d4e6f7a90";
-    public static final String INSTANCE_COMPONENT_TYPE = "VCF_AUTOMATION";
+    public static final String INSTANCE_COMPONENT_TYPE = "VCFA";
 
     public static final String FLEET_DEPOT_FQDN = "fleet-depot.vcf.example.com";
     public static final String FLEET_DEPOT_CERTIFICATE =
             "-----BEGIN CERTIFICATE-----\nMIIBFleetDepotFixtureCertificateChain\n-----END CERTIFICATE-----\n";
     public static final String RESOLVED_BINARY_URL =
-            "https://fleet-depot.vcf.example.com/PROD/COMP/VCF_OPERATIONS/9.1.1.0000.24500123/upgrade-manifest.json";
+            "https://fleet-depot.vcf.example.com/PROD/COMP/OPS/9.1.1.0000.24500123/upgrade-manifest.json";
 
     public static final String PRECHECK_TASK_ID = "b0d4d8b0-5c6a-4b2b-9d47-1a2f3c4d5e60";
     public static final String APPLY_TASK_ID = "7c9a2e51-33f4-4a0d-8b1e-5d6c7a8b9c02";

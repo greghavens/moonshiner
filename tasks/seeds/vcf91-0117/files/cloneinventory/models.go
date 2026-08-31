@@ -39,7 +39,7 @@ type VMSummary struct {
 	Name          string `json:"name"`
 	PowerState    string `json:"power_state"`
 	CPUCount      *int64 `json:"cpu_count,omitempty"`
-	MemorySizeMiB *int64 `json:"memory_size_mib,omitempty"`
+	MemorySizeMiB *int64 `json:"memory_size_MiB,omitempty"`
 }
 
 // CloneInventoryResult contains terminal task evidence and stable inventory.
@@ -169,7 +169,7 @@ func formatError(state fmt.State, verb rune, text string) {
 	_, _ = state.Write([]byte(text))
 }
 
-// Client performs the contract-pinned clone workflow.
+// Client performs the focused clone workflow.
 type Client struct {
 	baseURL      string
 	sessionID    string

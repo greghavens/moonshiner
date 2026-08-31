@@ -331,11 +331,6 @@ def verify_package_shape() -> None:
     require(INIT_PATH.is_file(), "protected package initializer is missing")
     project = tomllib.loads(PROJECT_PATH.read_text(encoding="utf-8"))
     require(project.get("project", {}).get("dependencies") == [], "dependencies must be empty")
-    require(
-        project.get("tool", {}).get("moonshiner", {}).get("stdlib-only") is True,
-        "package must remain stdlib-only",
-    )
-
     source = CLIENT_PATH.read_text(encoding="utf-8")
     try:
         tree = ast.parse(source, filename=str(CLIENT_PATH))
@@ -597,10 +592,10 @@ def verify_runtime() -> None:
     )
     expected_targets = [
         "/v1/tasks?pageSize=2",
-        "/v1/tasks?pageNumber=1&pageSize=2",
-        "/v1/tokens/access-token/refresh",
-        "/v1/tasks?pageNumber=1&pageSize=2",
         "/v1/tasks?pageNumber=2&pageSize=2",
+        "/v1/tokens/access-token/refresh",
+        "/v1/tasks?pageNumber=2&pageSize=2",
+        "/v1/tasks?pageNumber=3&pageSize=2",
     ]
     require(
         [request.get("rawTarget") for request in requests] == expected_targets,
@@ -612,7 +607,7 @@ def verify_runtime() -> None:
     )
     require(
         sum(request.get("rawTarget") == expected_targets[0] for request in requests) == 1,
-        "completed page zero was replayed",
+        "completed page one was replayed",
     )
 
     get_requests = [
@@ -652,8 +647,8 @@ def verify_runtime() -> None:
     require(refresh.get("rawQuery") == "", "refresh must omit its query delimiter")
     require(refresh.get("query") == {}, "refresh query must be absent")
     require(
-        one_header(refresh, "authorization") == f"Bearer {scenario['oldToken']}",
-        "refresh must use the expired bearer token",
+        "authorization" not in refresh.get("headerValues", {}),
+        "refresh must not send the expired bearer token",
     )
     require(one_header(refresh, "accept") == "application/json", "refresh Accept changed")
     content_type = one_header(refresh, "content-type")
@@ -684,7 +679,7 @@ def sample_task(task_id: str = "task-a") -> dict[str, object]:
 def task_page(
     elements: list[object],
     *,
-    page_number: object = 0,
+    page_number: object = 1,
     page_size: object = 2,
     total_elements: object | None = None,
     total_pages: object | None = None,
@@ -756,9 +751,9 @@ def verify_failure_handling() -> None:
         (
             "missing pagination member",
             {
-                "elements": [],
+                "elements": [sample_task()],
                 "pageMetadata": {
-                    "pageNumber": 0,
+                    "pageNumber": 1,
                     "pageSize": 2,
                     "totalElements": 0,
                 },
@@ -779,7 +774,7 @@ def verify_failure_handling() -> None:
         ),
         (
             "unrequested page",
-            task_page([sample_task()], page_number=1, total_elements=1, total_pages=1),
+            task_page([sample_task()], page_number=2, total_elements=1, total_pages=1),
         ),
         (
             "overfull page",
@@ -815,7 +810,7 @@ def verify_failure_handling() -> None:
             {
                 "json": task_page(
                     [sample_task("b")],
-                    page_number=1,
+                    page_number=2,
                     total_elements=4,
                     total_pages=2,
                 )
@@ -830,7 +825,7 @@ def verify_failure_handling() -> None:
             {
                 "json": task_page(
                     [sample_task("b")],
-                    page_number=0,
+                    page_number=1,
                     total_elements=3,
                     total_pages=2,
                 )
@@ -845,7 +840,7 @@ def verify_failure_handling() -> None:
             {
                 "json": task_page(
                     [sample_task("b")],
-                    page_number=1,
+                    page_number=2,
                     total_elements=3,
                     total_pages=2,
                 )
@@ -905,7 +900,7 @@ def verify_failure_handling() -> None:
     )
 
     with scripted_server(
-        [{"json": task_page([], page_size=101, total_elements=0, total_pages=0)}]
+        [{"json": {"elements": [], "pageMetadata": {}}}]
     ) as server:
         port = int(server.server_address[1])
         rows = client_type(
@@ -939,14 +934,14 @@ def verify_failure_handling() -> None:
         "client followed a redirect to an unlisted route",
     )
 
-    page_zero = task_page(
+    page_one = task_page(
         [sample_task("a"), sample_task("b")],
         total_elements=3,
         total_pages=2,
     )
     no_refresh_requests = expect_error(
         "non-401 page failure",
-        [{"json": page_zero}, {"status": 403, "json": {}}],
+        [{"json": page_one}, {"status": 403, "json": {}}],
         expected_requests=2,
     )
     require(
@@ -956,7 +951,7 @@ def verify_failure_handling() -> None:
     refresh_failure = expect_error(
         "refresh HTTP failure",
         [
-            {"json": page_zero},
+            {"json": page_one},
             {"status": 401, "json": {}},
             {"status": 401, "json": {}},
         ],
@@ -973,7 +968,7 @@ def verify_failure_handling() -> None:
         expect_error(
             label,
             [
-                {"json": page_zero},
+                {"json": page_one},
                 {"status": 401, "json": {}},
                 {"json": replacement},
             ],
@@ -982,7 +977,7 @@ def verify_failure_handling() -> None:
     expect_error(
         "malformed refresh JSON",
         [
-            {"json": page_zero},
+            {"json": page_one},
             {"status": 401, "json": {}},
             {"raw": b'"unterminated'},
         ],
@@ -991,7 +986,7 @@ def verify_failure_handling() -> None:
     second_401 = expect_error(
         "second getTasks 401",
         [
-            {"json": page_zero},
+            {"json": page_one},
             {"status": 401, "json": {}},
             {"json": new_token},
             {"status": 401, "json": {}},

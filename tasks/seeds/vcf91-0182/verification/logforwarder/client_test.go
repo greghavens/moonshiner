@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"moonshiner.local/vcf91/logforwarders/internal/contractmock"
-	"moonshiner.local/vcf91/logforwarders/logforwarder"
+	"vcflogforwarders/internal/contractmock"
+	"vcflogforwarders/logforwarder"
 )
 
 const contractPath = "../docs/contract.json"

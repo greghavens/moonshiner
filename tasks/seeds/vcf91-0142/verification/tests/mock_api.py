@@ -52,6 +52,7 @@ class ContractMockServer(ThreadingHTTPServer):
         old_description: str,
         old_version: str,
         failure_marker: str,
+        live_failure_once: bool = False,
         response_overrides: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         contract = json.loads(contract_path.read_text(encoding="utf-8"))
@@ -112,6 +113,8 @@ class ContractMockServer(ThreadingHTTPServer):
         self.namespace_description = old_description
         self.cluster_version = old_version
         self.failure_marker = failure_marker
+        self.live_failure_once = live_failure_once
+        self.namespace_gets = 0
         self.response_overrides = copy.deepcopy(response_overrides or {})
         if not set(self.response_overrides) <= EXPECTED_CONTRACT_NAMES:
             raise ValueError("response override names are not in the contract")
@@ -329,6 +332,23 @@ class ContractRequestHandler(BaseHTTPRequestHandler):
             return
 
         if name == "getSupervisorNamespace":
+            with server.state_lock:
+                server.namespace_gets += 1
+                namespace_get = server.namespace_gets
+            if server.live_failure_once and namespace_get == 1:
+                self._send_json(
+                    404,
+                    {
+                        "error_type": "NOT_FOUND",
+                        "messages": [
+                            {
+                                "id": "vcenter.wcp.workload.notfound",
+                                "default_message": "Namespace not found.",
+                            }
+                        ],
+                    },
+                )
+                return
             self._send_json(
                 200,
                 {
@@ -355,7 +375,7 @@ class ContractRequestHandler(BaseHTTPRequestHandler):
                     },
                     "spec": {
                         "topology": {
-                            "class": server.cluster_class,
+                            "classRef": {"name": server.cluster_class},
                             "version": server.cluster_version,
                         }
                     },

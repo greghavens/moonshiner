@@ -27,9 +27,9 @@ const (
 type Mode int
 
 const (
-	// ExpireOnce makes page one return 401, then accepts one refresh and resumes.
+	// ExpireOnce makes page two return 401, then accepts one refresh and resumes.
 	ExpireOnce Mode = iota
-	// FailWith500 makes page one fail without an authentication challenge.
+	// FailWith500 makes page two fail without an authentication challenge.
 	FailWith500
 	// SecondUnauthorized makes the retried page return a second 401.
 	SecondUnauthorized
@@ -264,9 +264,9 @@ func (s *Server) dispatchLocked(operationID string, r *http.Request, body []byte
 }
 
 func (s *Server) getTasksLocked(r *http.Request, body []byte) (int, any) {
-	pageNumber := len(s.successfulPages)
+	pageNumber := len(s.successfulPages) + 1
 	wantQuery := "pageSize=" + strconv.Itoa(s.pageSize)
-	if pageNumber > 0 {
+	if pageNumber > 1 {
 		wantQuery = "pageNumber=" + strconv.Itoa(pageNumber) + "&pageSize=" + strconv.Itoa(s.pageSize)
 	}
 	if len(body) != 0 || r.URL.RawQuery != wantQuery {
@@ -280,22 +280,22 @@ func (s *Server) getTasksLocked(r *http.Request, body []byte) (int, any) {
 		return http.StatusForbidden, errorBody("AUTHORIZATION", "unexpected access token")
 	}
 
-	if pageNumber == 1 && !s.challengeSent {
+	if pageNumber == 2 && !s.challengeSent {
 		if s.mode == FailWith500 {
 			return http.StatusInternalServerError, errorBody("SERVER_ERROR", "injected failure")
 		}
 		s.challengeSent = true
 		return http.StatusUnauthorized, errorBody("ACCESS_TOKEN_EXPIRED", "access token expired")
 	}
-	if pageNumber == 1 && s.refreshed && s.mode == SecondUnauthorized {
+	if pageNumber == 2 && s.refreshed && s.mode == SecondUnauthorized {
 		return http.StatusUnauthorized, errorBody("ACCESS_TOKEN_EXPIRED", "replacement token rejected")
 	}
 
 	totalPages := (len(s.tasks) + s.pageSize - 1) / s.pageSize
-	if pageNumber >= totalPages {
+	if pageNumber > totalPages {
 		return http.StatusBadRequest, errorBody("PAGE_RANGE", "page is outside the scenario")
 	}
-	start := pageNumber * s.pageSize
+	start := (pageNumber - 1) * s.pageSize
 	end := start + s.pageSize
 	if end > len(s.tasks) {
 		end = len(s.tasks)
@@ -322,8 +322,8 @@ func (s *Server) refreshLocked(r *http.Request, body []byte) (int, any) {
 	if r.URL.RawQuery != "" || !s.challengeSent || s.refreshed {
 		return http.StatusConflict, errorBody("REFRESH_SEQUENCE", "refresh is out of sequence")
 	}
-	if !hasSingleHeader(r.Header, "Authorization", "Bearer "+s.oldToken) {
-		return http.StatusForbidden, errorBody("AUTHORIZATION", "refresh used the wrong token")
+	if len(r.Header.Values("Authorization")) != 0 {
+		return http.StatusForbidden, errorBody("AUTHORIZATION", "refresh must be unauthenticated")
 	}
 	if !hasSingleHeader(r.Header, "Content-Type", "application/json") {
 		return http.StatusUnsupportedMediaType, errorBody("MEDIA_TYPE", "refresh must be JSON")

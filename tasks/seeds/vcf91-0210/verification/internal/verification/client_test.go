@@ -167,15 +167,15 @@ func TestListTasksRefreshesAndResumesExactWire(t *testing.T) {
 	wantStatuses := []int{200, 401, 200, 200, 200}
 	wantTargets := []string{
 		"/v1/tasks?pageSize=2",
-		"/v1/tasks?pageNumber=1&pageSize=2",
-		"/v1/tokens/access-token/refresh",
-		"/v1/tasks?pageNumber=1&pageSize=2",
 		"/v1/tasks?pageNumber=2&pageSize=2",
+		"/v1/tokens/access-token/refresh",
+		"/v1/tasks?pageNumber=2&pageSize=2",
+		"/v1/tasks?pageNumber=3&pageSize=2",
 	}
 	wantAuthorization := []string{
 		"Bearer " + server.OldToken(),
 		"Bearer " + server.OldToken(),
-		"Bearer " + server.OldToken(),
+		"",
 		"Bearer " + server.NewToken(),
 		"Bearer " + server.NewToken(),
 	}
@@ -186,14 +186,20 @@ func TestListTasksRefreshesAndResumesExactWire(t *testing.T) {
 		if request.OperationID != wantOperations[index] || request.RawTarget != wantTargets[index] || request.ResponseStatus != wantStatuses[index] {
 			t.Errorf("request %d = %v, want %s %s => %d", index, request, wantOperations[index], wantTargets[index], wantStatuses[index])
 		}
-		assertSingleHeader(t, request.Header, "Authorization", wantAuthorization[index])
+		if index == 2 {
+			if values := request.Header.Values("Authorization"); len(values) != 0 {
+				t.Errorf("refresh Authorization = %v, want absent", values)
+			}
+		} else {
+			assertSingleHeader(t, request.Header, "Authorization", wantAuthorization[index])
+		}
 		assertSingleHeader(t, request.Header, "Accept", "application/json")
 	}
 	if requests[1].RawTarget != requests[3].RawTarget {
 		t.Error("the interrupted page request was not retried identically")
 	}
 	if countTarget(requests, wantTargets[0]) != 1 {
-		t.Error("completed page zero was replayed")
+		t.Error("completed page one was replayed")
 	}
 
 	for _, index := range []int{0, 1, 3, 4} {
@@ -332,22 +338,22 @@ func TestSuccessfulResponseValidationTable(t *testing.T) {
 	const taskC = `{"id":"c","name":"name-c","status":"SUCCESSFUL","creationTimestamp":"2026-01-01T00:00:02Z"}`
 
 	page := func(number, size, total, pages int, elements string) string {
-		return fmt.Sprintf(`{"elements":%s,"pageMetadata":{"pageNumber":%d,"pageSize":%d,"totalElements":%d,"totalPages":%d}}`, elements, number, size, total, pages)
+		return fmt.Sprintf(`{"elements":%s,"pageMetadata":{"pageNumber":%d,"pageSize":%d,"totalElements":%d,"totalPages":%d}}`, elements, number+1, size, total, pages)
 	}
 	tests := []struct {
 		name   string
 		bodies []string
 	}{
 		{name: "top level is not an object", bodies: []string{`[]`}},
-		{name: "elements missing", bodies: []string{`{"pageMetadata":{"pageNumber":0,"pageSize":2,"totalElements":0,"totalPages":0}}`}},
-		{name: "elements null", bodies: []string{`{"elements":null,"pageMetadata":{"pageNumber":0,"pageSize":2,"totalElements":0,"totalPages":0}}`}},
-		{name: "elements is not an array", bodies: []string{`{"elements":{},"pageMetadata":{"pageNumber":0,"pageSize":2,"totalElements":0,"totalPages":0}}`}},
+		{name: "elements missing", bodies: []string{`{"pageMetadata":{"pageNumber":1,"pageSize":2,"totalElements":0,"totalPages":0}}`}},
+		{name: "elements null", bodies: []string{`{"elements":null,"pageMetadata":{"pageNumber":1,"pageSize":2,"totalElements":0,"totalPages":0}}`}},
+		{name: "elements is not an array", bodies: []string{`{"elements":{},"pageMetadata":{"pageNumber":1,"pageSize":2,"totalElements":0,"totalPages":0}}`}},
 		{name: "metadata missing", bodies: []string{`{"elements":[]}`}},
 		{name: "metadata null", bodies: []string{`{"elements":[],"pageMetadata":null}`}},
 		{name: "metadata is not an object", bodies: []string{`{"elements":[],"pageMetadata":[]}`}},
-		{name: "metadata member missing", bodies: []string{`{"elements":[],"pageMetadata":{"pageNumber":0,"pageSize":2,"totalElements":0}}`}},
+		{name: "metadata member missing", bodies: []string{`{"elements":[`+taskA+`],"pageMetadata":{"pageNumber":1,"pageSize":2,"totalElements":1}}`}},
 		{name: "metadata member boolean", bodies: []string{`{"elements":[],"pageMetadata":{"pageNumber":false,"pageSize":2,"totalElements":0,"totalPages":0}}`}},
-		{name: "metadata member fractional", bodies: []string{`{"elements":[],"pageMetadata":{"pageNumber":0,"pageSize":2.5,"totalElements":0,"totalPages":0}}`}},
+		{name: "metadata member fractional", bodies: []string{`{"elements":[],"pageMetadata":{"pageNumber":1,"pageSize":2.5,"totalElements":0,"totalPages":0}}`}},
 		{name: "negative metadata", bodies: []string{page(-1, 2, 0, 0, `[]`)}},
 		{name: "nonpositive metadata page size", bodies: []string{page(0, 0, 0, 0, `[]`)}},
 		{name: "changed metadata page size", bodies: []string{page(0, 1, 0, 0, `[]`)}},
@@ -390,7 +396,7 @@ func TestSuccessfulResponseValidationTable(t *testing.T) {
 
 func TestResponseMediaTypeStatusAndFreshOutput(t *testing.T) {
 	validEmpty := func(pageSize int) string {
-		return fmt.Sprintf(`{"elements":[],"pageMetadata":{"pageNumber":0,"pageSize":%d,"totalElements":0,"totalPages":0}}`, pageSize)
+		return `{"elements":[],"pageMetadata":{}}`
 	}
 
 	for _, contentType := range []string{"", "text/plain", "application/problem+json"} {
@@ -426,7 +432,7 @@ func TestResponseMediaTypeStatusAndFreshOutput(t *testing.T) {
 		t.Fatalf("error=%T %v requests=%d, want getTasks APIError{418} without refresh", err, err, requestCount)
 	}
 
-	const outputPage = `{"elements":[{"id":"b","name":"B","status":"s","creationTimestamp":"t"},{"id":"A","name":"A","type":"","status":"s","creationTimestamp":"t"}],"pageMetadata":{"pageNumber":0,"pageSize":2,"totalElements":2,"totalPages":1}}`
+	const outputPage = `{"elements":[{"id":"b","name":"B","status":"s","creationTimestamp":"t"},{"id":"A","name":"A","type":"","status":"s","creationTimestamp":"t"}],"pageMetadata":{"pageNumber":1,"pageSize":2,"totalElements":2,"totalPages":1}}`
 	responses := []scriptedResponse{
 		{status: 200, contentType: "application/json", body: outputPage},
 		{status: 200, contentType: "application/json", body: outputPage},

@@ -18,7 +18,7 @@ func singleComponentPlan() map[string]any {
 		"depot": depotSpec(),
 		"components": []any{
 			map[string]any{
-				"componentType": "VCF_OPERATIONS",
+				"componentType": "OPS",
 				"fqdn":          "ops-a.vcf.example.com",
 				"password":      "VMw@re123!Ops",
 			},
@@ -224,7 +224,7 @@ func TestRunOutcomes(t *testing.T) {
 				"depot": depotSpec(),
 				"components": []any{
 					map[string]any{
-						"componentType": "VCF_OPERATIONS_FLEET_MANAGEMENT",
+						"componentType": "VCF_FLEET_LCM",
 						"fqdn":          "fleet-mgmt.vcf.example.com",
 						"password":      "VMw@re123!Fleet",
 					},
@@ -236,8 +236,8 @@ func TestRunOutcomes(t *testing.T) {
 			wantOutcome:    "succeeded",
 			wantOperations: []string{"getComponents"},
 			check: func(t *testing.T, m *mocklcm.Mock, report reportView) {
-				if !reflect.DeepEqual(report.Skipped, []string{"VCF_OPERATIONS_FLEET_MANAGEMENT"}) {
-					t.Errorf("skipped %v, want [VCF_OPERATIONS_FLEET_MANAGEMENT]", report.Skipped)
+				if !reflect.DeepEqual(report.Skipped, []string{"VCF_FLEET_LCM"}) {
+					t.Errorf("skipped %v, want [VCF_FLEET_LCM]", report.Skipped)
 				}
 				if len(report.Installed) != 0 {
 					t.Errorf("installed %v, want nothing", report.Installed)
@@ -370,7 +370,7 @@ func TestPlanValidation(t *testing.T) {
 	t.Parallel()
 	validComponent := func() map[string]any {
 		return map[string]any{
-			"componentType": "VCF_OPERATIONS",
+			"componentType": "OPS",
 			"fqdn":          "ops-a.vcf.example.com",
 			"password":      "VMw@re123!Ops",
 		}
@@ -408,7 +408,7 @@ func TestPlanValidation(t *testing.T) {
 			plan: map[string]any{
 				"depot": depotSpec(),
 				"components": []any{map[string]any{
-					"componentType": "VCF_OPERATIONS", "password": "VMw@re123!Ops",
+					"componentType": "OPS", "password": "VMw@re123!Ops",
 				}},
 			},
 		},
@@ -417,7 +417,7 @@ func TestPlanValidation(t *testing.T) {
 			plan: map[string]any{
 				"depot": depotSpec(),
 				"components": []any{map[string]any{
-					"componentType": "VCF_OPERATIONS", "fqdn": "ops-a.vcf.example.com",
+					"componentType": "OPS", "fqdn": "ops-a.vcf.example.com",
 				}},
 			},
 		},

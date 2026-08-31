@@ -53,11 +53,11 @@ public final class SddcLcmMock {
     static final Map<String, String> BUNDLE_SLUG = new LinkedHashMap<>();
 
     static {
-        LATEST.put("VCF_OPERATIONS", "9.1.0.0.24010188");
-        LATEST.put("VCF_AUTOMATION", "9.1.0.0.24010199");
+        LATEST.put("OPS", "9.1.0.0.24010188");
+        LATEST.put("VCFA", "9.1.0.0.24010199");
         LATEST.put("VCF_VCENTER", "9.1.0.0.24010142");
-        BUNDLE_SLUG.put("VCF_OPERATIONS", "vcf-operations");
-        BUNDLE_SLUG.put("VCF_AUTOMATION", "vcf-automation");
+        BUNDLE_SLUG.put("OPS", "vcf-operations");
+        BUNDLE_SLUG.put("VCFA", "vcf-automation");
         BUNDLE_SLUG.put("VCF_VCENTER", "vcf-vcenter");
     }
 
@@ -315,9 +315,9 @@ public final class SddcLcmMock {
 
         List<Object> components = Json.arr();
         if (scope == null || scope.equals("FLEET")) {
-            components.add(component(OPS_ID, "VCF_OPERATIONS", "9.0.2.0.23984011",
+            components.add(component(OPS_ID, "OPS", "9.0.2.0.23984011",
                     OPS_FQDN, "FLEET", "Medium"));
-            components.add(component(AUTOMATION_ID, "VCF_AUTOMATION", "9.0.2.0.23984044",
+            components.add(component(AUTOMATION_ID, "VCFA", "9.0.2.0.23984044",
                     "automation.vcf.lab.local", "FLEET", "Small"));
         }
         if (scope == null || scope.equals("INSTANCE")) {
@@ -340,7 +340,7 @@ public final class SddcLcmMock {
             registeredDepotFqdn = String.valueOf(body.get("fqdn"));
             polls.remove(TASK_DEPOT);
         }
-        return new Reply(202, task(TASK_DEPOT, "fleet_depot_registration", "depot-registration",
+        return new Reply(202, task(TASK_DEPOT, "SET_DEPOT_WORKFLOW", "depot-registration",
                 "PENDING", DEPOT_FQDN, "DEPOT", null, null, null));
     }
 
@@ -554,7 +554,7 @@ public final class SddcLcmMock {
             polls.merge(taskId, 1, Integer::sum);
             String status = statusOf(taskId);
             if (taskId.equals(TASK_DEPOT)) {
-                return new Reply(200, task(TASK_DEPOT, "fleet_depot_registration", "depot-registration",
+                return new Reply(200, task(TASK_DEPOT, "SET_DEPOT_WORKFLOW", "depot-registration",
                         status, DEPOT_FQDN, "DEPOT", null, depotStages(status), null));
             }
             if (taskId.equals(TASK_PRECHECK)) {
@@ -622,11 +622,7 @@ public final class SddcLcmMock {
         desc.put("localizedMessage", describe(type, resourceId));
         t.put("description", desc);
         t.put("status", status);
-        t.put("type", type);
-        t.put("createdBy", "svc-lcm-automation");
-        t.put("updatedBy", "svc-lcm-automation");
-        t.put("resourceId", resourceId);
-        t.put("resourceType", resourceType);
+        t.put("createdBy", "system");
         t.put("createTime", T0);
         t.put("startTime", T1);
         t.put("updateTime", terminal(status) ? T2 : T1);
@@ -639,10 +635,6 @@ public final class SddcLcmMock {
         t.put("retriable", status.equals("FAILED"));
         t.put("cancellable", !terminal(status));
         if (stages != null) {
-            Map<String, Object> summary = Json.obj();
-            summary.put("totalSubTasks", 0);
-            summary.put("totalSteps", stages.size());
-            t.put("taskSummary", summary);
             t.put("stages", stages);
         }
         if (messages != null) {
@@ -668,10 +660,8 @@ public final class SddcLcmMock {
 
     private List<Object> depotStages(String status) {
         List<Object> stages = Json.arr();
-        stages.add(stage("stage-depot-connectivity", "depot-connectivity",
+        stages.add(stage("stage-set-depot", "set_depot_ref",
                 terminal(status) ? "SUCCEEDED" : "RUNNING", null));
-        stages.add(stage("stage-depot-index-sync", "depot-index-sync",
-                terminal(status) ? "SUCCEEDED" : "PENDING", null));
         return stages;
     }
 
@@ -785,10 +775,10 @@ public final class SddcLcmMock {
 
     private String componentTypeOf(String id) {
         if (OPS_ID.equals(id)) {
-            return "VCF_OPERATIONS";
+            return "OPS";
         }
         if (AUTOMATION_ID.equals(id)) {
-            return "VCF_AUTOMATION";
+            return "VCFA";
         }
         if (VCENTER_ID.equals(id)) {
             return "VCF_VCENTER";

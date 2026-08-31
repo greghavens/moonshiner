@@ -106,7 +106,7 @@ class MockSddcManager:
                 operation_id = parent.routes.get((self.command, self.path))
                 if operation_id == "createToken":
                     self._send_json(
-                        201,
+                        200,
                         {
                             "accessToken": parent.access_token,
                             "refreshToken": {"id": parent.refresh_token},

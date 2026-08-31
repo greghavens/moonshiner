@@ -21,9 +21,9 @@ import (
 const (
 	expectedCommit = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
 	expectedSpec   = "specifications/sddc-manager/sddc-manager-openapi.json"
-	contractSHA256 = "579afeb5543c24d6b0c963aa6e853095de72d70488b30c3027e9acc4e37abbb6"
-	sourcesSHA256  = "e5fedb68a22a9ee579eb3d12fc06e993694893df8e9195b73bfb4c39d6d455ea"
-	mockSHA256     = "c71f9bfdfcf958551cbc14f0f961166f158d25b604cbf0927db41e2524044748"
+	contractSHA256 = "99a681dfc5c52b74c8f385a2427f0a6644a39638cf64bcc6d4f6cc2d38c8c73d"
+	sourcesSHA256  = "2cc758dc4f52e267a436ae9f9580bfa7046ad2b939642e8f10617cde9b909e65"
+	mockSHA256     = "9963b065974243117bcc38e6f0a8f3f4be7632e343d29d23c047406126cd92cc"
 )
 
 type operationSource struct {
@@ -47,12 +47,12 @@ func TestProtectedContractProvenance(t *testing.T) {
 		} `json:"derived_from"`
 		Operations []struct {
 			operationSource
-			QueryParameters []struct {
+			PathParameters []struct {
 				Name     string         `json:"name"`
 				In       string         `json:"in"`
 				Required bool           `json:"required"`
 				Schema   map[string]any `json:"schema"`
-			} `json:"query_parameters"`
+			} `json:"path_parameters"`
 			Responses map[string]struct {
 				Description string `json:"description"`
 				SchemaRef   string `json:"schema_ref"`
@@ -105,9 +105,9 @@ func TestProtectedContractProvenance(t *testing.T) {
 	}
 
 	wantOperation := operationSource{
-		OperationID: "deleteDepotSettings",
+		OperationID: "deleteServiceConfigByKey",
 		Method:      http.MethodDelete,
-		Path:        "/v1/system/settings/depot",
+		Path:        "/v1/services-config/{serviceKey}",
 	}
 	if len(contract.Operations) != 1 ||
 		contract.Operations[0].operationSource != wantOperation {
@@ -118,20 +118,20 @@ func TestProtectedContractProvenance(t *testing.T) {
 		sources.Operations[0].Commit != expectedCommit ||
 		sources.Operations[0].SpecPath != expectedSpec ||
 		sources.Operations[0].Pointer !=
-			"/paths/~1v1~1system~1settings~1depot/delete" {
+			"/paths/~1v1~1services-config~1{serviceKey}/delete" {
 		t.Fatalf("official operation source mismatch: %#v", sources.Operations)
 	}
 
 	operation := contract.Operations[0]
-	if len(operation.QueryParameters) != 1 {
-		t.Fatalf("wrong query projection: %#v", operation.QueryParameters)
+	if len(operation.PathParameters) != 1 {
+		t.Fatalf("wrong path projection: %#v", operation.PathParameters)
 	}
-	parameter := operation.QueryParameters[0]
-	if parameter.Name != "depotType" ||
-		parameter.In != "query" ||
-		parameter.Required ||
+	parameter := operation.PathParameters[0]
+	if parameter.Name != "serviceKey" ||
+		parameter.In != "path" ||
+		!parameter.Required ||
 		!reflect.DeepEqual(parameter.Schema, map[string]any{"type": "string"}) {
-		t.Fatalf("wrong depotType projection: %#v", parameter)
+		t.Fatalf("wrong serviceKey projection: %#v", parameter)
 	}
 	if len(operation.Responses) != 3 ||
 		operation.Responses["204"].Description != "No Content" ||
@@ -155,27 +155,24 @@ func TestProtectedContractProvenance(t *testing.T) {
 	}
 }
 
-func TestDeleteDepotSettingsRetriesWithoutDuplicateEffect(t *testing.T) {
-	depotType := "VCF_DEPOT"
+func TestDeleteDepotServiceConfigRetriesWithoutDuplicateEffect(t *testing.T) {
 	tests := []struct {
 		name       string
-		options    depotdelete.DeleteDepotOptions
+		serviceKey string
 		wantTarget string
-		wantQuery  string
+		wantPath   string
 	}{
 		{
-			name:       "unset optional depot type is absent",
-			options:    depotdelete.DeleteDepotOptions{},
-			wantTarget: "/v1/system/settings/depot",
-			wantQuery:  "",
+			name:       "plain service key",
+			serviceKey: "depot-key",
+			wantTarget: "/v1/services-config/depot-key",
+			wantPath:   "/v1/services-config/depot-key",
 		},
 		{
-			name: "explicit depot type is sent once",
-			options: depotdelete.DeleteDepotOptions{
-				DepotType: &depotType,
-			},
-			wantTarget: "/v1/system/settings/depot?depotType=VCF_DEPOT",
-			wantQuery:  "depotType=VCF_DEPOT",
+			name:       "service key is one encoded segment",
+			serviceKey: "depot key",
+			wantTarget: "/v1/services-config/depot%20key",
+			wantPath:   "/v1/services-config/depot key",
 		},
 	}
 
@@ -201,9 +198,12 @@ func TestDeleteDepotSettingsRetriesWithoutDuplicateEffect(t *testing.T) {
 				t.Fatalf("NewClient: %v", err)
 			}
 
-			result, err := client.DeleteDepotSettings(context.Background(), test.options)
+			result, err := client.DeleteDepotServiceConfig(
+				context.Background(),
+				test.serviceKey,
+			)
 			if err != nil {
-				t.Fatalf("DeleteDepotSettings: %v", err)
+				t.Fatalf("DeleteDepotServiceConfig: %v", err)
 			}
 			if result != (depotdelete.Result{Attempts: 2, Retried: true}) {
 				t.Fatalf("result = %#v", result)
@@ -221,11 +221,11 @@ func TestDeleteDepotSettingsRetriesWithoutDuplicateEffect(t *testing.T) {
 			}
 			wantHost := strings.TrimPrefix(server.URL(), "http://")
 			for index, request := range requests {
-				if request.OperationID != "deleteDepotSettings" ||
+				if request.OperationID != "deleteServiceConfigByKey" ||
 					request.Method != http.MethodDelete ||
 					request.RequestURI != test.wantTarget ||
-					request.Path != "/v1/system/settings/depot" ||
-					request.RawQuery != test.wantQuery ||
+					request.Path != test.wantPath ||
+					request.RawQuery != "" ||
 					request.Host != wantHost {
 					t.Fatalf("request %d target mismatch: %#v", index, request)
 				}
@@ -302,15 +302,15 @@ func TestFailurePolicyIsBounded(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewClient: %v", err)
 			}
-			result, err := client.DeleteDepotSettings(
+			result, err := client.DeleteDepotServiceConfig(
 				context.Background(),
-				depotdelete.DeleteDepotOptions{},
+				"depot-key",
 			)
 			var apiError *depotdelete.APIError
 			if !errors.As(err, &apiError) {
 				t.Fatalf("error = %T %v, want *APIError", err, err)
 			}
-			if apiError.OperationID != "deleteDepotSettings" ||
+			if apiError.OperationID != "deleteServiceConfigByKey" ||
 				apiError.StatusCode != test.status ||
 				apiError.ErrorCode == "" ||
 				apiError.Message == "" ||
@@ -363,9 +363,9 @@ func TestBeforeRetryErrorStopsImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	result, err := client.DeleteDepotSettings(
+	result, err := client.DeleteDepotServiceConfig(
 		context.Background(),
-		depotdelete.DeleteDepotOptions{},
+		"depot-key",
 	)
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("error = %v, want callback error", err)
@@ -418,17 +418,17 @@ func TestLocalValidationPerformsNoTraffic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("valid NewClient: %v", err)
 	}
-	invalidDepotTypes := []string{"", " VCF_DEPOT", "VCF_DEPOT "}
-	for _, depotType := range invalidDepotTypes {
-		result, err := client.DeleteDepotSettings(
+	invalidServiceKeys := []string{"", " depot-key", "depot-key "}
+	for _, serviceKey := range invalidServiceKeys {
+		result, err := client.DeleteDepotServiceConfig(
 			context.Background(),
-			depotdelete.DeleteDepotOptions{DepotType: &depotType},
+			serviceKey,
 		)
 		if err == nil {
-			t.Fatalf("DepotType %q unexpectedly succeeded", depotType)
+			t.Fatalf("serviceKey %q unexpectedly succeeded", serviceKey)
 		}
 		if result.Attempts != 0 {
-			t.Fatalf("DepotType %q attempts = %d", depotType, result.Attempts)
+			t.Fatalf("serviceKey %q attempts = %d", serviceKey, result.Attempts)
 		}
 	}
 	if calls.Load() != 0 {
@@ -447,7 +447,7 @@ func TestContextCancellationIsPreserved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	result, err := client.DeleteDepotSettings(ctx, depotdelete.DeleteDepotOptions{})
+	result, err := client.DeleteDepotServiceConfig(ctx, "depot-key")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}
@@ -479,15 +479,15 @@ func TestTransportFailureIsRetriedAndRedacted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	result, err := client.DeleteDepotSettings(
+	result, err := client.DeleteDepotServiceConfig(
 		context.Background(),
-		depotdelete.DeleteDepotOptions{},
+		"depot-key",
 	)
 	var transportError *depotdelete.TransportError
 	if !errors.As(err, &transportError) {
 		t.Fatalf("error = %T %v, want *TransportError", err, err)
 	}
-	if transportError.OperationID != "deleteDepotSettings" {
+	if transportError.OperationID != "deleteServiceConfigByKey" {
 		t.Fatalf("TransportError = %#v", transportError)
 	}
 	if strings.Contains(err.Error(), token) ||
@@ -530,9 +530,9 @@ func TestRedirectIsNotFollowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	result, err := client.DeleteDepotSettings(
+	result, err := client.DeleteDepotServiceConfig(
 		context.Background(),
-		depotdelete.DeleteDepotOptions{},
+		"depot-key",
 	)
 	var apiError *depotdelete.APIError
 	if !errors.As(err, &apiError) || apiError.StatusCode != http.StatusFound {

@@ -102,12 +102,8 @@ try {
     ) 'items' 'list result required fields'
 
     $Manifest = Import-PowerShellDataFile -LiteralPath $ManifestPath
-    Assert-Equal @($Manifest.RequiredModules).Count 1 `
+    Assert-Equal @($Manifest.RequiredModules).Count 0 `
         'manifest prerequisite count'
-    Assert-Equal $Manifest.RequiredModules[0].ModuleName `
-        'VMware.Sdk.Vcf.SddcManager' 'VCF PowerCLI module prerequisite'
-    Assert-Equal ([version] $Manifest.RequiredModules[0].ModuleVersion) `
-        ([version] '13.5.0.25380678') 'VCF PowerCLI module version'
     Assert-Equal (($Manifest.FunctionsToExport) -join ',') `
         'New-VcfVcenterRoleClient,Get-VcfVcenterRoleCollection' `
         'manifest exports'
@@ -128,9 +124,8 @@ try {
     Assert-Equal @($ParseErrors).Count 0 'module parses without errors'
     $SourceText = Get-Content -Raw -LiteralPath $ModulePath
     foreach ($RequiredText in @(
-        'VMware.Sdk.OpenApi.Cmdlets.IServerConnection',
-        '.GetClient()',
         'vmware-api-session-id',
+        'DangerousAcceptAnyServerCertificateValidator',
         'StringComparer'
     )) {
         Assert-True $SourceText.Contains($RequiredText) `
@@ -141,7 +136,9 @@ try {
         'Invoke-WebRequest',
         'Start-Process',
         'curl',
-        'Connect-VIServer'
+        'Connect-VIServer',
+        'VMware.Sdk.OpenApi.Cmdlets.IServerConnection',
+        '.GetClient()'
     )) {
         Assert-True (-not $SourceText.Contains($ForbiddenText)) `
             "implementation must not use $ForbiddenText"
@@ -157,9 +154,8 @@ try {
         'Get-VcfVcenterRoleCollection,New-VcfVcenterRoleClient' `
         'runtime exports'
     $NewCommand = Get-Command New-VcfVcenterRoleClient
-    Assert-Equal $NewCommand.Parameters.Connection.ParameterType.FullName `
-        'VMware.Sdk.OpenApi.Cmdlets.IServerConnection' `
-        'authenticated VCF PowerCLI connection type'
+    Assert-True (-not $NewCommand.Parameters.ContainsKey('Connection')) `
+        'direct HTTP client has no unusable PowerCLI connection form'
     $GetCommand = Get-Command Get-VcfVcenterRoleCollection
     Assert-Equal $GetCommand.Parameters.PageSize.ParameterType.FullName `
         'System.Int64' 'page-size parameter type'
@@ -186,21 +182,21 @@ try {
         'page-size default comes from the specification'
 
     $RunId = [guid]::NewGuid().ToString('N')
-    $SessionToken = 'session-' + $RunId
-    $MarkerOne = 'after ' + $RunId.Substring(0, 6) + '/one+?&'
-    $MarkerTwo = 'after+' + $RunId.Substring(6, 6) + '/two ?'
+    $SessionToken = $RunId
+    $MarkerOne = 'AQID/' + $RunId.Substring(0, 6) + '+=='
+    $MarkerTwo = 'BwgJ+' + $RunId.Substring(6, 6) + '/='
     $Roles = @(
         [ordered]@{
-            role = 'role-z-' + $RunId.Substring(12, 4)
+            role = '-8'
             info = [ordered]@{
                 name = 'zulu'
                 description = 'runtime zulu'
                 privileges = @('System.Read')
-                system = $false
+                system = $true
             }
         },
         [ordered]@{
-            role = 'role-b-' + $RunId.Substring(16, 4)
+            role = '1005'
             info = [ordered]@{
                 name = 'Alpha'
                 description = 'runtime alpha b'
@@ -209,7 +205,7 @@ try {
             }
         },
         [ordered]@{
-            role = 'role-a-' + $RunId.Substring(20, 4)
+            role = '1004'
             info = [ordered]@{
                 name = 'Alpha'
                 description = 'runtime alpha a'
@@ -218,7 +214,7 @@ try {
             }
         },
         [ordered]@{
-            role = 'role-c-' + $RunId.Substring(24, 4)
+            role = '-7'
             info = [ordered]@{
                 name = 'bravo'
                 description = 'runtime bravo'
@@ -227,7 +223,7 @@ try {
             }
         },
         [ordered]@{
-            role = 'role-d-' + $RunId.Substring(28, 4)
+            role = '1006'
             info = [ordered]@{
                 name = 'alpha'
                 description = 'runtime lowercase alpha'

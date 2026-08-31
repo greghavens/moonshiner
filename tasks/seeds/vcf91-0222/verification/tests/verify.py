@@ -354,7 +354,7 @@ def make_scenario() -> dict[str, Any]:
         "pinnedComponent": "VCENTER",
         "pinnedComponentVersion": "9.1.0.0",
         "unpinnedComponent": "NSX",
-        "correlationId": "corr-" + secrets.token_hex(8),
+        "correlationId": str(uuid.uuid4()),
         "resolvedComponentVersions": [
             {
                 "component": "VCENTER",

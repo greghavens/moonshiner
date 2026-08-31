@@ -37,14 +37,12 @@ public final class MockOpsServer implements AutoCloseable {
     private static final List<String> UNREACHABLE_VCURLS =
             List.of("vcenter-down.lab.local", "vcenter-unreachable.lab.local");
 
-    /** An adapter instance name that already exists, so creating it again is rejected. */
-    private static final String CONFLICTING_ADAPTER_NAME = "Duplicate VC Adapter Instance";
-
     private final Path logPath;
     private final String basePath;
     private final Map<String, Route> routes = new LinkedHashMap<>();
     private HttpServer server;
     private int seq = 0;
+    private int persistedCredentials = 0;
 
     private record Route(String operationId, String method, String path) {}
 
@@ -132,9 +130,10 @@ public final class MockOpsServer implements AutoCloseable {
 
         int status;
         String response;
+        int credentialsBefore = persistedCredentials;
         if (route == null) {
             status = 404;
-            response = errorBody("No operation is served at " + method + " " + path);
+            response = errorBody("No operation is served at " + method + " " + path, 404);
         } else if (route.operationId().equals("testConnection")) {
             String[] r = handleTestConnection(body);
             status = Integer.parseInt(r[0]);
@@ -147,6 +146,8 @@ public final class MockOpsServer implements AutoCloseable {
 
         synchronized (this) {
             entry.put("responseStatus", status);
+            entry.put("credentialCountAfter", persistedCredentials);
+            entry.put("credentialPersisted", persistedCredentials > credentialsBefore);
             append(entry);
         }
 
@@ -163,21 +164,22 @@ public final class MockOpsServer implements AutoCloseable {
         try {
             req = Json.asObject(Json.parse(body), "request body");
         } catch (RuntimeException e) {
-            return new String[] {"400", errorBody("Request body is not valid JSON: " + e.getMessage())};
+            return new String[] {"400", errorBody("Request body is not valid JSON: " + e.getMessage(), 400)};
         }
         String missing = missingRequired(req);
         if (missing != null) {
-            return new String[] {"400", errorBody(missing)};
+            return new String[] {"400", errorBody(missing, 400)};
         }
+        String credentialId = credentialId(req, true);
         String vcurl = resourceIdentifier(req, "VCURL");
         if (vcurl != null && UNREACHABLE_VCURLS.contains(vcurl)) {
             return new String[] {
-                "400",
+                "500",
                 errorBody("Unable to establish a connection to the data source at " + vcurl
-                        + ": connection timed out")
+                        + ": connection timed out", 500)
             };
         }
-        return new String[] {"201", adapterInstanceBody(req, false)};
+        return new String[] {"201", adapterInstanceBody(req, false, credentialId)};
     }
 
     private String[] handleCreateAdapterInstance(String body) {
@@ -185,19 +187,31 @@ public final class MockOpsServer implements AutoCloseable {
         try {
             req = Json.asObject(Json.parse(body), "request body");
         } catch (RuntimeException e) {
-            return new String[] {"400", errorBody("Request body is not valid JSON: " + e.getMessage())};
+            return new String[] {"400", errorBody("Request body is not valid JSON: " + e.getMessage(), 400)};
         }
         String missing = missingRequired(req);
         if (missing != null) {
-            return new String[] {"400", errorBody(missing)};
+            return new String[] {"400", errorBody(missing, 400)};
+        }
+        Map<String, Object> credential = credential(req);
+        if (credential != null) {
+            String expectedId = expectedCredentialId(credential);
+            Object actualId = credential.get("id");
+            if (!expectedId.equals(actualId) || credential.containsKey("fields")) {
+                return new String[] {
+                    "422",
+                    errorBody("CredentialInstance already exists or was not identified by id", 422)
+                };
+            }
         }
         String name = String.valueOf(req.get("name"));
-        if (CONFLICTING_ADAPTER_NAME.equals(name)) {
+        if (credential != null && resourceIdentifier(req, "VCURL") != null
+                && resourceIdentifier(req, "PROCESSCHANGEEVENTS") == null) {
             return new String[] {
-                "400", errorBody("An adapter instance named '" + name + "' already exists")
+                "500", errorBody("Internal Server error, cause unknown.", 500, 500)
             };
         }
-        return new String[] {"201", adapterInstanceBody(req, true)};
+        return new String[] {"201", adapterInstanceBody(req, true, credentialId(req, false))};
     }
 
     private static String missingRequired(Map<String, Object> req) {
@@ -225,8 +239,36 @@ public final class MockOpsServer implements AutoCloseable {
         return null;
     }
 
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> credential(Map<String, Object> req) {
+        Object value = req.get("credential");
+        return value instanceof Map<?, ?> ? (Map<String, Object>) value : null;
+    }
+
+    private synchronized String credentialId(Map<String, Object> req, boolean persistInline) {
+        Map<String, Object> credential = credential(req);
+        if (credential == null) {
+            return null;
+        }
+        Object supplied = credential.get("id");
+        if (supplied instanceof String id && !id.isEmpty()) {
+            return id;
+        }
+        String id = expectedCredentialId(credential);
+        if (persistInline) {
+            persistedCredentials++;
+        }
+        return id;
+    }
+
+    private static String expectedCredentialId(Map<String, Object> credential) {
+        String name = String.valueOf(credential.get("name"));
+        return UUID.nameUUIDFromBytes(("credential:" + name).getBytes(StandardCharsets.UTF_8)).toString();
+    }
+
     /** Shapes a response after the spec's adapter-instance example. */
-    private static String adapterInstanceBody(Map<String, Object> req, boolean persisted) {
+    private static String adapterInstanceBody(
+            Map<String, Object> req, boolean persisted, String credentialInstanceId) {
         String name = String.valueOf(req.get("name"));
         String adapterKindKey = String.valueOf(req.get("adapterKindKey"));
         String id = UUID.nameUUIDFromBytes((persisted ? "created:" : "tested:").concat(name)
@@ -240,12 +282,20 @@ public final class MockOpsServer implements AutoCloseable {
         if (description instanceof String s) {
             sb.append(",\"description\":").append(Json.quote(s));
         }
+        if (credentialInstanceId != null) {
+            sb.append(",\"credentialInstanceId\":").append(Json.quote(credentialInstanceId));
+        }
         sb.append(",\"id\":").append(Json.quote(id)).append("}");
         return sb.toString();
     }
 
-    private static String errorBody(String message) {
-        return "{\"message\":" + Json.quote(message) + ",\"httpStatusCode\":400}";
+    private static String errorBody(String message, int status) {
+        return "{\"message\":" + Json.quote(message) + ",\"httpStatusCode\":" + status + "}";
+    }
+
+    private static String errorBody(String message, int status, int apiErrorCode) {
+        return "{\"message\":" + Json.quote(message) + ",\"httpStatusCode\":" + status
+                + ",\"apiErrorCode\":" + apiErrorCode + "}";
     }
 
     private static Map<String, Object> capturedHeaders(HttpExchange exchange) {

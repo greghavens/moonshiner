@@ -16,14 +16,30 @@ public final class VcfIdentityProviderClient {
     private final Duration requestTimeout;
     private final HttpClient http;
 
-    /**
-     * Focused projection of IdentityProviderSpec. The other contract optionals
-     * (ldap, oidc, and fedIdpSpec) are deliberately unset in this workflow.
-     */
+    public record IdentityProviderDirectory(
+            String name,
+            String defaultDomain,
+            List<String> domains,
+            String federatedIdpSourceType) {
+    }
+
+    public record OidcSpec(
+            String clientId,
+            String clientSecret,
+            String discoveryEndpoint) {
+    }
+
+    public record FederatedIdentityProviderSpec(
+            String name,
+            IdentityProviderDirectory directory,
+            OidcSpec oidcSpec) {
+    }
+
     public record IdentityProviderSpec(
             String name,
             String type,
-            List<String> certChain) {
+            List<String> certChain,
+            FederatedIdentityProviderSpec fedIdpSpec) {
     }
 
     public VcfIdentityProviderClient(

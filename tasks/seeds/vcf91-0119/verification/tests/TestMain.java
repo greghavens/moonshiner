@@ -11,8 +11,8 @@ public final class TestMain {
     }
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 7) {
-            throw new AssertionError("expected seven harness arguments");
+        if (args.length != 8) {
+            throw new AssertionError("expected eight harness arguments");
         }
         String apiRoot = args[0];
         String sessionId = args[1];
@@ -21,11 +21,20 @@ public final class TestMain {
         String expectedTask = args[4];
         String expectedVm = args[5];
         Path requestLog = Path.of(args[6]);
+        String mode = args[7];
+
+        Duration expectedPollInterval = mode.equals("live")
+                ? Duration.ofSeconds(2)
+                : Duration.ofMillis(7);
+        int maxPolls = mode.equals("live") ? 30 : 8;
+        int expectedPolls = mode.equals("live") ? 12 : mode.equals("states") ? 4 : 8;
+        int expectedSleeps = expectedPolls - 1;
+        boolean expectExhaustion = mode.equals("exhaustion");
 
         AtomicInteger sleepCount = new AtomicInteger();
         VcenterCloneClient.Sleeper sleeper = duration -> {
             check(
-                    duration.equals(Duration.ofMillis(7)),
+                    duration.equals(expectedPollInterval),
                     "wrong poll interval passed to sleeper");
             sleepCount.incrementAndGet();
         };
@@ -34,8 +43,8 @@ public final class TestMain {
                 apiRoot,
                 sessionId,
                 Duration.ofSeconds(3),
-                Duration.ofMillis(7),
-                8,
+                expectedPollInterval,
+                maxPolls,
                 sleeper);
         check(
                 !Files.exists(requestLog) || Files.size(requestLog) == 0,
@@ -77,19 +86,32 @@ public final class TestMain {
                         Duration.ofMillis(1),
                         0));
 
-        VcenterCloneClient.CloneOutcome outcome =
-                client.cloneAndWait(source, name);
-        check(outcome.taskId().equals(expectedTask), "wrong task ID");
+        VcenterCloneClient.CloneOutcome outcome = null;
+        try {
+            outcome = client.cloneAndWait(source, name);
+            check(!expectExhaustion, "poll exhaustion returned success");
+        } catch (java.io.IOException expected) {
+            check(expectExhaustion, "unexpected IOException: " + expected);
+        }
+        if (!expectExhaustion) {
+            check(outcome.taskId().equals(expectedTask), "wrong task ID");
+            check(
+                    outcome.virtualMachineId().equals(expectedVm),
+                    "wrong VM result");
+            check(
+                    outcome.polls() == expectedPolls,
+                    "client did not poll through terminal state");
+        }
         check(
-                outcome.virtualMachineId().equals(expectedVm),
-                "wrong VM result");
-        check(outcome.polls() == 4, "client did not poll through terminal state");
-        check(sleepCount.get() == 3, "wrong sleeper invocation count");
+                sleepCount.get() == expectedSleeps,
+                "wrong sleeper invocation count");
 
         List<String> events = Files.readAllLines(
                 requestLog,
                 StandardCharsets.UTF_8);
-        check(events.size() == 5, "unexpected request count");
+        check(
+                events.size() == expectedPolls + 1,
+                "unexpected request count");
 
         String expectedCloneTarget =
                 "/api/vcenter/vm?action=clone&vmw-task=true";

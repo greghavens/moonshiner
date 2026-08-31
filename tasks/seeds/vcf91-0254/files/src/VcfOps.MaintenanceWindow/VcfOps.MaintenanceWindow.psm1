@@ -29,7 +29,7 @@ function Set-VcfOpsMaintenanceWindow {
         [string] $Key,
 
         [Parameter(Mandatory = $true)]
-        [ValidateSet('ONCE', 'DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY')]
+        [ValidateSet('ONCE', 'DAILY', 'WEEKLY')]
         [string] $ScheduleType,
 
         [Parameter(Mandatory = $true)]

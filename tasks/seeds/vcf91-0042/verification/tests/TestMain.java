@@ -21,23 +21,37 @@ public final class TestMain {
         expectIllegalArgument(
                 () -> client.addExternalIdentityProviderIfSafe(
                         new VcfIdentityProviderClient.IdentityProviderSpec(
-                                null, args[4], null),
+                                null, args[4], null, federatedSpec()),
                         null),
                 "invalid provider must be rejected before traffic");
 
         boolean blocked = client.addExternalIdentityProviderIfSafe(
                 new VcfIdentityProviderClient.IdentityProviderSpec(
-                        args[2], args[4], null),
+                        args[2], args[4], null, federatedSpec()),
                 null);
         require(!blocked, "FAILURE precheck must gate enrollment");
 
         boolean enrolled = client.addExternalIdentityProviderIfSafe(
                 new VcfIdentityProviderClient.IdentityProviderSpec(
-                        args[3], args[4], null),
+                        args[3], args[4], null, federatedSpec()),
                 null);
         require(enrolled, "SUCCESS precheck must permit enrollment");
 
         System.out.println("SUCCESSFUL");
+    }
+
+    private static VcfIdentityProviderClient.FederatedIdentityProviderSpec federatedSpec() {
+        return new VcfIdentityProviderClient.FederatedIdentityProviderSpec(
+                "Broker federation",
+                new VcfIdentityProviderClient.IdentityProviderDirectory(
+                        "Corporate Directory",
+                        "corp.example",
+                        java.util.List.of("corp.example", "example.org"),
+                        "MICROSOFT_ENTRA_ID"),
+                new VcfIdentityProviderClient.OidcSpec(
+                        "vcf-client",
+                        "client-secret-value",
+                        "https://login.example.org/.well-known/openid-configuration"));
     }
 
     private static void require(boolean condition, String message) {

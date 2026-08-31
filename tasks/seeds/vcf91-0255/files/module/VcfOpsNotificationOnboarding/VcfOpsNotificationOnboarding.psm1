@@ -3,25 +3,11 @@ Set-StrictMode -Version Latest
 <#
     VMware Cloud Foundation Operations 9.1 - outbound notification onboarding.
 
-    The service operations this module drives are projected in docs/contract.json
-    from the pinned OpenAPI specification recorded in docs/official_sources.json:
-
-      acquireToken                  POST /suite-api/api/auth/token/acquire
-      getCurrentVersionOfServer     GET  /suite-api/api/versions/current
-      getAlertPluginTypes           GET  /suite-api/api/alertplugins/types
-      createAlertPlugin             POST /suite-api/api/alertplugins
-      getNotificationTemplates      GET  /suite-api/api/notifications/templates
-      createNotificationPluginRule  POST /suite-api/api/notifications/rules
-
     Requests are issued with the VMware.Sdk.Vcf.Ops PowerCLI cmdlets, which the
     environment installs as a prerequisite. Connect-VcfOpsServer performs
     acquireToken and getCurrentVersionOfServer; each remaining operation has an
     Invoke-VcfOps<OperationId> cmdlet, and request models are built with the
-    matching Initialize-VcfOps<schema> cmdlet, for example:
-
-      $value  = Initialize-VcfOpsnamevalue -Name 'SMTP_HOST' -Value 'smtp.example.com'
-      $plugin = Initialize-VcfOpsnotificationplugin -Name 'x' -PluginTypeId 'y' -ConfigValues @($value)
-      $result = Invoke-VcfOpsCreateAlertPlugin -Server $connection -NotificationPlugin $plugin
+    matching Initialize-VcfOps<schema> cmdlet.
 
     A request model serializes only the properties that were actually supplied,
     so an optional field is omitted from the wire body by leaving its parameter
@@ -102,6 +88,10 @@ function New-VcfOpsNotificationBinding {
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
         [string] $RuleName,
+
+        [Parameter()]
+        [ValidateNotNull()]
+        [System.Collections.IDictionary] $RuleProperty,
 
         [Parameter()]
         [ValidateNotNullOrEmpty()]

@@ -164,7 +164,6 @@ public final class VcfInstallerClient {
         if (!(metadataValue instanceof Map<?, ?> metadata)) {
             throw protocol(GET_TASKS_OPERATION, "pageMetadata must be an object");
         }
-
         int pageNumber = integer(metadata, "pageNumber", GET_TASKS_OPERATION);
         int pageSize = integer(metadata, "pageSize", GET_TASKS_OPERATION);
         int totalElements = integer(metadata, "totalElements", GET_TASKS_OPERATION);

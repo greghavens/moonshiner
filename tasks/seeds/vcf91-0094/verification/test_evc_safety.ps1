@@ -2,6 +2,8 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $script:Assertions = 0
+$script:SessionId = '0123456789abcdef0123456789abcdef'
+$script:ServiceUuid = '7978ee81-a66c-4c37-8653-c577c0161e9d'
 
 function Assert-True {
     param(
@@ -110,7 +112,7 @@ function Assert-Request {
     Assert-Equal $Actual.method $Method "HTTP method for $Target"
     Assert-Equal $Actual.target $Target "request target for $Target"
     Assert-Equal $Actual.body $Body "raw request body for $Target"
-    Assert-Equal $Actual.api_session_id 'session-test-token' "session header for $Target"
+    Assert-Equal $Actual.api_session_id $script:SessionId "session header for $Target"
     if ($HasJsonBody) {
         Assert-True (
             [string]$Actual.content_type
@@ -132,9 +134,8 @@ $server = $null
 try {
     $manifestPath = Join-Path $PSScriptRoot 'VcfEvcSafety.psd1'
     $manifest = Test-ModuleManifest -Path $manifestPath
-    Assert-True (
-        @($manifest.RequiredModules.Name) -ccontains 'VMware.Sdk.Vcf.SddcManager'
-    ) 'The module manifest must retain VMware.Sdk.Vcf.SddcManager as a prerequisite.'
+    Assert-Equal @($manifest.RequiredModules).Count 0 `
+        'The direct HTTP module must not declare an unrelated SDK prerequisite.'
 
     $vendoredVmware = @(
         Get-ChildItem -LiteralPath $PSScriptRoot -Recurse -File |
@@ -145,45 +146,88 @@ try {
     )
     Assert-Equal $vendoredVmware.Count 0 'VMware SDK modules must not be vendored.'
 
+    $moduleText = Get-Content -Raw -LiteralPath (
+        Join-Path $PSScriptRoot 'VcfEvcSafety.psm1'
+    )
+    Assert-True $moduleText.Contains(
+        'DangerousAcceptAnyServerCertificateValidator',
+        [StringComparison]::Ordinal
+    ) 'Certificate skipping must use the static .NET validator.'
+    Assert-True (-not $moduleText.Contains(
+        'VMware.Sdk.Vcf.SddcManager',
+        [StringComparison]::Ordinal
+    )) 'The implementation must not require the unrelated SDDC Manager module.'
+
     Import-Module $manifestPath -Force
-    Assert-True ($null -ne (
-        Get-Module -Name 'VMware.Sdk.Vcf.SddcManager'
-    )) 'Importing VcfEvcSafety must load the installed VMware SDK prerequisite.'
+    $evcParameter = (Get-Command Set-VcfClusterEvcModeSafely).`
+        Parameters['EvcMode']
+    Assert-True ([bool] @($evcParameter.Attributes).Where({
+        $_ -is [Management.Automation.ParameterAttribute] -and $_.Mandatory
+    }).Count) `
+        'EvcMode must be mandatory; unsupported clear-by-omission is removed.'
 
     $server = Start-ContractServer -TemporaryDirectory $temporaryDirectory
 
+    $supportedMasks = @(
+        [pscustomobject][ordered]@{ key = 'cpuid.CMPXCHG16B'; name = 'cpuid.CMPXCHG16B'; value = 'Val:1' },
+        [pscustomobject][ordered]@{ key = 'cpuid.DS'; name = 'cpuid.DS'; value = 'Val:1' },
+        [pscustomobject][ordered]@{ key = 'cpuid.FAMILY'; name = 'cpuid.FAMILY'; value = 'Val:6' },
+        [pscustomobject][ordered]@{ key = 'cpuid.Intel'; name = 'cpuid.Intel'; value = 'Val:1' },
+        [pscustomobject][ordered]@{ key = 'cpuid.LAHF64'; name = 'cpuid.LAHF64'; value = 'Val:1' },
+        [pscustomobject][ordered]@{ key = 'cpuid.LM'; name = 'cpuid.LM'; value = 'Val:1' },
+        [pscustomobject][ordered]@{ key = 'cpuid.MODEL'; name = 'cpuid.MODEL'; value = 'Val:0xf' },
+        [pscustomobject][ordered]@{ key = 'cpuid.MWAIT'; name = 'cpuid.MWAIT'; value = 'Val:1' },
+        [pscustomobject][ordered]@{ key = 'cpuid.NUM_EXT_LEVELS'; name = 'cpuid.NUM_EXT_LEVELS'; value = 'Val:0x80000008' },
+        [pscustomobject][ordered]@{ key = 'cpuid.NUMLEVELS'; name = 'cpuid.NUMLEVELS'; value = 'Val:0xa' },
+        [pscustomobject][ordered]@{ key = 'cpuid.NX'; name = 'cpuid.NX'; value = 'Val:1' },
+        [pscustomobject][ordered]@{ key = 'cpuid.SS'; name = 'cpuid.SS'; value = 'Val:1' },
+        [pscustomobject][ordered]@{ key = 'cpuid.SSE3'; name = 'cpuid.SSE3'; value = 'Val:1' },
+        [pscustomobject][ordered]@{ key = 'cpuid.SSSE3'; name = 'cpuid.SSSE3'; value = 'Val:1' },
+        [pscustomobject][ordered]@{ key = 'cpuid.STEPPING'; name = 'cpuid.STEPPING'; value = 'Val:1' }
+    )
     $evcMode = [pscustomobject][ordered]@{
-        key = 'intel-skylake'
+        key = 'intel-merom'
         masks = @(
-            [pscustomobject][ordered]@{
-                key = 'cpuid.avx'
-                name = 'Advanced Vector Extensions'
-                value = 'Val:1'
-                caller_only = 'must-not-reach-wire'
+            $supportedMasks | ForEach-Object {
+                [pscustomobject][ordered]@{
+                    key = $_.key
+                    name = $_.name
+                    value = $_.value
+                    caller_only = 'must-not-reach-wire'
+                }
             }
         )
         caller_only = 'must-not-reach-wire'
     }
+    $setBody = [ordered]@{
+        evc_mode = [ordered]@{
+            key = 'intel-merom'
+            masks = $supportedMasks
+        }
+    } | ConvertTo-Json -Depth 8 -Compress
 
     $setResult = Set-VcfClusterEvcModeSafely `
         -BaseUrl $server.BaseUrl `
-        -ApiToken 'session-test-token' `
-        -ClusterId 'domain-c7' `
+        -ApiToken $script:SessionId `
+        -ClusterId 'domain-c9' `
         -EvcMode $evcMode `
         -TaskTimeoutSeconds 5 `
         -PollIntervalMilliseconds 1
 
-    Assert-Equal $setResult.ClusterId 'domain-c7' 'set result cluster'
+    Assert-Equal $setResult.ClusterId 'domain-c9' 'set result cluster'
     Assert-Equal $setResult.Action 'Set' 'set result action'
-    Assert-Equal $setResult.PrecheckTaskId 'precheck-domain-c7' 'set precheck task id'
-    Assert-Equal $setResult.MutationTaskId 'mutation-domain-c7' 'set mutation task id'
+    Assert-Equal $setResult.PrecheckTaskId `
+        "task-4125:$script:ServiceUuid" 'set precheck task id'
+    Assert-Equal $setResult.MutationTaskId `
+        "task-4128:$script:ServiceUuid" 'set mutation task id'
 
     $precheckError = $null
     try {
         Set-VcfClusterEvcModeSafely `
             -BaseUrl $server.BaseUrl `
-            -ApiToken 'session-test-token' `
+            -ApiToken $script:SessionId `
             -ClusterId 'domain-c8' `
+            -EvcMode $evcMode `
             -TaskTimeoutSeconds 5 `
             -PollIntervalMilliseconds 1
     }
@@ -195,20 +239,26 @@ try {
         $precheckError.GetType().Name
     ) 'VcfEvcPrecheckException' 'precheck failure exception type'
     Assert-True (
-        -not $precheckError.Message.Contains('session-test-token', [StringComparison]::Ordinal)
+        -not $precheckError.Message.Contains($script:SessionId, [StringComparison]::Ordinal)
     ) 'precheck error must not disclose the API token'
 
-    $clearResult = Set-VcfClusterEvcModeSafely `
-        -BaseUrl $server.BaseUrl `
-        -ApiToken 'session-test-token' `
-        -ClusterId 'domain-c10' `
-        -TaskTimeoutSeconds 5 `
-        -PollIntervalMilliseconds 1
-
-    Assert-Equal $clearResult.ClusterId 'domain-c10' 'clear result cluster'
-    Assert-Equal $clearResult.Action 'Clear' 'clear result action'
-    Assert-Equal $clearResult.PrecheckTaskId 'precheck-domain-c10' 'clear precheck task id'
-    Assert-Equal $clearResult.MutationTaskId 'mutation-domain-c10' 'clear mutation task id'
+    $resultError = $null
+    try {
+        Set-VcfClusterEvcModeSafely `
+            -BaseUrl $server.BaseUrl `
+            -ApiToken $script:SessionId `
+            -ClusterId 'domain-c10' `
+            -EvcMode $evcMode `
+            -TaskTimeoutSeconds 5 `
+            -PollIntervalMilliseconds 1
+    }
+    catch {
+        $resultError = $_.Exception
+    }
+    Assert-True ($null -ne $resultError) `
+        'a non-empty successful precheck result must throw'
+    Assert-Equal $resultError.GetType().Name `
+        'VcfEvcPrecheckException' 'check-result failure exception type'
 
     Start-Sleep -Milliseconds 100
     $requests = @(
@@ -216,40 +266,38 @@ try {
             Where-Object { $_.Trim() } |
             ForEach-Object { $_ | ConvertFrom-Json }
     )
-    Assert-Equal $requests.Count 8 'exact request count across all workflows'
-
-    $setBody = '{"evc_mode":{"key":"intel-skylake","masks":[{"key":"cpuid.avx","name":"Advanced Vector Extensions","value":"Val:1"}]}}'
+    Assert-Equal $requests.Count 7 'exact request count across all workflows'
     Assert-Request $requests[0] 'POST' `
-        '/api/vcenter/cluster/domain-c7/evc-mode?action=check-set&vmw-task=true' `
+        '/api/vcenter/cluster/domain-c9/evc-mode?action=check-set&vmw-task=true' `
         $setBody $true
     Assert-Request $requests[1] 'GET' `
-        '/api/cis/tasks/precheck-domain-c7' '' $false
+        "/api/cis/tasks/$([uri]::EscapeDataString("task-4125:$script:ServiceUuid"))" '' $false
     Assert-Request $requests[2] 'PUT' `
-        '/api/vcenter/cluster/domain-c7/evc-mode?vmw-task=true' `
+        '/api/vcenter/cluster/domain-c9/evc-mode?vmw-task=true' `
         $setBody $true
 
     Assert-Request $requests[3] 'POST' `
         '/api/vcenter/cluster/domain-c8/evc-mode?action=check-set&vmw-task=true' `
-        '{}' $true
+        $setBody $true
     Assert-Request $requests[4] 'GET' `
-        '/api/cis/tasks/precheck-domain-c8' '' $false
+        "/api/cis/tasks/$([uri]::EscapeDataString("task-4126:$script:ServiceUuid"))" '' $false
 
     Assert-Request $requests[5] 'POST' `
         '/api/vcenter/cluster/domain-c10/evc-mode?action=check-set&vmw-task=true' `
-        '{}' $true
+        $setBody $true
     Assert-Request $requests[6] 'GET' `
-        '/api/cis/tasks/precheck-domain-c10' '' $false
-    Assert-Request $requests[7] 'PUT' `
-        '/api/vcenter/cluster/domain-c10/evc-mode?vmw-task=true' `
-        '{}' $true
+        "/api/cis/tasks/$([uri]::EscapeDataString("task-4127:$script:ServiceUuid"))" '' $false
 
     $failedClusterMutations = @(
         $requests | Where-Object {
-            $_.method -eq 'PUT' -and $_.target -like '*domain-c8*'
+            $_.method -eq 'PUT' -and (
+                $_.target -like '*domain-c8*' -or
+                $_.target -like '*domain-c10*'
+            )
         }
     )
     Assert-Equal $failedClusterMutations.Count 0 `
-        'the rejected precheck must gate every mutation for domain-c8'
+        'every rejected precheck must gate its mutation'
 
     foreach ($request in $requests) {
         Assert-True (
@@ -257,7 +305,7 @@ try {
         ) 'unset Cis.Tasks_get spec query must be omitted'
         Assert-True (
             $request.body -notmatch '"evc_mode":(?:null|""|\{\})'
-        ) 'unset evc_mode must be omitted, never serialized empty'
+        ) 'evc_mode must never be serialized null or empty'
         Assert-True (
             $request.body -notmatch 'caller_only'
         ) 'caller-added properties must not reach the wire'

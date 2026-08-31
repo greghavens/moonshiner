@@ -62,6 +62,8 @@ final class MockVcenterServer implements AutoCloseable {
             String replacementAccessToken,
             String subjectToken,
             String subjectTokenType,
+            String audience,
+            String requestedTokenType,
             String suffix) {
     }
 
@@ -244,6 +246,9 @@ final class MockVcenterServer implements AutoCloseable {
     private synchronized void serveToken(HttpExchange exchange, byte[] body)
             throws IOException {
         String expectedBody = "grant_type=" + formEncode(GRANT_TYPE)
+                + "&audience=" + formEncode(fixture.audience())
+                + "&requested_token_type="
+                + formEncode(fixture.requestedTokenType())
                 + "&subject_token=" + formEncode(fixture.subjectToken())
                 + "&subject_token_type=" + formEncode(fixture.subjectTokenType());
         boolean valid = noQuery(exchange)
@@ -288,34 +293,26 @@ final class MockVcenterServer implements AutoCloseable {
     }
 
     private List<String> vmItems() {
-        String suffix = fixture.suffix();
         return List.of(
-                "{\"vm\":" + quote("vm-a-" + suffix)
-                        + ",\"name\":\"alpha\",\"power_state\":\"POWERED_ON\"}",
-                "{\"vm\":" + quote("vm-m-" + suffix)
-                        + ",\"name\":\"middle \\\"quoted\\\"\","
-                        + "\"power_state\":\"SUSPENDED\",\"cpu_count\":4,"
-                        + "\"memory_size_mib\":8192}",
-                "{\"vm\":" + quote("vm-z-" + suffix)
-                        + ",\"name\":\"zeta\",\"power_state\":\"POWERED_OFF\","
-                        + "\"cpu_count\":8,\"memory_size_mib\":16384}");
+                "{\"vm\":\"vm-19\",\"name\":\"sddcm01\",\"power_state\":\"POWERED_ON\",\"cpu_count\":4,\"memory_size_MiB\":16384}",
+                "{\"vm\":\"vm-20\",\"name\":\"vc01\",\"power_state\":\"POWERED_ON\",\"cpu_count\":4,\"memory_size_MiB\":21504}",
+                "{\"vm\":\"vm-28\",\"name\":\"nsx01a\",\"power_state\":\"POWERED_ON\",\"cpu_count\":6,\"memory_size_MiB\":24576}",
+                "{\"vm\":\"vm-33\",\"name\":\"vcf-msr01-nxpxf\",\"power_state\":\"POWERED_ON\",\"cpu_count\":4,\"memory_size_MiB\":10240}",
+                "{\"vm\":\"vm-34\",\"name\":\"vcf-msr01-5ghdn\",\"power_state\":\"POWERED_ON\",\"cpu_count\":8,\"memory_size_MiB\":24576}",
+                "{\"vm\":\"vm-35\",\"name\":\"vcf-msr01-x6j88\",\"power_state\":\"POWERED_ON\",\"cpu_count\":8,\"memory_size_MiB\":24576}",
+                "{\"vm\":\"vm-36\",\"name\":\"vcf-msr01-6zpgq\",\"power_state\":\"POWERED_ON\",\"cpu_count\":8,\"memory_size_MiB\":24576}",
+                "{\"vm\":\"vm-37\",\"name\":\"vcf01\",\"power_state\":\"POWERED_ON\",\"cpu_count\":4,\"memory_size_MiB\":16384}",
+                "{\"vm\":\"vm-38\",\"name\":\"vcf-proxy01\",\"power_state\":\"POWERED_ON\",\"cpu_count\":4,\"memory_size_MiB\":16384}",
+                "{\"vm\":\"vm-39\",\"name\":\"vcf-lic01\",\"power_state\":\"POWERED_ON\",\"cpu_count\":2,\"memory_size_MiB\":4096}",
+                "{\"vm\":\"vm-43\",\"name\":\"vcf-asr01-szwjz\",\"power_state\":\"POWERED_ON\",\"cpu_count\":8,\"memory_size_MiB\":98304}");
     }
 
     private List<String> hostItems() {
-        String suffix = fixture.suffix();
         return List.of(
-                "{\"host\":" + quote("host-a-" + suffix)
-                        + ",\"name\":\"esx-a.example.test\","
-                        + "\"connection_state\":\"CONNECTED\"}",
-                "{\"host\":" + quote("host-m-" + suffix)
-                        + ",\"name\":\"esx-m.example.test\","
-                        + "\"connection_state\":\"NOT_RESPONDING\","
-                        + "\"power_state\":null,\"host_uuid\":null}",
-                "{\"host\":" + quote("host-z-" + suffix)
-                        + ",\"name\":\"esx-z.example.test\","
-                        + "\"connection_state\":\"DISCONNECTED\","
-                        + "\"power_state\":\"POWERED_OFF\","
-                        + "\"host_uuid\":" + quote("uuid-" + suffix) + "}");
+                "{\"host\":\"host-12\",\"name\":\"esx01.vcf.lab\","
+                        + "\"connection_state\":\"CONNECTED\","
+                        + "\"power_state\":\"POWERED_ON\","
+                        + "\"host_uuid\":\"312680c6-8a28-4302-90c6-319869516823\"}");
     }
 
     private static Map<String, String> loadRoutes(Path contract) throws IOException {
@@ -376,10 +373,7 @@ final class MockVcenterServer implements AutoCloseable {
     private static void sendUnauthenticated(HttpExchange exchange)
             throws IOException {
         sendJson(exchange, 401,
-                "{\"error_type\":\"UNAUTHENTICATED\",\"messages\":[{"
-                        + "\"id\":\"com.vmware.vapi.endpoint.method.authentication.required\","
-                        + "\"default_message\":\"Authentication required.\","
-                        + "\"args\":[]}]}");
+                "{\"error_type\":\"UNAUTHENTICATED\",\"messages\":[]}");
     }
 
     private static void sendJson(HttpExchange exchange, int status, String json)

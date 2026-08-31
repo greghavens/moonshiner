@@ -101,7 +101,7 @@ class ContractServer(ThreadingHTTPServer):
         with self.state_lock:
             traversal = self.page_requests // TOTAL_PAGES
             self.page_requests += 1
-        start = page_number * PAGE_SIZE
+        start = (page_number - 1) * PAGE_SIZE
         elements = list(self.domains[start : start + PAGE_SIZE])
         if traversal % 2 == 1:
             elements.reverse()
@@ -167,7 +167,7 @@ class Handler(BaseHTTPRequestHandler):
             len(query["pageNumber"]) != 1
             or len(query["pageSize"]) != 1
             or requested_size != PAGE_SIZE
-            or page_number not in range(TOTAL_PAGES)
+            or page_number not in range(1, TOTAL_PAGES + 1)
         ):
             self.send_json(400, {"message": "Invalid pagination request"})
             return

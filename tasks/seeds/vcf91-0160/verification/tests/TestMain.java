@@ -16,6 +16,7 @@ public final class TestMain {
     }
 
     public static void main(String[] args) throws Exception {
+        testLiveNamespaceNotFoundStopsBeforeKubernetes();
         testLateFailurePreservesCommittedStepsAndExactWire();
         testEarlyFailureStopsImmediately();
         testMiddleFailurePreservesNamespaceAndStops();
@@ -25,6 +26,35 @@ public final class TestMain {
         testTransportFailureCarriesUnknownLedger();
         System.out.println(
                 "PASS: contract-pinned partial VCF/VKS change is reported");
+    }
+
+    private static void testLiveNamespaceNotFoundStopsBeforeKubernetes()
+            throws Exception {
+        ContractMockServer.Fixture fixture = fixture(
+                ContractMockServer.FailurePoint.LIVE_NAMESPACE_404);
+        try (ContractMockServer mock =
+                     new ContractMockServer(CONTRACT, fixture)) {
+            VcfVksChangeClient.ChangeReport report =
+                    client(mock, fixture).apply(change(fixture));
+            assertReport(
+                    report,
+                    VcfVksChangeClient.OverallStatus.FAILED,
+                    new VcfVksChangeClient.StepStatus[] {
+                        VcfVksChangeClient.StepStatus.FAILED,
+                        VcfVksChangeClient.StepStatus.SKIPPED,
+                        VcfVksChangeClient.StepStatus.SKIPPED
+                    },
+                    new Integer[] {404, null, null},
+                    new boolean[] {false, false, false});
+            assertEquals(1, mock.requests().size(),
+                    "live namespace 404 must stop before Kubernetes");
+            assertFalse(mock.namespaceCommitted(),
+                    "live namespace 404 cannot be committed");
+            assertFalse(mock.labelCommitted(),
+                    "live namespace 404 must skip label patch");
+            assertFalse(mock.versionCommitted(),
+                    "live namespace 404 must skip version patch");
+        }
     }
 
     private static void testLateFailurePreservesCommittedStepsAndExactWire()

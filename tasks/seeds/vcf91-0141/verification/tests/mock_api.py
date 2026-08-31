@@ -83,6 +83,7 @@ class ContractMockServer(ThreadingHTTPServer):
 
         self.patch_attempts = {name: 0 for name in self.clusters}
         self.mutation_counts = {name: 0 for name in self.clusters}
+        self.namespace_gets = 0
         self.sequence = 0
         self.state_lock = threading.Lock()
         super().__init__(address, ContractRequestHandler)
@@ -208,6 +209,23 @@ class ContractRequestHandler(BaseHTTPRequestHandler):
         if namespace_match is not None:
             if namespace_match["namespace"] != self.contract_server.namespace:
                 self._send_json(404, {"error": "namespace not found"})
+                return
+            with self.contract_server.state_lock:
+                self.contract_server.namespace_gets += 1
+                namespace_get = self.contract_server.namespace_gets
+            if namespace_get == 1:
+                self._send_json(
+                    404,
+                    {
+                        "error_type": "NOT_FOUND",
+                        "messages": [
+                            {
+                                "id": "vcenter.wcp.workload.notfound",
+                                "default_message": "Namespace not found.",
+                            }
+                        ],
+                    },
+                )
                 return
             self._send_json(
                 200,

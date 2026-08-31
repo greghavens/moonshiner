@@ -212,7 +212,7 @@ func TestListDomainsRetrievesEveryPageAndSortsStable(t *testing.T) {
 		t.Fatalf("request count = %d, want 6: %#v", len(requests), requests)
 	}
 	for index, request := range requests {
-		wantPage := index % 3
+		wantPage := index%3 + 1
 		wantQuery := "pageNumber=" + strconv.Itoa(wantPage) + "&pageSize=2"
 		if request.Method != http.MethodGet ||
 			request.Path != "/v1/domains" ||

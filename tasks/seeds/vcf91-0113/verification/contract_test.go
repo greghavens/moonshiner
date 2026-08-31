@@ -22,7 +22,7 @@ import (
 const (
 	expectedCommit = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
 	expectedSpec   = "specifications/vsphere/openapi/automation/vcenter.yaml"
-	contractSHA256 = "48396ac56cb70efd83e1cb49becdae3bf5a92184ac46804483d8e2df68ab61a3"
+	contractSHA256 = "85195c9ac03d6a4a3b918b09c089e3797b1f80c017eefa39cb44db31af59ce58"
 	sourcesSHA256  = "fef87b0869b6e8edad49530a46970598cebc24434b7fa20ec78cc71c8c594628"
 )
 
@@ -158,10 +158,10 @@ func TestProtectedContractProvenance(t *testing.T) {
 		"cores_per_socket", "count", "hot_add_enabled", "hot_remove_enabled",
 	})
 	assertOptionalProperties(t, memory.Required, memory.Properties, []string{
-		"hot_add_enabled", "size_mib",
+		"hot_add_enabled", "size_MiB",
 	})
 	if cpu.Properties["count"].Format != "int64" ||
-		memory.Properties["size_mib"].Format != "int64" {
+		memory.Properties["size_MiB"].Format != "int64" {
 		t.Fatalf("integer schema projection lost int64 formats")
 	}
 }
@@ -182,15 +182,15 @@ func TestResizeAndStartReportsLaterPowerFailureAndExactWire(t *testing.T) {
 		t.Fatalf("error = %T %v, want *APIError", err, err)
 	}
 	if apiError.OperationID != resize.PowerStartOperation ||
-		apiError.StatusCode != http.StatusServiceUnavailable ||
-		apiError.ErrorType != "SERVICE_UNAVAILABLE" ||
+		apiError.StatusCode != http.StatusBadRequest ||
+		apiError.ErrorType != "ALREADY_IN_DESIRED_STATE" ||
 		apiError.Message != runtime.FailureMessage {
 		t.Fatalf("APIError lost contract data: %#v", apiError)
 	}
 	for _, secret := range []string{
 		runtime.SessionToken,
 		runtime.FailureMessage,
-		"SERVICE_UNAVAILABLE",
+		"ALREADY_IN_DESIRED_STATE",
 	} {
 		if strings.Contains(apiError.Error(), secret) {
 			t.Fatalf("APIError text exposed %q: %q", secret, apiError.Error())
@@ -219,8 +219,8 @@ func TestResizeAndStartReportsLaterPowerFailureAndExactWire(t *testing.T) {
 				Name:        "PowerStart",
 				OperationID: resize.PowerStartOperation,
 				State:       "FAILED",
-				HTTPStatus:  http.StatusServiceUnavailable,
-				ErrorType:   "SERVICE_UNAVAILABLE",
+				HTTPStatus:  http.StatusBadRequest,
+				ErrorType:   "ALREADY_IN_DESIRED_STATE",
 				Message:     runtime.FailureMessage,
 			},
 		},
@@ -255,8 +255,8 @@ func TestResizeAndStartReportsLaterPowerFailureAndExactWire(t *testing.T) {
 			method:      http.MethodPatch,
 			requestURI:  "/api/vcenter/vm/" + encodedVM + "/hardware/memory",
 			contentType: "application/json",
-			body:        `{"size_mib":` + integerString(runtime.MemoryMiB) + `}`,
-			members:     []string{"size_mib"},
+			body:        `{"size_MiB":` + integerString(runtime.MemoryMiB) + `}`,
+			members:     []string{"size_MiB"},
 			status:      http.StatusNoContent,
 		},
 		{
@@ -264,7 +264,7 @@ func TestResizeAndStartReportsLaterPowerFailureAndExactWire(t *testing.T) {
 			method:      http.MethodPost,
 			requestURI:  "/api/vcenter/vm/" + encodedVM + "/power?action=start",
 			query:       "action=start",
-			status:      http.StatusServiceUnavailable,
+			status:      http.StatusBadRequest,
 		},
 	}
 	if len(requests) != len(wireCases) {

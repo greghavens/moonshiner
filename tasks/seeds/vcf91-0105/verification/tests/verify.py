@@ -176,7 +176,7 @@ def verify_provenance(contract: dict, sources: dict) -> None:
             "name",
             "power_state",
             "cpu_count",
-            "memory_size_mib",
+            "memory_size_MiB",
         ]
         and properties["power_state"].get("enum")
         == ["POWERED_OFF", "POWERED_ON", "SUSPENDED"],
@@ -407,31 +407,107 @@ def verify_primary(package: object, temp: Path) -> None:
     username = f"rotation-svc-{suffix}"
     old_password = f"old:{secrets.token_urlsafe(16)}"
     new_password = f"new:{secrets.token_urlsafe(16)}"
-    old_token = f"old-session-{secrets.token_urlsafe(18)}"
-    new_token = f"new-session-{secrets.token_urlsafe(18)}"
+    old_token = secrets.token_hex(16)
+    new_token = secrets.token_hex(16)
     error_secret = f"server-detail-{secrets.token_urlsafe(18)}"
     release_file = temp / "release-old-request"
     slow_filters = {
-        "vms": [f"vm/α ?{suffix}", f"vm&={suffix}"],
-        "names": [f"blue / 雪 ?&={suffix}", f"name+two={suffix}"],
-        "datacenters": [f"dc / + ={suffix}"],
-        "power_states": ["POWERED_ON", "SUSPENDED"],
+        "vms": ["vm-39"],
+        "names": ["vcf-lic01"],
+        "folders": ["group-v4"],
+        "datacenters": ["datacenter-3"],
+        "hosts": ["host-12"],
+        "clusters": ["domain-c9"],
+        "resource_pools": ["resgroup-10"],
+        "power_states": ["POWERED_ON"],
     }
     slow_vms = [
         {
-            "vm": f"vm-old-{suffix}",
-            "name": f"Old request {suffix}",
+            "memory_size_MiB": 4096,
+            "vm": "vm-39",
+            "name": "vcf-lic01",
             "power_state": "POWERED_ON",
-            "cpu_count": 4,
+            "cpu_count": 2,
         }
     ]
     fast_vms = [
         {
-            "vm": f"vm-new-{suffix}",
-            "name": f"New request {suffix}",
-            "power_state": "SUSPENDED",
-            "memory_size_mib": 8192,
-        }
+            "memory_size_MiB": 16384,
+            "vm": "vm-19",
+            "name": "sddcm01",
+            "power_state": "POWERED_ON",
+            "cpu_count": 4,
+        },
+        {
+            "memory_size_MiB": 21504,
+            "vm": "vm-20",
+            "name": "vc01",
+            "power_state": "POWERED_ON",
+            "cpu_count": 4,
+        },
+        {
+            "memory_size_MiB": 24576,
+            "vm": "vm-28",
+            "name": "nsx01a",
+            "power_state": "POWERED_ON",
+            "cpu_count": 6,
+        },
+        {
+            "memory_size_MiB": 10240,
+            "vm": "vm-33",
+            "name": "vcf-msr01-nxpxf",
+            "power_state": "POWERED_ON",
+            "cpu_count": 4,
+        },
+        {
+            "memory_size_MiB": 24576,
+            "vm": "vm-34",
+            "name": "vcf-msr01-5ghdn",
+            "power_state": "POWERED_ON",
+            "cpu_count": 8,
+        },
+        {
+            "memory_size_MiB": 24576,
+            "vm": "vm-35",
+            "name": "vcf-msr01-x6j88",
+            "power_state": "POWERED_ON",
+            "cpu_count": 8,
+        },
+        {
+            "memory_size_MiB": 24576,
+            "vm": "vm-36",
+            "name": "vcf-msr01-6zpgq",
+            "power_state": "POWERED_ON",
+            "cpu_count": 8,
+        },
+        {
+            "memory_size_MiB": 16384,
+            "vm": "vm-37",
+            "name": "vcf01",
+            "power_state": "POWERED_ON",
+            "cpu_count": 4,
+        },
+        {
+            "memory_size_MiB": 16384,
+            "vm": "vm-38",
+            "name": "vcf-proxy01",
+            "power_state": "POWERED_ON",
+            "cpu_count": 4,
+        },
+        {
+            "memory_size_MiB": 4096,
+            "vm": "vm-39",
+            "name": "vcf-lic01",
+            "power_state": "POWERED_ON",
+            "cpu_count": 2,
+        },
+        {
+            "memory_size_MiB": 98304,
+            "vm": "vm-43",
+            "name": "vcf-asr01-szwjz",
+            "power_state": "POWERED_ON",
+            "cpu_count": 8,
+        },
     ]
     scenario = {
         "username": username,
@@ -590,11 +666,8 @@ def verify_primary(package: object, temp: Path) -> None:
             "old-session exploded VM query wire shape changed",
         )
         require(
-            all(
-                f"{name}=" not in slow.get("rawQuery", "")
-                for name in ("folders", "hosts", "clusters", "resource_pools")
-            ),
-            "unset optional filters were serialized on the old request",
+            all(f"{name}=" in slow.get("rawQuery", "") for name in FILTER_NAMES),
+            "the live filter intersection did not exercise every filter",
         )
         require_bodyless(slow, "old-session VM list")
         require(
@@ -637,17 +710,19 @@ def verify_failed_rotation_and_validation(package: object, temp: Path) -> None:
     old_password = f"old-{secrets.token_urlsafe(12)}"
     configured_new = f"configured-{secrets.token_urlsafe(12)}"
     rejected_password = f"rejected-{secrets.token_urlsafe(12)}"
-    old_token = f"old-{secrets.token_urlsafe(16)}"
-    new_token = f"new-{secrets.token_urlsafe(16)}"
+    old_token = secrets.token_hex(16)
+    new_token = secrets.token_hex(16)
     error_secret = f"payload-{secrets.token_urlsafe(20)}"
     release_file = temp / "already-released"
     release_file.parent.mkdir(parents=True, exist_ok=True)
     release_file.write_text("released\n", encoding="utf-8")
     fast_vms = [
         {
-            "vm": f"vm-{suffix}",
-            "name": f"Still old {suffix}",
-            "power_state": "POWERED_OFF",
+            "memory_size_MiB": 4096,
+            "vm": "vm-39",
+            "name": "vcf-lic01",
+            "power_state": "POWERED_ON",
+            "cpu_count": 2,
         }
     ]
     scenario = {

@@ -85,10 +85,7 @@ func TestPinnedContractProvenanceAndMockSurface(t *testing.T) {
 	var responderCalls atomic.Int32
 	server := contractmock.New(t, protectedPath("docs", "contract.json"), func(contractmock.Request) contractmock.Response {
 		responderCalls.Add(1)
-		return contractmock.JSONResponse(t, http.StatusOK, page{
-			Elements:     []vcfinstaller.Task{},
-			PageMetadata: metadata{PageNumber: 0, PageSize: 0, TotalElements: 0, TotalPages: 0},
-		})
+		return rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{}}`)
 	})
 	if server.OperationID() != "getTasks" {
 		t.Fatalf("mock loaded operation %q", server.OperationID())
@@ -155,20 +152,20 @@ func TestListAllTasksWirePaginationAndStableOrder(t *testing.T) {
 						{ID: "task-d", Name: "fourth", Status: "SUCCESSFUL", CreationTimestamp: "2026-08-02T04:00:00Z"},
 						{ID: "task-a", Name: "first", Type: &firstType, Status: "PENDING", CreationTimestamp: "2026-08-02T01:00:00Z"},
 					},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 2, TotalElements: 5, TotalPages: 3},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 2, TotalElements: 5, TotalPages: 3},
 				},
 				1: {
 					Elements: []vcfinstaller.Task{
 						{ID: "task-c", Name: "third", Status: "FAILED", CreationTimestamp: "2026-08-02T03:00:00Z"},
 						{ID: "task-e", Name: "tie-second", Status: "IN_PROGRESS", CreationTimestamp: "2026-08-02T02:00:00Z"},
 					},
-					PageMetadata: metadata{PageNumber: 1, PageSize: 2, TotalElements: 5, TotalPages: 3},
+					PageMetadata: metadata{PageNumber: 2, PageSize: 2, TotalElements: 5, TotalPages: 3},
 				},
 				2: {
 					Elements: []vcfinstaller.Task{
 						{ID: "task-b", Name: "tie-first", Type: &secondType, Status: "QUEUED", CreationTimestamp: "2026-08-02T02:00:00Z"},
 					},
-					PageMetadata: metadata{PageNumber: 2, PageSize: 1, TotalElements: 5, TotalPages: 3},
+					PageMetadata: metadata{PageNumber: 3, PageSize: 1, TotalElements: 5, TotalPages: 3},
 				},
 			},
 			want: []vcfinstaller.Task{
@@ -180,8 +177,8 @@ func TestListAllTasksWirePaginationAndStableOrder(t *testing.T) {
 			},
 			wantTargets: []string{
 				"/v1/tasks?pageSize=2",
-				"/v1/tasks?pageNumber=1&pageSize=2",
 				"/v1/tasks?pageNumber=2&pageSize=2",
+				"/v1/tasks?pageNumber=3&pageSize=2",
 			},
 		},
 		{
@@ -193,13 +190,13 @@ func TestListAllTasksWirePaginationAndStableOrder(t *testing.T) {
 						{ID: "task-z", Name: "later", Status: "SUCCESSFUL", CreationTimestamp: "2026-08-02T12:00:00Z"},
 						{ID: "task-y", Name: "earlier", Status: "SUCCESSFUL", CreationTimestamp: "2026-08-02T11:00:00Z"},
 					},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 2, TotalElements: 3, TotalPages: 2},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 2, TotalElements: 3, TotalPages: 2},
 				},
 				1: {
 					Elements: []vcfinstaller.Task{
 						{ID: "task-x", Name: "earliest", Status: "SUCCESSFUL", CreationTimestamp: "2026-08-02T10:00:00Z"},
 					},
-					PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 3, TotalPages: 2},
+					PageMetadata: metadata{PageNumber: 2, PageSize: 1, TotalElements: 3, TotalPages: 2},
 				},
 			},
 			want: []vcfinstaller.Task{
@@ -209,7 +206,7 @@ func TestListAllTasksWirePaginationAndStableOrder(t *testing.T) {
 			},
 			wantTargets: []string{
 				"/v1/tasks?completedAfter=0&doLiveRefresh=false&limit=7&orderBy=creationTimestamp&orderDirection=ASC&pageSize=2&resourceId=domain%2Fblue&resourceType=DOMAIN&taskName=install+%26+patch&taskStatus=IN_PROGRESS&taskType=SDDC_INSTALL",
-				"/v1/tasks?completedAfter=0&doLiveRefresh=false&limit=7&orderBy=creationTimestamp&orderDirection=ASC&pageNumber=1&pageSize=2&resourceId=domain%2Fblue&resourceType=DOMAIN&taskName=install+%26+patch&taskStatus=IN_PROGRESS&taskType=SDDC_INSTALL",
+				"/v1/tasks?completedAfter=0&doLiveRefresh=false&limit=7&orderBy=creationTimestamp&orderDirection=ASC&pageNumber=2&pageSize=2&resourceId=domain%2Fblue&resourceType=DOMAIN&taskName=install+%26+patch&taskStatus=IN_PROGRESS&taskType=SDDC_INSTALL",
 			},
 		},
 		{
@@ -230,7 +227,7 @@ func TestListAllTasksWirePaginationAndStableOrder(t *testing.T) {
 					Elements: []vcfinstaller.Task{
 						{ID: "task-empty", Name: "explicit empties", Status: "PENDING", CreationTimestamp: "2026-08-02T01:00:00Z"},
 					},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 1, TotalElements: 1, TotalPages: 1},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 1, TotalPages: 1},
 				},
 			},
 			want: []vcfinstaller.Task{
@@ -250,7 +247,7 @@ func TestListAllTasksWirePaginationAndStableOrder(t *testing.T) {
 						{ID: "later-in-time", Name: "raw first", Status: "PENDING", CreationTimestamp: "2026-08-02T01:00:00-05:00"},
 						{ID: "A-task", Name: "same upper", Status: "PENDING", CreationTimestamp: "2026-08-02T05:00:00Z"},
 					},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 3, TotalElements: 3, TotalPages: 1},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 3, TotalElements: 3, TotalPages: 1},
 				},
 			},
 			want: []vcfinstaller.Task{
@@ -331,7 +328,7 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 				0: {
 					Status:      http.StatusOK,
 					ContentType: "text/plain",
-					Body:        []byte(`{"elements":[],"pageMetadata":{"pageNumber":0,"pageSize":0,"totalElements":0,"totalPages":0}}`),
+					Body:        []byte(`{"elements":[],"pageMetadata":{"pageNumber":1,"pageSize":0,"totalElements":0,"totalPages":0}}`),
 				},
 			},
 		},
@@ -344,37 +341,37 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 		{
 			name: "trailing success JSON",
 			responses: map[int]contractmock.Response{
-				0: rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{"pageNumber":0,"pageSize":0,"totalElements":0,"totalPages":0}} {}`),
+				0: rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{"pageNumber":1,"pageSize":0,"totalElements":0,"totalPages":0}} {}`),
 			},
 		},
 		{
 			name: "missing elements",
 			responses: map[int]contractmock.Response{
-				0: rawJSON(http.StatusOK, `{"pageMetadata":{"pageNumber":0,"pageSize":0,"totalElements":0,"totalPages":0}}`),
+				0: rawJSON(http.StatusOK, `{"pageMetadata":{"pageNumber":1,"pageSize":0,"totalElements":0,"totalPages":0}}`),
 			},
 		},
 		{
 			name: "null elements",
 			responses: map[int]contractmock.Response{
-				0: rawJSON(http.StatusOK, `{"elements":null,"pageMetadata":{"pageNumber":0,"pageSize":0,"totalElements":0,"totalPages":0}}`),
+				0: rawJSON(http.StatusOK, `{"elements":null,"pageMetadata":{"pageNumber":1,"pageSize":0,"totalElements":0,"totalPages":0}}`),
 			},
 		},
 		{
 			name: "null task element",
 			responses: map[int]contractmock.Response{
-				0: rawJSON(http.StatusOK, `{"elements":[null],"pageMetadata":{"pageNumber":0,"pageSize":1,"totalElements":1,"totalPages":1}}`),
+				0: rawJSON(http.StatusOK, `{"elements":[null],"pageMetadata":{"pageNumber":1,"pageSize":1,"totalElements":1,"totalPages":1}}`),
 			},
 		},
 		{
 			name: "present null optional task type",
 			responses: map[int]contractmock.Response{
-				0: rawJSON(http.StatusOK, `{"elements":[{"id":"task-a","name":"first","type":null,"status":"PENDING","creationTimestamp":"2026-08-02T01:00:00Z"}],"pageMetadata":{"pageNumber":0,"pageSize":1,"totalElements":1,"totalPages":1}}`),
+				0: rawJSON(http.StatusOK, `{"elements":[{"id":"task-a","name":"first","type":null,"status":"PENDING","creationTimestamp":"2026-08-02T01:00:00Z"}],"pageMetadata":{"pageNumber":1,"pageSize":1,"totalElements":1,"totalPages":1}}`),
 			},
 		},
 		{
 			name: "non-string optional task type",
 			responses: map[int]contractmock.Response{
-				0: rawJSON(http.StatusOK, `{"elements":[{"id":"task-a","name":"first","type":7,"status":"PENDING","creationTimestamp":"2026-08-02T01:00:00Z"}],"pageMetadata":{"pageNumber":0,"pageSize":1,"totalElements":1,"totalPages":1}}`),
+				0: rawJSON(http.StatusOK, `{"elements":[{"id":"task-a","name":"first","type":7,"status":"PENDING","creationTimestamp":"2026-08-02T01:00:00Z"}],"pageMetadata":{"pageNumber":1,"pageSize":1,"totalElements":1,"totalPages":1}}`),
 			},
 		},
 		{
@@ -386,13 +383,13 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 		{
 			name: "missing metadata member",
 			responses: map[int]contractmock.Response{
-				0: rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{"pageNumber":0,"pageSize":0,"totalElements":0}}`),
+				0: rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{"pageNumber":1,"pageSize":0,"totalElements":0}}`),
 			},
 		},
 		{
 			name: "null metadata member",
 			responses: map[int]contractmock.Response{
-				0: rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{"pageNumber":0,"pageSize":null,"totalElements":0,"totalPages":0}}`),
+				0: rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{"pageNumber":1,"pageSize":null,"totalElements":0,"totalPages":0}}`),
 			},
 		},
 		{
@@ -410,31 +407,31 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 		{
 			name: "fractional metadata member",
 			responses: map[int]contractmock.Response{
-				0: rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{"pageNumber":0,"pageSize":0.5,"totalElements":0,"totalPages":0}}`),
+				0: rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{"pageNumber":1,"pageSize":0.5,"totalElements":0,"totalPages":0}}`),
 			},
 		},
 		{
 			name: "negative metadata member",
 			responses: map[int]contractmock.Response{
-				0: rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{"pageNumber":0,"pageSize":0,"totalElements":-1,"totalPages":0}}`),
+				0: rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{"pageNumber":1,"pageSize":0,"totalElements":-1,"totalPages":0}}`),
 			},
 		},
 		{
 			name: "wrong returned first page",
 			responses: map[int]contractmock.Response{
-				0: rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{"pageNumber":1,"pageSize":0,"totalElements":0,"totalPages":0}}`),
+				0: rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{"pageNumber":2,"pageSize":0,"totalElements":0,"totalPages":0}}`),
 			},
 		},
 		{
 			name: "metadata page size differs from elements",
 			responses: map[int]contractmock.Response{
-				0: rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{"pageNumber":0,"pageSize":1,"totalElements":0,"totalPages":0}}`),
+				0: rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{"pageNumber":1,"pageSize":1,"totalElements":0,"totalPages":0}}`),
 			},
 		},
 		{
 			name: "incoherent total pages",
 			responses: map[int]contractmock.Response{
-				0: rawJSON(http.StatusOK, `{"elements":[{"id":"task-a","name":"first","status":"PENDING","creationTimestamp":"2026-08-02T01:00:00Z"}],"pageMetadata":{"pageNumber":0,"pageSize":1,"totalElements":1,"totalPages":2}}`),
+				0: rawJSON(http.StatusOK, `{"elements":[{"id":"task-a","name":"first","status":"PENDING","creationTimestamp":"2026-08-02T01:00:00Z"}],"pageMetadata":{"pageNumber":1,"pageSize":1,"totalElements":1,"totalPages":2}}`),
 			},
 		},
 		{
@@ -442,7 +439,7 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 			responses: map[int]contractmock.Response{
 				0: contractmock.JSONResponse(t, http.StatusOK, page{
 					Elements:     []vcfinstaller.Task{},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 0, TotalElements: 2, TotalPages: 2},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 0, TotalElements: 2, TotalPages: 2},
 				}),
 			},
 		},
@@ -452,7 +449,7 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 			responses: map[int]contractmock.Response{
 				0: contractmock.JSONResponse(t, http.StatusOK, page{
 					Elements:     []vcfinstaller.Task{validTask},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 1, TotalElements: 3, TotalPages: 2},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 3, TotalPages: 2},
 				}),
 			},
 		},
@@ -464,7 +461,7 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 						validTask,
 						{ID: "task-b", Name: "second", Status: "PENDING", CreationTimestamp: "2026-08-02T02:00:00Z"},
 					},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 2, TotalElements: 2, TotalPages: 2},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 2, TotalElements: 2, TotalPages: 2},
 				}),
 			},
 		},
@@ -477,7 +474,7 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 						validTask,
 						{ID: "task-b", Name: "second", Status: "PENDING", CreationTimestamp: "2026-08-02T02:00:00Z"},
 					},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 2, TotalElements: 1, TotalPages: 1},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 2, TotalElements: 1, TotalPages: 1},
 				}),
 			},
 		},
@@ -486,11 +483,11 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 			responses: map[int]contractmock.Response{
 				0: contractmock.JSONResponse(t, http.StatusOK, page{
 					Elements:     []vcfinstaller.Task{validTask},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 1, TotalElements: 2, TotalPages: 2},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 2, TotalPages: 2},
 				}),
 				1: contractmock.JSONResponse(t, http.StatusOK, page{
 					Elements:     []vcfinstaller.Task{{ID: "task-b", Name: "second", Status: "SUCCESSFUL", CreationTimestamp: "2026-08-02T02:00:00Z"}},
-					PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 3, TotalPages: 3},
+					PageMetadata: metadata{PageNumber: 2, PageSize: 1, TotalElements: 3, TotalPages: 3},
 				}),
 			},
 		},
@@ -499,11 +496,11 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 			responses: map[int]contractmock.Response{
 				0: contractmock.JSONResponse(t, http.StatusOK, page{
 					Elements:     []vcfinstaller.Task{validTask},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 1, TotalElements: 2, TotalPages: 2},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 2, TotalPages: 2},
 				}),
 				1: contractmock.JSONResponse(t, http.StatusOK, page{
 					Elements:     []vcfinstaller.Task{{ID: "task-b", Name: "second", Status: "SUCCESSFUL", CreationTimestamp: "2026-08-02T02:00:00Z"}},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 1, TotalElements: 2, TotalPages: 2},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 2, TotalPages: 2},
 				}),
 			},
 		},
@@ -512,11 +509,11 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 			responses: map[int]contractmock.Response{
 				0: contractmock.JSONResponse(t, http.StatusOK, page{
 					Elements:     []vcfinstaller.Task{validTask},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 1, TotalElements: 2, TotalPages: 2},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 2, TotalPages: 2},
 				}),
 				1: contractmock.JSONResponse(t, http.StatusOK, page{
 					Elements:     []vcfinstaller.Task{},
-					PageMetadata: metadata{PageNumber: 1, PageSize: 0, TotalElements: 2, TotalPages: 2},
+					PageMetadata: metadata{PageNumber: 2, PageSize: 0, TotalElements: 2, TotalPages: 2},
 				}),
 			},
 		},
@@ -525,11 +522,11 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 			responses: map[int]contractmock.Response{
 				0: contractmock.JSONResponse(t, http.StatusOK, page{
 					Elements:     []vcfinstaller.Task{duplicateTokenTask},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 1, TotalElements: 2, TotalPages: 2},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 2, TotalPages: 2},
 				}),
 				1: contractmock.JSONResponse(t, http.StatusOK, page{
 					Elements:     []vcfinstaller.Task{duplicateTokenTask},
-					PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 2, TotalPages: 2},
+					PageMetadata: metadata{PageNumber: 2, PageSize: 1, TotalElements: 2, TotalPages: 2},
 				}),
 			},
 		},
@@ -538,7 +535,7 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 			responses: map[int]contractmock.Response{
 				0: contractmock.JSONResponse(t, http.StatusOK, page{
 					Elements:     []vcfinstaller.Task{{ID: "task-a", Name: " ", Status: "PENDING", CreationTimestamp: "2026-08-02T01:00:00Z"}},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 1, TotalElements: 1, TotalPages: 1},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 1, TotalPages: 1},
 				}),
 			},
 		},
@@ -547,7 +544,7 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 			responses: map[int]contractmock.Response{
 				0: contractmock.JSONResponse(t, http.StatusOK, page{
 					Elements:     []vcfinstaller.Task{{ID: " ", Name: "first", Status: "PENDING", CreationTimestamp: "2026-08-02T01:00:00Z"}},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 1, TotalElements: 1, TotalPages: 1},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 1, TotalPages: 1},
 				}),
 			},
 		},
@@ -556,7 +553,7 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 			responses: map[int]contractmock.Response{
 				0: contractmock.JSONResponse(t, http.StatusOK, page{
 					Elements:     []vcfinstaller.Task{{ID: "task-a", Name: "first", Status: " ", CreationTimestamp: "2026-08-02T01:00:00Z"}},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 1, TotalElements: 1, TotalPages: 1},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 1, TotalPages: 1},
 				}),
 			},
 		},
@@ -565,7 +562,7 @@ func TestListAllTasksRejectsFailuresWithoutPartialResults(t *testing.T) {
 			responses: map[int]contractmock.Response{
 				0: contractmock.JSONResponse(t, http.StatusOK, page{
 					Elements:     []vcfinstaller.Task{{ID: "task-a", Name: "first", Status: "PENDING", CreationTimestamp: " "}},
-					PageMetadata: metadata{PageNumber: 0, PageSize: 1, TotalElements: 1, TotalPages: 1},
+					PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 1, TotalPages: 1},
 				}),
 			},
 		},
@@ -630,7 +627,7 @@ func TestListAllTasksReturnsFreshValuesAndAcceptsJSONParameters(t *testing.T) {
 		Elements: []vcfinstaller.Task{{
 			ID: "task-a", Name: "first", Type: &taskType, Status: "PENDING", CreationTimestamp: "2026-08-02T01:00:00Z",
 		}},
-		PageMetadata: metadata{PageNumber: 0, PageSize: 1, TotalElements: 1, TotalPages: 1},
+		PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 1, TotalPages: 1},
 	}
 	server := contractmock.New(t, protectedPath("docs", "contract.json"), func(contractmock.Request) contractmock.Response {
 		response := contractmock.JSONResponse(t, http.StatusOK, document)
@@ -666,7 +663,7 @@ func TestListAllTasksDoesNotSilentlyTruncateLargeValidResponse(t *testing.T) {
 		Elements: []vcfinstaller.Task{{
 			ID: "task-large", Name: largeName, Status: "SUCCESSFUL", CreationTimestamp: "2026-08-02T01:00:00Z",
 		}},
-		PageMetadata: metadata{PageNumber: 0, PageSize: 1, TotalElements: 1, TotalPages: 1},
+		PageMetadata: metadata{PageNumber: 1, PageSize: 1, TotalElements: 1, TotalPages: 1},
 	}
 	server := contractmock.New(t, protectedPath("docs", "contract.json"), func(contractmock.Request) contractmock.Response {
 		return contractmock.JSONResponse(t, http.StatusOK, document)
@@ -741,10 +738,7 @@ func TestNewClientAndInputValidation(t *testing.T) {
 	}
 
 	server := contractmock.New(t, protectedPath("docs", "contract.json"), func(request contractmock.Request) contractmock.Response {
-		return contractmock.JSONResponse(t, http.StatusOK, page{
-			Elements:     []vcfinstaller.Task{},
-			PageMetadata: metadata{PageNumber: 0, PageSize: 0, TotalElements: 0, TotalPages: 0},
-		})
+		return rawJSON(http.StatusOK, `{"elements":[],"pageMetadata":{}}`)
 	})
 	boundaryClient, err := vcfinstaller.NewClient(server.URL(), "token", nil)
 	if err != nil {

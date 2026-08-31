@@ -18,11 +18,68 @@ import (
 )
 
 const (
-	testSession = "session-secret-vcf91-0117"
+	testSession = "0123456789abcdef0123456789abcdef"
 	testTimeout = 2 * time.Second
 )
 
-func TestCloneAndInventoryPollsToTerminalAndSortsEveryResponse(t *testing.T) {
+func TestLiveShapedCloneAndInventory(t *testing.T) {
+	cpuTwo := int64(2)
+	cpuFour := int64(4)
+	cpuSix := int64(6)
+	cpuEight := int64(8)
+	memory4096 := int64(4096)
+	memory10240 := int64(10240)
+	memory16384 := int64(16384)
+	memory21504 := int64(21504)
+	memory24576 := int64(24576)
+	memory98304 := int64(98304)
+	taskID := "task-4226:7978ee81-a66c-4c37-8653-c577c0161e9d"
+	taskResult := json.RawMessage(`"vm-1052:7978ee81-a66c-4c37-8653-c577c0161e9d"`)
+	server := contractmock.Start(t, contractmock.Scenario{
+		TaskID: taskID,
+		TaskStatuses: []string{
+			"PENDING",
+			"RUNNING", "RUNNING", "RUNNING", "RUNNING", "RUNNING",
+			"RUNNING", "RUNNING", "RUNNING", "RUNNING", "SUCCEEDED",
+		},
+		TaskResult: taskResult,
+		VMs: []contractmock.VM{
+			{VM: "vm-1052", Name: "moonshiner-live-validation-0117", PowerState: "POWERED_OFF", CPUCount: &cpuTwo, MemorySizeMiB: &memory4096},
+			{VM: "vm-19", Name: "sddcm01", PowerState: "POWERED_ON", CPUCount: &cpuFour, MemorySizeMiB: &memory16384},
+			{VM: "vm-20", Name: "vc01", PowerState: "POWERED_ON", CPUCount: &cpuFour, MemorySizeMiB: &memory21504},
+			{VM: "vm-28", Name: "nsx01a", PowerState: "POWERED_ON", CPUCount: &cpuSix, MemorySizeMiB: &memory24576},
+			{VM: "vm-33", Name: "vcf-msr01-nxpxf", PowerState: "POWERED_ON", CPUCount: &cpuFour, MemorySizeMiB: &memory10240},
+			{VM: "vm-34", Name: "vcf-msr01-5ghdn", PowerState: "POWERED_ON", CPUCount: &cpuEight, MemorySizeMiB: &memory24576},
+			{VM: "vm-35", Name: "vcf-msr01-x6j88", PowerState: "POWERED_ON", CPUCount: &cpuEight, MemorySizeMiB: &memory24576},
+			{VM: "vm-36", Name: "vcf-msr01-6zpgq", PowerState: "POWERED_ON", CPUCount: &cpuEight, MemorySizeMiB: &memory24576},
+			{VM: "vm-37", Name: "vcf01", PowerState: "POWERED_ON", CPUCount: &cpuFour, MemorySizeMiB: &memory16384},
+			{VM: "vm-38", Name: "vcf-proxy01", PowerState: "POWERED_ON", CPUCount: &cpuFour, MemorySizeMiB: &memory16384},
+			{VM: "vm-39", Name: "vcf-lic01", PowerState: "POWERED_ON", CPUCount: &cpuTwo, MemorySizeMiB: &memory4096},
+			{VM: "vm-43", Name: "vcf-asr01-szwjz", PowerState: "POWERED_ON", CPUCount: &cpuEight, MemorySizeMiB: &memory98304},
+		},
+	})
+	client := mustClient(t, server.URL(), testSession, 2*time.Second, 30, nil)
+	result, err := client.CloneAndInventory(context.Background(), cloneinventory.CloneRequest{
+		SourceVM: "vm-39",
+		Name:     "moonshiner-live-validation-0117",
+	})
+	if err != nil {
+		t.Fatalf("CloneAndInventory: %v", err)
+	}
+	if result.TaskID != taskID || result.TaskStatus != "SUCCEEDED" || result.PollCount != 11 ||
+		!jsonEqual(result.TaskResult, taskResult) {
+		t.Fatalf("terminal evidence = %#v", result)
+	}
+	if len(result.VMs) != 12 {
+		t.Fatalf("VM count = %d, want live 12-VM snapshot", len(result.VMs))
+	}
+	assertSortedVMs(t, result.VMs)
+	if records := server.Records(); len(records) != 13 {
+		t.Fatalf("request count = %d, want 13", len(records))
+	}
+}
+
+func TestContractCoverageExoticTaskAndFlippedInventory(t *testing.T) {
 	cpuTwo := int64(2)
 	cpuFour := int64(4)
 	memory := int64(8192)
@@ -479,9 +536,6 @@ func mustClient(
 
 func assertSortedVMs(t testing.TB, vms []cloneinventory.VMSummary) {
 	t.Helper()
-	if len(vms) != 3 {
-		t.Fatalf("VM count = %d, want 3", len(vms))
-	}
 	if !sort.SliceIsSorted(vms, func(left, right int) bool {
 		if vms[left].Name == vms[right].Name {
 			return vms[left].VM < vms[right].VM
@@ -489,6 +543,9 @@ func assertSortedVMs(t testing.TB, vms []cloneinventory.VMSummary) {
 		return vms[left].Name < vms[right].Name
 	}) {
 		t.Fatalf("VMs are not sorted by (Name, VM): %#v", vms)
+	}
+	if len(vms) != 3 {
+		return
 	}
 	gotKeys := []string{
 		vms[0].Name + "/" + vms[0].VM,

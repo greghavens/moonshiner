@@ -1,4 +1,4 @@
-"""Loopback VCF Installer mock whose route table is pinned to docs/contract.json."""
+"""Loopback mock for the focused VCF 9.1 bootstrap operations."""
 
 from __future__ import annotations
 
@@ -25,22 +25,21 @@ class RequestRecord:
 
 
 class _Handler(BaseHTTPRequestHandler):
-    server_version = "VCFInstallerContractMock/9.1"
     protocol_version = "HTTP/1.1"
 
-    def do_PATCH(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+    def do_PATCH(self) -> None:
         self._dispatch()
 
-    def do_PUT(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+    def do_PUT(self) -> None:
         self._dispatch()
 
-    def do_GET(self) -> None:  # noqa: N802 - unsupported by this reduced contract
+    def do_GET(self) -> None:
         self._dispatch()
 
-    def do_POST(self) -> None:  # noqa: N802 - unsupported by this reduced contract
+    def do_POST(self) -> None:
         self._dispatch()
 
-    def do_DELETE(self) -> None:  # noqa: N802 - unsupported by this reduced contract
+    def do_DELETE(self) -> None:
         self._dispatch()
 
     def _dispatch(self) -> None:
@@ -49,37 +48,27 @@ class _Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
         parsed = urlsplit(self.path)
         record = RequestRecord(
-            method=self.command,
-            target=self.path,
-            path=parsed.path,
-            query=parsed.query,
-            headers={key.lower(): value for key, value in self.headers.items()},
-            body=body,
+            self.command,
+            self.path,
+            parsed.path,
+            parsed.query,
+            {key.lower(): value for key, value in self.headers.items()},
+            body,
         )
         with owner._lock:
             owner.request_log.append(record)
 
         operation_id = owner.routes.get((self.command, parsed.path))
         if operation_id is None:
-            self._json_response(
-                404,
-                {
-                    "errorCode": "UNSUPPORTED_CONTRACT_OPERATION",
-                    "message": "The reduced contract does not expose this operation",
-                },
-            )
+            self._json(404, {"errorCode": "UNSUPPORTED_OPERATION", "message": "not in contract"})
             return
-
         if operation_id == owner.fail_operation:
-            status = 500
-            document = owner.error_responses[operation_id]
-        else:
-            status = 202
-            document = owner.success_responses[operation_id]
-        status = owner.status_overrides.get(operation_id, status)
-        self._json_response(status, document)
+            self._json(500, owner.error_responses[operation_id])
+            return
+        status = owner.status_overrides.get(operation_id, owner.success_statuses[operation_id])
+        self._json(status, owner.success_responses[operation_id])
 
-    def _json_response(self, status: int, document: object) -> None:
+    def _json(self, status: int, document: object) -> None:
         encoded = json.dumps(document, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -92,8 +81,6 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class ContractMock:
-    """Context-managed loopback server exposing exactly the pinned operations."""
-
     def __init__(
         self,
         *,
@@ -102,76 +89,55 @@ class ContractMock:
     ) -> None:
         contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
         operations = contract["operations"]
-        expected_ids = {
+        expected = {
             "updateProxyConfiguration",
-            "updateDepotSettings",
+            "updateServicesConfig",
             "syncDepotMetadata",
         }
-        if set(operations) != expected_ids:
-            raise AssertionError("mock and protected operation contract diverged")
+        if set(operations) != expected:
+            raise AssertionError("mock and operation contract diverged")
         self.routes = {
             (operation["method"], operation["path"]): operation_id
             for operation_id, operation in operations.items()
         }
-        if len(self.routes) != len(operations):
-            raise AssertionError("contract contains duplicate method/path routes")
-        if fail_operation is not None and fail_operation not in expected_ids:
+        self.success_statuses = {
+            operation_id: operation["successStatus"]
+            for operation_id, operation in operations.items()
+        }
+        if fail_operation is not None and fail_operation not in expected:
             raise ValueError(f"unknown failure operation {fail_operation}")
         self.fail_operation = fail_operation
         self.status_overrides = dict(status_overrides or {})
-        unknown_overrides = set(self.status_overrides) - expected_ids
-        if unknown_overrides:
-            raise ValueError(f"unknown status overrides {sorted(unknown_overrides)}")
-        for operation_id, operation in operations.items():
-            if "202" not in operation["responses"]:
-                raise AssertionError(
-                    f"mock success status is outside the contract for {operation_id}"
-                )
-            if operation_id == fail_operation and "500" not in operation["responses"]:
-                raise AssertionError(
-                    f"mock failure status is outside the contract for {operation_id}"
-                )
         self.success_responses = {
             "updateProxyConfiguration": {
-                "id": "task-proxy-91",
+                "id": "proxy-task-live-shape",
                 "name": "Update Proxy Configuration",
-                "status": "IN_PROGRESS",
-                "creationTimestamp": "2026-05-13T12:00:00Z",
+                "status": "COMPLETED_WITH_SUCCESS",
+                "creationTimestamp": "2026-08-30T12:00:00Z",
             },
-            "updateDepotSettings": {
-                "vmwareAccount": {
-                    "status": "DEPOT_CONNECTION_SUCCESSFUL",
-                    "message": "Credentials accepted",
-                },
-                "depotConfiguration": {"isOfflineDepot": False},
+            "updateServicesConfig": {
+                "services": [{
+                    "name": "VCF Depot",
+                    "type": "VCF_DEPOT",
+                    "key": "depot-service-key",
+                    "nodes": [{
+                        "name": "VCF Depot",
+                        "addresses": [{"type": "Fqdn", "value": "vcf-flt01.vcf.lab"}],
+                    }],
+                }],
             },
-            "syncDepotMetadata": {
-                "syncStatus": "IN_PROGRESS",
-            },
+            "syncDepotMetadata": {"syncStatus": "SYNC_IN_PROGRESS"},
         }
         self.error_responses = {
             operation_id: {
                 "errorCode": f"VCF_{operation_id.upper()}_FAILED",
                 "errorType": "INTERNAL_SERVER_ERROR",
-                "message": f"{operation_id} failed in the contract mock",
+                "message": f"{operation_id} failed",
+                "remediationMessage": "Retry after correcting the service condition.",
                 "referenceToken": f"ref-{operation_id}",
             }
-            for operation_id in expected_ids
+            for operation_id in expected
         }
-        self.error_responses["syncDepotMetadata"] = {
-            "errorCode": "VCF_DEPOT_SYNC_FAILED",
-            "errorType": "INTERNAL_SERVER_ERROR",
-            "message": "Depot metadata index could not be refreshed",
-            "remediationMessage": "Retry after depot connectivity is restored.",
-            "referenceToken": "ref-sync-91",
-            "causes": [
-                {
-                    "type": "DepotConnectionException",
-                    "message": "Upstream depot returned an inconsistent manifest",
-                }
-            ],
-        }
-        self.sync_error = self.error_responses["syncDepotMetadata"]
         self.request_log: list[RequestRecord] = []
         self._lock = threading.Lock()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)

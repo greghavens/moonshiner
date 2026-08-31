@@ -140,13 +140,13 @@ func TestRequestWireShape(t *testing.T) {
 		{
 			name: "unset optional group fields are omitted",
 			invoke: func(client *nsxpolicy.Client) error {
-				_, err := client.UpdateGroup(context.Background(), "default", "payments/api", nsxpolicy.Group{DisplayName: str("Payments")})
+				_, err := client.UpdateGroup(context.Background(), "default", "payments-api", completeGroup("payments-api", "Payments"))
 				return err
 			},
 			wantOperation: "UpdateGroupForDomain",
 			wantMethod:    http.MethodPut,
-			wantURI:       "/policy/api/v1/infra/domains/default/groups/payments%2Fapi",
-			wantBody:      `{"display_name":"Payments"}`,
+			wantURI:       "/policy/api/v1/infra/domains/default/groups/payments-api",
+			wantBody:      `{"_revision":0,"description":"preserved description","display_name":"Payments","expression":[],"id":"payments-api","resource_type":"Group"}`,
 			wantType:      "application/json",
 		},
 		{
@@ -250,7 +250,7 @@ func TestResponseDecoding(t *testing.T) {
 			name: "update",
 			body: `{"id":"web","description":"managed by rotation test"}`,
 			invoke: func(client *nsxpolicy.Client) (any, error) {
-				return client.UpdateGroup(context.Background(), "default", "web", nsxpolicy.Group{Description: &description})
+				return client.UpdateGroup(context.Background(), "default", "web", completeGroup("web", "Web"))
 			},
 			want: nsxpolicy.Group{ID: "web", Description: &description},
 		},
@@ -281,7 +281,7 @@ func TestCredentialRotationDoesNotStrandInflightRequest(t *testing.T) {
 		if basicPassword(request.Header) == "old-secret" {
 			firstArrived <- struct{}{}
 			<-releaseFirst
-			return contractmock.Reply{Status: http.StatusUnauthorized, Body: `{"error":"expired"}`}
+			return contractmock.Reply{Status: http.StatusForbidden, Body: `{"error_code":403,"module_name":"common-services","error_message":"Credentials are incorrect or the account is locked"}`}
 		}
 		return contractmock.Reply{Status: http.StatusOK, Body: string(request.Body)}
 	})
@@ -291,9 +291,7 @@ func TestCredentialRotationDoesNotStrandInflightRequest(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := client.UpdateGroup(context.Background(), "default", "payments/api", nsxpolicy.Group{
-			DisplayName: stringPointer("Payments"),
-		})
+		_, err := client.UpdateGroup(context.Background(), "default", "payments-api", completeGroup("payments-api", "Payments"))
 		done <- err
 	}()
 
@@ -396,7 +394,7 @@ func TestConcurrentRotationAndRequestsAreRaceFree(t *testing.T) {
 	}
 }
 
-func TestUnauthorizedRetryPolicy(t *testing.T) {
+func TestCredentialRejectionRetryPolicy(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name      string
@@ -419,7 +417,7 @@ func TestUnauthorizedRetryPolicy(t *testing.T) {
 					arrived <- struct{}{}
 					<-release
 				}
-				return contractmock.Reply{Status: http.StatusUnauthorized, Body: `{"error":"unauthorized"}`}
+				return contractmock.Reply{Status: http.StatusForbidden, Body: `{"error_code":403,"module_name":"common-services","error_message":"Credentials are incorrect or the account is locked"}`}
 			})
 			defer server.Close()
 			defer releaseFirstRequest()
@@ -443,8 +441,8 @@ func TestUnauthorizedRetryPolicy(t *testing.T) {
 			releaseFirstRequest()
 			err := <-done
 			var httpErr *nsxpolicy.HTTPError
-			if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusUnauthorized || !strings.Contains(httpErr.Body, "unauthorized") {
-				t.Fatalf("error = %#v, want HTTPError 401 with response body", err)
+			if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusForbidden || !strings.Contains(httpErr.Body, "common-services") {
+				t.Fatalf("error = %#v, want live HTTPError 403 with response body", err)
 			}
 			if got := calls.Load(); got != tt.wantCalls {
 				t.Fatalf("attempts = %d, want %d", got, tt.wantCalls)
@@ -605,6 +603,19 @@ func newClient(t *testing.T, server *contractmock.Server, credentials nsxpolicy.
 }
 
 func stringPointer(value string) *string { return &value }
+
+func completeGroup(id, displayName string) nsxpolicy.Group {
+	revision := 0
+	description := "preserved description"
+	return nsxpolicy.Group{
+		Revision:     &revision,
+		Description:  &description,
+		DisplayName:  &displayName,
+		Expression:   []nsxpolicy.Expression{},
+		ID:           id,
+		ResourceType: "Group",
+	}
+}
 
 func basicPassword(header http.Header) string {
 	return basicCredentials(header).Password

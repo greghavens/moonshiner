@@ -1,4 +1,4 @@
-// Package contractmock provides the protected, contract-pinned loopback fixture.
+// Package contractmock provides focused VCF 9.1 category responses.
 package contractmock
 
 import (
@@ -93,13 +93,13 @@ func New(contractPath, logPath string, plan Plan) (*Server, error) {
 	}
 	markers := make([]string, 0, max(0, pageCount-1))
 	for index := 0; index+1 < pageCount; index++ {
-		markers = append(markers, "cursor/"+strconv.Itoa(index+1)+"+"+randomValue())
+		markers = append(markers, opaqueMarker(index+1))
 	}
 
 	server := &Server{
 		route:   route,
 		plan:    plan,
-		secrets: Secrets{SessionID: "session-" + randomValue(), Markers: markers},
+		secrets: Secrets{SessionID: randomSessionID(), Markers: markers},
 		logPath: logPath,
 		logFile: logFile,
 	}
@@ -235,7 +235,14 @@ func (s *Server) listCategories(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !found {
-			writeJSON(w, http.StatusNotFound, errorEnvelope("INVALID_MARKER"))
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error_type": "INTERNAL_SERVER_ERROR",
+				"messages": []map[string]any{{
+					"args":            []string{"Index 1 out of bounds for length 1"},
+					"default_message": "Provider method implementation threw unexpected exception: Index 1 out of bounds for length 1",
+					"id":              "vapi.bindings.method.impl.unexpected",
+				}},
+			})
 			return
 		}
 	}
@@ -295,8 +302,8 @@ func (s *Server) validQuery(r *http.Request) bool {
 		if len(values) != 1 {
 			return false
 		}
-		size, err := strconv.ParseInt(values[0], 10, 64)
-		if err != nil || size < 1 {
+		_, err := strconv.ParseInt(values[0], 10, 64)
+		if err != nil {
 			return false
 		}
 	}
@@ -428,4 +435,20 @@ func randomValue() string {
 		panic("cannot generate fixture value")
 	}
 	return hex.EncodeToString(value[:])
+}
+
+func randomSessionID() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		panic("cannot generate fixture session")
+	}
+	return hex.EncodeToString(value[:])
+}
+
+func opaqueMarker(page int) string {
+	value := "eyJwYWdlIjoi" + strconv.Itoa(page) + "IiwidG9rZW4iOiI"
+	for len(value) < 612 {
+		value += randomValue() + "/+"
+	}
+	return value[:612] + "="
 }

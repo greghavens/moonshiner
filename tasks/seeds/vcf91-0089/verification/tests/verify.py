@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ MANIFEST_PATH = (
 PINNED_SHA = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
 PINNED_BLOB_SHA = "8028b0824c4ff3503d05f44814f967938a795c40"
 PINNED_SPEC_PATH = "specifications/vsphere/openapi/automation/vcenter.yaml"
+SERVICE_UUID = "7978ee81-a66c-4c37-8653-c577c0161e9d"
 EXPECTED_OPERATIONS = {
     "Vcenter.VM_clone$Task": (
         "POST",
@@ -42,11 +44,11 @@ EXPECTED_OPERATIONS = {
     ),
 }
 PROTECTED_HASHES = {
-    "README.md": "09cb83f72f5ca37fa87adead23f31edfde212ebe0016de3d3dea28a8ccaee9f2",
+    "README.md": "f0f253295c62f1be1afe55c08bcbd7be94b6c39c706e43db4bbbdb71bdfce3a0",
     "docs/contract.json": "af5b04fb5a85ca6b2c81e9a19bf8082022c39d55318b8f10818f1be356d01437",
-    "docs/official_sources.json": "452789510ab5ad7aa537b22949b08c7299547a66d3cc390328df8589015a580a",
-    "mock/vcenter_contract_mock.py": "42176aed298722a1d11c5f6a1314d79816bbaf84cebabf36bb5179a91ab59e34",
-    "src/VcfVCenterAutomation/VcfVCenterAutomation.psd1": "6e7783403453f408f0322f7ddf4ec8728fe15871e1cfd3bd24995c321cf481f2",
+    "docs/official_sources.json": "9b54daafb66135ef59972bd62113c1fff9bb9c02fd9d85c756f80355b59029d1",
+    "mock/vcenter_contract_mock.py": "a23178a5c2192066a1b00d30a38324e5a5a116dad4157d982976a380875990b5",
+    "src/VcfVCenterAutomation/VcfVCenterAutomation.psd1": "bf14cf923dce6e3b279de17255bae645747a42ea4b6f571a97a6f5cd377007f7",
 }
 
 
@@ -175,11 +177,24 @@ def validate_protected_inputs() -> dict[str, Any]:
             f"source provenance missing for {item.get('operationId')}",
         )
 
-    required_module = "VMware.Sdk.Vcf.SddcManager"
+    require(
+        sources.get("powercli")
+        == {
+            "module": "VMware.Sdk.vSphere",
+            "version": "13.5.0",
+            "commands": {
+                "Vcenter.VM_clone$Task": "Invoke-CloneVmAsync",
+                "Cis.Tasks_get": "Invoke-GetTask",
+            },
+        },
+        "PowerCLI module or generated-command mapping changed",
+    )
+
+    required_module = "VMware.Sdk.vSphere"
     manifest_text = MANIFEST_PATH.read_text(encoding="utf-8")
     require(
         required_module in manifest_text and "13.5.0" in manifest_text,
-        "manifest no longer declares the VMware.Sdk.Vcf prerequisite",
+        "manifest no longer declares the VMware.Sdk.vSphere prerequisite",
     )
     vendored = [
         path
@@ -399,6 +414,16 @@ def check_result_and_wire(
 
     task_id = clone.get("issuedTaskId")
     require(isinstance(task_id, str) and task_id, "mock issued no task identifier")
+    require(
+        task_id.startswith("task-") and task_id.endswith(":" + SERVICE_UUID),
+        "task identifier does not have the live decorated shape",
+    )
+    require(
+        isinstance(clone.get("eventualResult"), str)
+        and clone["eventualResult"].startswith("vm-")
+        and clone["eventualResult"].endswith(":" + SERVICE_UUID),
+        "clone result does not have the live decorated shape",
+    )
     require(result.get("taskId") == task_id, "client polled a different task")
     require(
         result.get("result") == clone.get("eventualResult"),
@@ -406,7 +431,9 @@ def check_result_and_wire(
     )
 
     polls = entries[1:]
-    expected_target = f"/api/cis/tasks/{task_id}"
+    expected_target = (
+        "/api/cis/tasks/" + urllib.parse.quote(task_id, safe="")
+    )
     require(
         all(entry.get("method") == "GET" for entry in polls),
         "task status method must be GET",
@@ -445,6 +472,27 @@ def check_result_and_wire(
         [entry.get("pollCount") for entry in polls] == [1, 2, 3],
         "poll counts are incorrect",
     )
+    for index, entry in enumerate(polls):
+        info = entry.get("returnedTaskInfo")
+        require(isinstance(info, dict), "mock omitted returned task payload")
+        require(
+            info.get("description")
+            == {"id": "Description", "default_message": "", "args": []},
+            "task description does not match the live shape",
+        )
+        require(info.get("service") == SERVICE_UUID, "task service UUID changed")
+        require(
+            info.get("operation") == "com.vmware.vcenter.vm.clone",
+            "task operation name changed",
+        )
+        require(
+            info.get("cancelable") is (index < 2),
+            "task cancelable transition changed",
+        )
+        require(
+            ("result" in info) is (index == 2),
+            "task result presence changed",
+        )
 
 
 def verify() -> None:

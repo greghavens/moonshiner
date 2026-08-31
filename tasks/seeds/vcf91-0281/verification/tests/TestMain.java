@@ -44,8 +44,8 @@ public final class TestMain {
                     expectTimeout ? 1 : MAX_DRAIN_POLLS);
             if (expectTimeout) {
                 System.err.println(
-                        "rotate() returned even though the outgoing credential "
-                                + "was still in use after the allowed drain poll");
+                        "rotate() returned even though a concurrent adapter binding "
+                                + "still used the outgoing credential after the allowed poll");
                 System.exit(1);
                 return;
             }

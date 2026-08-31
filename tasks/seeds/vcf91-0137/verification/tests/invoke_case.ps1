@@ -45,12 +45,44 @@ try {
         $Handler
     )
 
+    $arguments = @{
+        NamespaceApi = $Api
+        Namespace = $Config.namespace
+        ClusterName = $Config.cluster_name
+        ClusterClass = $Config.cluster_class
+        KubernetesVersion = $Config.kubernetes_version
+        TopologyVariables = $Config.topology_variables
+        WorkerClass = $Config.worker_class
+        WorkerName = $Config.worker_name
+        ControlPlaneReplicas = $Config.control_plane_replicas
+        WorkerReplicas = $Config.worker_replicas
+        KubernetesToken = $Config.kubernetes_bearer_token
+        MaxPolls = 5
+        PollIntervalMilliseconds = 0
+        KubernetesScheme = 'http'
+    }
+    $LiveGapError = $null
+    try {
+        $null = New-VcfVksClusterAndWait @arguments
+    }
+    catch {
+        $LiveGapError = $_
+    }
+    if ($null -eq $LiveGapError) {
+        throw 'The exact live blank namespace summary unexpectedly succeeded.'
+    }
+
     $Result = New-VcfVksClusterAndWait `
         -NamespaceApi $Api `
         -Namespace $Config.namespace `
         -ClusterName $Config.cluster_name `
         -ClusterClass $Config.cluster_class `
         -KubernetesVersion $Config.kubernetes_version `
+        -TopologyVariables $Config.topology_variables `
+        -WorkerClass $Config.worker_class `
+        -WorkerName $Config.worker_name `
+        -ControlPlaneReplicas $Config.control_plane_replicas `
+        -WorkerReplicas $Config.worker_replicas `
         -KubernetesToken $Config.kubernetes_bearer_token `
         -MaxPolls 5 `
         -PollIntervalMilliseconds 0 `

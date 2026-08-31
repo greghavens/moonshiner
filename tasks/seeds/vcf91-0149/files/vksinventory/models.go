@@ -12,6 +12,7 @@ type Config struct {
 	VCenterURL       string
 	Namespace        string
 	SessionID        string
+	KubernetesToken  string
 	KubernetesScheme string
 	PageLimit        int64
 	HTTPClient       *http.Client

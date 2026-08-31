@@ -44,9 +44,9 @@ if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
 
 # Fail closed if any protected contract fixture was changed.
 $protectedHashes = @{
-    (Join-Path $Root 'docs/contract.json') = '941c6f5ef58e5c5c7825dd65624e4c9da7a6c57201b128d4935b64b6fd0b6afb'
-    (Join-Path $Root 'docs/official_sources.json') = 'c5930b82a30202d63878606bda909c4ce323bf824cddb616e05a6b25a92dfa79'
-    (Join-Path $Root 'tests/mock_sddc_manager.py') = 'df4534c34141558c22560beb754305cb8753431ccc099a61f7bbd4f00358bd91'
+    (Join-Path $Root 'docs/contract.json') = '9b369bded4573577abf53157f901486e6ce61f7c4501361f3ec96dd86576d0d5'
+    (Join-Path $Root 'docs/official_sources.json') = 'b1e1d0171d14bcfd2799d7738e908517e9d532ce744e64b28e55757cd4491d6c'
+    (Join-Path $Root 'tests/mock_sddc_manager.py') = '2b51662e5532039706eda77909e8d8034a333f219f05a077521bbda72d70d3f4'
     (Join-Path $Root '.gitignore') = '2eab86595eefa9c93d8c44f171b67960bd1fdffe1a31613167fac1908a0708ae'
 }
 foreach ($entry in $protectedHashes.GetEnumerator()) {
@@ -61,7 +61,7 @@ $sources = Get-Content -LiteralPath (Join-Path $Root 'docs/official_sources.json
     -Raw | ConvertFrom-Json
 $expectedSha = '3949fc33339fc5ea1b77eadb258f1cf49aa88e26'
 $expectedSpec = 'specifications/sddc-manager/sddc-manager-openapi.json'
-$expectedOperations = 'createToken,updateDepotSettings'
+$expectedOperations = 'createToken,updateServicesConfig'
 Assert-Eq 'contract format' 'focused-openapi-projection-v1' `
     $contract.contract_format
 Assert-Eq 'contract pins OpenAPI 3.0.1' '3.0.1' `
@@ -76,7 +76,7 @@ Assert-Eq 'contract operationIds' $expectedOperations `
     (($contract.operations.operationId) -join ',')
 Assert-Eq 'contract methods' 'POST,PUT' `
     (($contract.operations.method) -join ',')
-Assert-Eq 'contract paths' '/v1/tokens,/v1/system/settings/depot' `
+Assert-Eq 'contract paths' '/v1/tokens,/v1/services-config' `
     (($contract.operations.path) -join ',')
 Assert-Eq 'official source repository commit' $expectedSha `
     $sources.repository.commit_sha
@@ -90,12 +90,14 @@ foreach ($operation in $sources.operations) {
     Assert-Eq "source $($operation.operationId) repeats path" $expectedSpec `
         $operation.spec_path
 }
-Assert-Eq 'DepotAccount projected property order' `
-    'username,password,status,message,downloadToken,downloadActivationCode' `
-    (($contract.schemas.DepotAccount.properties.PSObject.Properties.Name) -join ',')
-Assert-Eq 'DepotSettings projected property order' `
-    'vmwareAccount,offlineAccount,depotConfiguration' `
-    (($contract.schemas.DepotSettings.properties.PSObject.Properties.Name) -join ',')
+Assert-Eq 'ServicesConfig projected property order' 'services' `
+    (($contract.schemas.ServicesConfig.properties.PSObject.Properties.Name) -join ',')
+Assert-Eq 'ServiceConfig required members' 'key,name,nodes,type' `
+    ((@($contract.schemas.ServiceConfig.required) | Sort-Object) -join ',')
+Assert-Eq 'ServiceNode required members' 'addresses,name' `
+    ((@($contract.schemas.ServiceNode.required) | Sort-Object) -join ',')
+Assert-Eq 'ServiceNodeAddress required members' 'type,value' `
+    ((@($contract.schemas.ServiceNodeAddress.required) | Sort-Object) -join ',')
 
 # Require the official SDK surface and reject parallel transports or vendoring.
 $tokens = $null
@@ -117,10 +119,15 @@ Assert-True 'module imports the VMware SDK' `
     ($commandNames -contains 'Import-Module')
 Assert-True 'module resolves the exact SDK operation' `
     ($commandNames -contains 'Get-VcfSddcManagerOperation')
-Assert-True 'module constructs DepotAccount with the SDK' `
-    ($commandNames -contains 'Initialize-VcfDepotAccount')
-Assert-True 'module constructs DepotSettings with the SDK' `
-    ($commandNames -contains 'Initialize-VcfDepotSettings')
+foreach ($initializer in @(
+    'Initialize-VcfServiceNodeAddress',
+    'Initialize-VcfServiceNode',
+    'Initialize-VcfServiceConfig',
+    'Initialize-VcfServicesConfig'
+)) {
+    Assert-True "module constructs the SDK model with $initializer" `
+        ($commandNames -contains $initializer)
+}
 foreach ($forbidden in @(
     'Invoke-WebRequest',
     'Invoke-RestMethod',
@@ -203,17 +210,19 @@ try {
         -ErrorAction Stop
     foreach ($sdkCommand in @(
         'Get-VcfSddcManagerOperation',
-        'Initialize-VcfDepotAccount',
-        'Initialize-VcfDepotSettings'
+        'Initialize-VcfServiceNodeAddress',
+        'Initialize-VcfServiceNode',
+        'Initialize-VcfServiceConfig',
+        'Initialize-VcfServicesConfig'
     )) {
         $command = Get-Command $sdkCommand -ErrorAction Stop
         Assert-Eq "$sdkCommand comes from the installed VMware SDK" `
             'VMware.Sdk.Vcf.SddcManager' $command.Source
     }
-    $resolved = @(Get-VcfSddcManagerOperation -Name 'updateDepotSettings')
-    Assert-Eq 'installed SDK resolves updateDepotSettings once' 1 $resolved.Count
+    $resolved = @(Get-VcfSddcManagerOperation -Name 'updateServicesConfig')
+    Assert-Eq 'installed SDK resolves updateServicesConfig once' 1 $resolved.Count
     Assert-Eq 'resolved operation path matches contract' `
-        '/v1/system/settings/depot' $resolved[0].Path
+        '/v1/services-config' $resolved[0].Path
 
     Import-Module $modulePath -Force -ErrorAction Stop
     $exports = @(
@@ -221,7 +230,7 @@ try {
             Select-Object -ExpandProperty Name
     )
     Assert-Eq 'module exports exactly one function' `
-        'Set-VcfDepotSettingsRetrySafe' ($exports -join ',')
+        'Set-VcfServicesConfigRetrySafe' ($exports -join ',')
 
     $securePassword = ConvertTo-SecureString `
         ([string] $runtimeInfo.password) -AsPlainText -Force
@@ -234,13 +243,18 @@ try {
         -NotDefault `
         -ErrorAction Stop
 
-    $result = Set-VcfDepotSettingsRetrySafe `
+    $result = Set-VcfServicesConfigRetrySafe `
         -Server $connection `
-        -DownloadToken ([string] $runtimeInfo.downloadToken) `
+        -ServiceName ([string] $runtimeInfo.serviceName) `
+        -ServiceType ([string] $runtimeInfo.serviceType) `
+        -ServiceKey ([string] $runtimeInfo.serviceKey) `
+        -NodeName ([string] $runtimeInfo.nodeName) `
+        -AddressType ([string] $runtimeInfo.addressType) `
+        -AddressValue ([string] $runtimeInfo.addressValue) `
         -MaxAttempts 2 `
         -ErrorAction Stop
-    Assert-Eq 'SDK success result preserves download token' `
-        $runtimeInfo.downloadToken $result.VmwareAccount.DownloadToken
+    Assert-Eq 'SDK success result preserves service key' `
+        $runtimeInfo.serviceKey $result.Services[0].Key
 
     $logLines = @(
         Get-Content -LiteralPath $logFile |
@@ -249,7 +263,7 @@ try {
     $requests = @($logLines | ForEach-Object { $_ | ConvertFrom-Json })
     Assert-Eq 'exact wire request count' 4 $requests.Count
     Assert-Eq 'exact operation sequence' `
-        'createToken,,updateDepotSettings,updateDepotSettings' `
+        'createToken,,updateServicesConfig,updateServicesConfig' `
         (($requests.operationId | ForEach-Object { [string] $_ }) -join ',')
     Assert-Eq 'mock sees only named contract operationIds' `
         $expectedOperations `
@@ -277,7 +291,7 @@ try {
     Assert-Eq 'one createToken request' 1 $tokenRequests.Count
     Assert-Eq 'createToken method' 'POST' $tokenRequests[0].method
     Assert-Eq 'createToken target' '/v1/tokens' $tokenRequests[0].rawTarget
-    Assert-Eq 'createToken status' 201 $tokenRequests[0].responseStatus
+    Assert-Eq 'createToken status' 200 $tokenRequests[0].responseStatus
     Assert-Eq 'createToken carries no bearer token' '' `
         $tokenRequests[0].authorization
     Assert-True 'createToken content type is JSON' `
@@ -303,17 +317,17 @@ try {
         "Bearer $($runtimeInfo.accessToken)" $versionProbes[0].authorization
 
     $updates = @(
-        $requests | Where-Object operationId -CEQ 'updateDepotSettings'
+        $requests | Where-Object operationId -CEQ 'updateServicesConfig'
     )
     Assert-Eq 'HTTP 500 is retried exactly once' 2 $updates.Count
     Assert-Eq 'both mutations use PUT' 'PUT,PUT' `
         (($updates.method) -join ',')
     Assert-Eq 'both mutation targets are exact' `
-        '/v1/system/settings/depot,/v1/system/settings/depot' `
+        '/v1/services-config,/v1/services-config' `
         (($updates.rawTarget) -join ',')
     Assert-Eq 'first committed response is transient 500' 500 `
         $updates[0].responseStatus
-    Assert-Eq 'second identical PUT is accepted' 202 `
+    Assert-Eq 'second identical PUT is accepted' 200 `
         $updates[1].responseStatus
     Assert-True 'both mutations have JSON content type' `
         (@($updates | Where-Object {
@@ -326,27 +340,24 @@ try {
     Assert-Eq 'retry body bytes are identical' $updates[0].body $updates[1].body
 
     $updateBody = $updates[0].body | ConvertFrom-Json
-    Assert-Eq 'body has exactly vmwareAccount at top level' `
-        'vmwareAccount' ((Get-JsonPropertyNames $updateBody) -join ',')
-    Assert-Eq 'account has exactly downloadToken' `
-        'downloadToken' `
-        ((Get-JsonPropertyNames $updateBody.vmwareAccount) -join ',')
-    Assert-Eq 'downloadToken reaches the SDK operation' `
-        $runtimeInfo.downloadToken $updateBody.vmwareAccount.downloadToken
-    foreach ($omitted in @(
-        'username',
-        'password',
-        'status',
-        'message',
-        'downloadActivationCode'
-    )) {
-        Assert-True "account omits unset optional $omitted" `
-            ($updateBody.vmwareAccount.PSObject.Properties.Name -cnotcontains $omitted)
-    }
-    foreach ($omitted in @('offlineAccount', 'depotConfiguration')) {
-        Assert-True "body omits unset optional $omitted" `
-            ($updateBody.PSObject.Properties.Name -cnotcontains $omitted)
-    }
+    Assert-Eq 'body has exactly services at top level' `
+        'services' ((Get-JsonPropertyNames $updateBody) -join ',')
+    Assert-Eq 'body contains one service' 1 @($updateBody.services).Count
+    $service = @($updateBody.services)[0]
+    Assert-Eq 'service has only required fields' 'key,name,nodes,type' `
+        ((Get-JsonPropertyNames $service) -join ',')
+    Assert-Eq 'service key reaches SDK operation' `
+        $runtimeInfo.serviceKey $service.key
+    Assert-Eq 'body contains one node' 1 @($service.nodes).Count
+    $node = @($service.nodes)[0]
+    Assert-Eq 'node has only required fields' 'addresses,name' `
+        ((Get-JsonPropertyNames $node) -join ',')
+    Assert-Eq 'body contains one address' 1 @($node.addresses).Count
+    $address = @($node.addresses)[0]
+    Assert-Eq 'address has required fields' 'type,value' `
+        ((Get-JsonPropertyNames $address) -join ',')
+    Assert-Eq 'address value reaches SDK operation' `
+        $runtimeInfo.addressValue $address.value
     Assert-Eq 'first PUT applies one desired-state effect' 1 `
         $updates[0].mutationEffectCount
     Assert-Eq 'identical retry does not duplicate the effect' 1 `

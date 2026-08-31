@@ -19,7 +19,8 @@ function Set-VcfNsxIpAddressBlock {
         [Parameter(Mandatory)][string]$IpBlockId,
         [Parameter(Mandatory)][string]$DisplayName,
         [Parameter(Mandatory)][string[]]$Cidrs,
-        [Parameter(Mandatory)][string]$AccessToken,
+        [Parameter(Mandatory)][string]$Username,
+        [Parameter(Mandatory)][string]$Password,
         [string]$Description,
         [bool]$SubnetExclusive
     )

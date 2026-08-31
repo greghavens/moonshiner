@@ -27,6 +27,7 @@ COMMIT = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
 SPEC_PATH = "specifications/vsphere/openapi/automation/vcenter.yaml"
 GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange"
 SUBJECT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt"
+REQUESTED_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 
 
 def fail(message: str) -> NoReturn:
@@ -236,6 +237,8 @@ def run_case() -> None:
     subject_token = f"subject-{secrets.token_urlsafe(23)}"
     old_token = f"access-old-{secrets.token_urlsafe(19)}"
     new_token = f"access-new-{secrets.token_urlsafe(19)}"
+    audience = f"vcf-{secrets.token_hex(8)}"
+    kubernetes_bearer_token = f"k8s-{secrets.token_urlsafe(28)}"
     managed_by = f"platform operator/{secrets.token_hex(6)}"
 
     with tempfile.TemporaryDirectory(prefix="vcf91-0139-") as temp_name:
@@ -262,6 +265,12 @@ def run_case() -> None:
             json.dumps(after_versions),
             "--subject-token",
             subject_token,
+            "--audience",
+            audience,
+            "--requested-token-type",
+            REQUESTED_TOKEN_TYPE,
+            "--kubernetes-bearer-token",
+            kubernetes_bearer_token,
             "--old-access-token",
             old_token,
             "--new-access-token",
@@ -287,6 +296,11 @@ def run_case() -> None:
                 clusters,
                 managed_by,
             )
+            authentication_arguments = {
+                "audience": audience,
+                "requested_token_type": REQUESTED_TOKEN_TYPE,
+                "kubernetes_bearer_token": kubernetes_bearer_token,
+            }
 
             invalid_cases = [
                 (
@@ -454,25 +468,59 @@ def run_case() -> None:
                 ):
                     fail(f"{context} caused network traffic")
 
+            try:
+                reconcile_cluster_annotations(
+                    *base_arguments[:4],
+                    (cluster for cluster in clusters),
+                    base_arguments[5],
+                    **authentication_arguments,
+                    kubernetes_scheme="http",
+                    timeout=3.0,
+                )
+            except Exception as error:
+                if "HTTP 400" not in str(error):
+                    fail("exact live token-exchange 400 was not preserved")
+            else:
+                fail("exact live token exchange unexpectedly succeeded")
+
+            try:
+                reconcile_cluster_annotations(
+                    *base_arguments[:4],
+                    (cluster for cluster in clusters),
+                    base_arguments[5],
+                    **authentication_arguments,
+                    kubernetes_scheme="http",
+                    timeout=3.0,
+                )
+            except Exception as error:
+                if "invalid summary" not in str(error):
+                    fail("exact live blank namespace summary was not rejected")
+            else:
+                fail("exact live blank namespace summary unexpectedly succeeded")
+
             result = reconcile_cluster_annotations(
                 *base_arguments[:4],
                 (cluster for cluster in clusters),
                 base_arguments[5],
+                **authentication_arguments,
                 kubernetes_scheme="http",
                 timeout=3.0,
             )
-            entries = wait_for_log(log_path, 8)
+            all_entries = wait_for_log(log_path, 11)
 
             change_ticket = f"change/{secrets.token_hex(7)}"
             ticket_result = reconcile_cluster_annotations(
                 *base_arguments[:4],
                 list(reversed(clusters)),
                 base_arguments[5],
+                **authentication_arguments,
                 change_ticket=change_ticket,
                 kubernetes_scheme="http",
                 timeout=3.0,
             )
-            ticket_entries = wait_for_log(log_path, 14)[8:]
+            ticket_entries = wait_for_log(log_path, 17)[11:]
+            primary_entries = all_entries[:5]
+            entries = all_entries[5:]
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -492,7 +540,7 @@ def run_case() -> None:
         "result key order",
     )
     assert_equal(result["namespace"], namespace, "result namespace")
-    assert_equal(result["access_token_refreshes"], 1, "refresh count")
+    assert_equal(result["access_token_refreshes"], 0, "refresh count")
     assert_equal(
         result["updated"],
         [
@@ -526,10 +574,27 @@ def run_case() -> None:
         "change-ticket result",
     )
 
-    assert_equal(len(entries), 8, "request count")
+    assert_equal(
+        [entry["operation"] for entry in primary_entries],
+        [
+            "vcenter.token.issue",
+            "vcenter.token.issue",
+            "vcenter.namespace.listAuthorized",
+            "vcenter.token.issue",
+            "vcenter.namespace.listAuthorized",
+        ],
+        "live-gap operation order",
+    )
+    assert_equal(
+        [entry["status"] for entry in primary_entries],
+        [400, 200, 401, 200, 200],
+        "live token, refresh, and blank-summary statuses",
+    )
+
+    assert_equal(len(entries), 6, "request count")
     assert_equal(
         [entry["sequence"] for entry in entries],
-        list(range(8)),
+        list(range(5, 11)),
         "request log sequence",
     )
     assert_equal(
@@ -540,20 +605,18 @@ def run_case() -> None:
             "kubernetes.cluster.get",
             "kubernetes.cluster.patch",
             "kubernetes.cluster.get",
-            "vcenter.token.issue",
-            "kubernetes.cluster.get",
             "kubernetes.cluster.patch",
         ],
         "operation order",
     )
     assert_equal(
         [entry["method"] for entry in entries],
-        ["POST", "GET", "GET", "PATCH", "GET", "POST", "GET", "PATCH"],
+        ["POST", "GET", "GET", "PATCH", "GET", "PATCH"],
         "method order",
     )
     assert_equal(
         [entry["status"] for entry in entries],
-        [200, 200, 200, 200, 401, 200, 200, 200],
+        [200, 200, 200, 200, 200, 200],
         "response status sequence",
     )
 
@@ -575,8 +638,6 @@ def run_case() -> None:
             cluster_targets[0],
             cluster_targets[0],
             cluster_targets[1],
-            token_target,
-            cluster_targets[1],
             cluster_targets[1],
         ],
         "raw request targets",
@@ -587,6 +648,8 @@ def run_case() -> None:
     form_body = urllib.parse.urlencode(
         [
             ("grant_type", GRANT_TYPE),
+            ("audience", audience),
+            ("requested_token_type", REQUESTED_TOKEN_TYPE),
             ("subject_token", subject_token),
             ("subject_token_type", SUBJECT_TOKEN_TYPE),
         ]
@@ -606,28 +669,29 @@ def run_case() -> None:
         for _cluster in clusters
     ]
     assert_equal(request_body(entries[0]), form_body, "initial exchange body")
-    assert_equal(request_body(entries[5]), form_body, "refresh exchange body")
     assert_equal(
         urllib.parse.parse_qsl(
             form_body.decode("ascii"), keep_blank_values=True
         ),
         [
             ("grant_type", GRANT_TYPE),
+            ("audience", audience),
+            ("requested_token_type", REQUESTED_TOKEN_TYPE),
             ("subject_token", subject_token),
             ("subject_token_type", SUBJECT_TOKEN_TYPE),
         ],
         "token form fields and order",
     )
-    for index in (1, 2, 4, 6):
+    for index in (1, 2, 4):
         assert_equal(request_body(entries[index]), b"", f"GET {index} body")
         assert_equal(entries[index]["body_length"], 0, f"GET {index} length")
     assert_equal(
         request_body(entries[3]), expected_patch_bodies[0], "first patch body"
     )
     assert_equal(
-        request_body(entries[7]), expected_patch_bodies[1], "second patch body"
+        request_body(entries[5]), expected_patch_bodies[1], "second patch body"
     )
-    for index in (3, 7):
+    for index in (3, 5):
         body_text = request_body(entries[index]).decode("utf-8")
         for forbidden in (
             "platform.vcf.vmware.com/change-ticket",
@@ -645,22 +709,20 @@ def run_case() -> None:
         "content-type": "application/x-www-form-urlencoded",
     }
     assert_headers(entries[0], token_headers, "initial token exchange")
-    assert_headers(entries[5], token_headers, "refresh token exchange")
     assert_headers(
         entries[1],
         {
             **base_get_headers,
-            "vmware-api-session-id": old_token,
+            "vmware-api-session-id": new_token,
         },
         "namespace list",
     )
-    expected_kube_tokens = [old_token, old_token, old_token, new_token, new_token]
-    for index, token in zip((2, 3, 4, 6, 7), expected_kube_tokens):
+    for index in (2, 3, 4, 5):
         headers = {
             **base_get_headers,
-            "authorization": f"Bearer {token}",
+            "authorization": f"Bearer {kubernetes_bearer_token}",
         }
-        if index in (3, 7):
+        if index in (3, 5):
             headers["content-type"] = "application/merge-patch+json"
         assert_headers(entries[index], headers, f"Kubernetes request {index}")
 
@@ -674,8 +736,8 @@ def run_case() -> None:
         fail("completed first-Cluster work was replayed")
     if sum(entry["method"] == "PATCH" for entry in entries) != 2:
         fail("a PATCH was omitted or retried")
-    if sum(entry["raw_target"] == token_target for entry in entries) != 2:
-        fail("token exchange count was not initial plus one refresh")
+    if sum(entry["raw_target"] == token_target for entry in entries) != 1:
+        fail("successful workflow did not perform one initial token exchange")
 
     assert_equal(
         [entry["operation"] for entry in ticket_entries],
@@ -735,7 +797,7 @@ def run_case() -> None:
     for index in (2, 3, 4, 5):
         headers = {
             **base_get_headers,
-            "authorization": f"Bearer {new_token}",
+            "authorization": f"Bearer {kubernetes_bearer_token}",
         }
         if index in (3, 5):
             headers["content-type"] = "application/merge-patch+json"

@@ -30,16 +30,32 @@ PINNED_OPERATIONS = [
 ]
 
 VALUES = {
-    "supervisor": "supervisor-42",
-    "namespace": "team-aurora",
-    "name": "aurora-vks",
-    "cluster_class": "builtin-generic-v3.6.0",
-    "kubernetes_version": "v1.35.0---vmware.2-vkr.4",
-    "vm_class": "best-effort-medium",
-    "storage_class": "vsan-default-storage-policy",
-    "session": "session-contract-0134",
+    "supervisor": "supervisor-live-validation-missing",
+    "namespace": "vmsp-platform",
+    "name": "vcf-msr01",
+    "cluster_class": "vsphere-9.1.2668",
+    "kubernetes_version": "v1.34.2",
+    "worker_class": "vsphere-9.1.2668-worker",
+    "worker_name": "workers",
+    "session": "0123456789abcdef0123456789abcdef",
     "token": "kube-contract-0134",
 }
+TOPOLOGY_VARIABLE_ORDER = [
+    "datastore",
+    "dnsImageTag",
+    "imageRepository",
+    "infraServerThumbprint",
+    "network",
+    "infraServerURL",
+    "resourcePool",
+    "vmTemplate",
+    "datacenter",
+    "etcdImageTag",
+    "folder",
+    "controlPlaneIpAddr",
+    "credsSecretName",
+    "kubeVipPodManifest",
+]
 
 
 class VerificationError(AssertionError):
@@ -181,8 +197,6 @@ def invoke_module(
     optional_lines = ""
     if optional:
         optional_lines = """
-$parameters.ControlPlaneReplicas = 3
-$parameters.WorkerReplicas = 5
 $parameters.PodCidrBlocks = @('10.244.0.0/16', '10.245.0.0/16')
 $parameters.ServiceCidrBlocks = @('10.96.0.0/12')
 $parameters.ServiceDomain = 'cluster.local'
@@ -201,8 +215,26 @@ $parameters = @{{
     Name = '{VALUES["name"]}'
     ClusterClass = '{VALUES["cluster_class"]}'
     KubernetesVersion = '{VALUES["kubernetes_version"]}'
-    VmClass = '{VALUES["vm_class"]}'
-    StorageClass = '{VALUES["storage_class"]}'
+    TopologyVariables = @{{
+        datastore = 'live-shaped-datastore'
+        dnsImageTag = 'live-shaped-dnsImageTag'
+        imageRepository = 'live-shaped-imageRepository'
+        infraServerThumbprint = 'live-shaped-infraServerThumbprint'
+        network = 'live-shaped-network'
+        infraServerURL = 'live-shaped-infraServerURL'
+        resourcePool = 'live-shaped-resourcePool'
+        vmTemplate = 'live-shaped-vmTemplate'
+        datacenter = 'live-shaped-datacenter'
+        etcdImageTag = 'live-shaped-etcdImageTag'
+        folder = 'live-shaped-folder'
+        controlPlaneIpAddr = 'live-shaped-controlPlaneIpAddr'
+        credsSecretName = 'live-shaped-credsSecretName'
+        kubeVipPodManifest = 'live-shaped-kubeVipPodManifest'
+    }}
+    WorkerClass = '{VALUES["worker_class"]}'
+    WorkerName = '{VALUES["worker_name"]}'
+    ControlPlaneReplicas = 3
+    WorkerReplicas = 3
     VCenterSessionId = '{VALUES["session"]}'
     KubeBearerToken = '{VALUES["token"]}'
     Confirm = $false
@@ -277,11 +309,21 @@ def minimal_body() -> dict[str, Any]:
         },
         "spec": {
             "topology": {
-                "class": VALUES["cluster_class"],
+                "classRef": {"name": VALUES["cluster_class"]},
                 "version": VALUES["kubernetes_version"],
+                "controlPlane": {"replicas": 3},
+                "workers": {
+                    "machineDeployments": [
+                        {
+                            "class": VALUES["worker_class"],
+                            "name": VALUES["worker_name"],
+                            "replicas": 3,
+                        }
+                    ]
+                },
                 "variables": [
-                    {"name": "vmClass", "value": VALUES["vm_class"]},
-                    {"name": "storageClass", "value": VALUES["storage_class"]},
+                    {"name": name, "value": f"live-shaped-{name}"}
+                    for name in TOPOLOGY_VARIABLE_ORDER
                 ],
             }
         },
@@ -294,13 +336,6 @@ def full_body() -> dict[str, Any]:
         "pods": {"cidrBlocks": ["10.244.0.0/16", "10.245.0.0/16"]},
         "services": {"cidrBlocks": ["10.96.0.0/12"]},
         "serviceDomain": "cluster.local",
-    }
-    topology = body["spec"]["topology"]
-    topology["controlPlane"] = {"replicas": 3}
-    topology["workers"] = {
-        "machineDeployments": [
-            {"class": "node-pool", "name": "md-0", "replicas": 5}
-        ]
     }
     return body
 
@@ -409,8 +444,6 @@ def test_ready_minimal(contract: dict[str, Any]) -> None:
     serialized = entries[2]["body"]
     for forbidden in (
         '"clusterNetwork"',
-        '"controlPlane"',
-        '"workers"',
         '"labels"',
         '"annotations"',
         ":null",
@@ -438,6 +471,16 @@ def test_supervisor_gate() -> None:
     require(
         [entry["operation"] for entry in entries] == ["getSupervisorSummary"],
         "Supervisor failure must stop before namespace precheck and mutation",
+    )
+
+
+def test_live_no_supervisor_gate() -> None:
+    with mock_server("supervisor-missing") as (base_uri, log_path):
+        invoke_module(base_uri, expect_success=False)
+        entries = read_log(log_path)
+    require(
+        [entry["operation"] for entry in entries] == ["getSupervisorSummary"],
+        "live no-Supervisor 404 must stop before namespace and mutation",
     )
 
 
@@ -487,6 +530,8 @@ def main() -> int:
         print("ok - protected contract provenance")
         check_sdk_prerequisite()
         print("ok - VCF SDK prerequisite")
+        test_live_no_supervisor_gate()
+        print("ok - exact live no-Supervisor gate")
         test_ready_minimal(contract)
         print("ok - exact minimal wire shape and omission")
         test_ready_optional(contract)

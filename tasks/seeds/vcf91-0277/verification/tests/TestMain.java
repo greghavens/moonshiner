@@ -39,6 +39,7 @@ public final class TestMain {
         everyOptionalFilterSet();
         singlePageAndPercentEncoding();
         allFilterKeysUtf8AndEmptyCollection();
+        multipleNamesRejectedBeforeTraffic();
         authenticationFailureReportsStatus();
         failedPageIsNotAPartialResult();
 
@@ -155,8 +156,8 @@ public final class TestMain {
     }
 
     /**
-     * Repeated UTF-8 and reserved-character values retain caller order, all filter
-     * keys retain contract order, and a zero totalCount stops after the initial page.
+     * A UTF-8 name value, repeated adapter/resource kind values, and all filter
+     * keys retain contract order; a zero totalCount stops after the initial page.
      */
     private static void allFilterKeysUtf8AndEmptyCollection() throws Exception {
         try (MockVcfOpsServer mock = new MockVcfOpsServer(contract, username, password)) {
@@ -164,7 +165,7 @@ public final class TestMain {
             String token = client.authenticate(username, password, null);
 
             List<VcfOpsInventoryClient.Resource> resources = client.listResources(
-                    List.of("missing-café", "missing /?"),
+                    List.of("missing-café"),
                     List.of("VMWARE", "NSXT"),
                     List.of("VirtualMachine", "HostSystem"),
                     7);
@@ -174,10 +175,27 @@ public final class TestMain {
             require(log.size() == 2,
                     "scenario D expected one acquireToken and one empty page, got "
                             + describe(log));
-            String filters = "name=missing-caf%C3%A9&name=missing%20%2F%3F"
+            String filters = "name=missing-caf%C3%A9"
                     + "&adapterKind=VMWARE&adapterKind=NSXT"
                     + "&resourceKind=VirtualMachine&resourceKind=HostSystem";
             assertPage(log.get(1), token, filters + "&page=0&pageSize=7");
+        }
+    }
+
+    /** The live API supports only one name filter even though OpenAPI types it as an array. */
+    private static void multipleNamesRejectedBeforeTraffic() throws Exception {
+        try (MockVcfOpsServer mock = new MockVcfOpsServer(contract, username, password)) {
+            VcfOpsInventoryClient client = new VcfOpsInventoryClient(mock.baseUri());
+            IllegalArgumentException failure = null;
+            try {
+                client.listResources(
+                        List.of("vc01", "vcf-proxy01"), List.of(), List.of(), 10);
+            } catch (IllegalArgumentException expected) {
+                failure = expected;
+            }
+            require(failure != null, "multiple name filters must be rejected locally");
+            require(mock.requestLog().isEmpty(),
+                    "rejecting multiple name filters must perform no traffic");
         }
     }
 

@@ -352,6 +352,7 @@ class FailureAndValidationTests(unittest.TestCase):
             invalid_calls = [
                 lambda: client.list_groups(""),
                 lambda: client.list_groups("default", page_size=True),
+                lambda: client.list_groups("default", page_size=0),
                 lambda: client.list_groups("default", page_size=-1),
                 lambda: client.list_groups("default", page_size=1001),
                 lambda: client.list_groups(

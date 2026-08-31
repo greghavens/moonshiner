@@ -142,10 +142,7 @@ func TestApplySystemBaselineReportsLaterTaskFailureAndExactWire(t *testing.T) {
 		ReferenceToken:     "ref-ceip-2901",
 	}
 	server := newServer(t, contractmock.Plan{
-		ProxyPolls: []contractmock.PollReply{
-			{TaskStatus: "IN_PROGRESS"},
-			{TaskStatus: "SUCCESSFUL"},
-		},
+		ProxyTaskStatus: "COMPLETED_WITH_SUCCESS",
 		CeipPolls: []contractmock.PollReply{
 			{TaskStatus: "IN_PROGRESS"},
 			{TaskStatus: "FAILED", Errors: []contractmock.VCFError{failure}},
@@ -203,8 +200,8 @@ func TestApplySystemBaselineReportsLaterTaskFailureAndExactWire(t *testing.T) {
 		{
 			OperationID: "updateProxyConfiguration",
 			TaskID:      runtime.ProxyTaskID,
-			Status:      "SUCCESSFUL",
-			PollCount:   2,
+			Status:      "COMPLETED_WITH_SUCCESS",
+			PollCount:   0,
 		},
 		{
 			OperationID: "setCeipStatus",
@@ -224,14 +221,12 @@ func TestApplySystemBaselineReportsLaterTaskFailureAndExactWire(t *testing.T) {
 
 	requests := server.Requests()
 	wantOperations := []string{
-		"updateProxyConfiguration", "getTask", "getTask",
+		"updateProxyConfiguration",
 		"setCeipStatus", "getTask", "getTask",
 	}
-	wantMethods := []string{"PATCH", "GET", "GET", "PATCH", "GET", "GET"}
+	wantMethods := []string{"PATCH", "PATCH", "GET", "GET"}
 	wantPaths := []string{
 		"/v1/system/proxy-configuration",
-		"/v1/tasks/" + runtime.ProxyTaskID,
-		"/v1/tasks/" + runtime.ProxyTaskID,
 		"/v1/system/ceip",
 		"/v1/tasks/" + runtime.CeipTaskID,
 		"/v1/tasks/" + runtime.CeipTaskID,
@@ -279,13 +274,12 @@ func TestApplySystemBaselineReportsLaterTaskFailureAndExactWire(t *testing.T) {
 			t.Fatalf("unset/read-only proxy property %q appeared on wire: %s", absent, proxyText)
 		}
 	}
-	assertJSONBody(t, requests[3].Body, map[string]any{"status": "DISABLE"})
+	assertJSONBody(t, requests[1].Body, map[string]any{"status": "DISABLE"})
 
 	paceMu.Lock()
 	gotPace := append([]paceCall(nil), paceCalls...)
 	paceMu.Unlock()
 	wantPace := []paceCall{
-		{OperationID: "updateProxyConfiguration", CompletedPoll: 1},
 		{OperationID: "setCeipStatus", CompletedPoll: 1},
 	}
 	if !reflect.DeepEqual(gotPace, wantPace) {

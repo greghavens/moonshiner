@@ -38,6 +38,7 @@ class ContractMock(AbstractContextManager["ContractMock"]):
         states: list[str],
         result: Any,
         failed_info: Any = None,
+        create_error: tuple[int, Any] | None = None,
     ) -> None:
         contract = json.loads(contract_path.read_text(encoding="utf-8"))
         operations = {
@@ -64,6 +65,7 @@ class ContractMock(AbstractContextManager["ContractMock"]):
         self._states = list(states)
         self._result = result
         self._failed_info = failed_info
+        self._create_error = create_error
         self._poll_index = 0
         self._submitted = False
         self._sequence = 0
@@ -128,7 +130,10 @@ class ContractMock(AbstractContextManager["ContractMock"]):
         ):
             operation_id = CREATE_OPERATION
             with self._lock:
-                if not self._submitted:
+                if self._create_error is not None:
+                    self._submitted = True
+                    status, payload = self._create_error
+                elif not self._submitted:
                     self._submitted = True
                     status = self._create["success"]["status"]
                     payload = self._task_id
@@ -145,15 +150,12 @@ class ContractMock(AbstractContextManager["ContractMock"]):
                 self._poll_index += 1
             task_info: dict[str, Any] = {
                 "description": {
-                    "id": "com.vmware.vcenter.supervisor.backup",
-                    "default_message": "Supervisor backup",
+                    "id": "Description",
+                    "default_message": "",
                     "args": [],
                 },
-                "service": (
-                    "com.vmware.vcenter.namespace_management.supervisors."
-                    "recovery.backup.jobs"
-                ),
-                "operation": "create",
+                "service": "7978ee81-a66c-4c37-8653-c577c0161e9d",
+                "operation": CREATE_OPERATION,
                 "status": state,
                 "cancelable": False,
             }

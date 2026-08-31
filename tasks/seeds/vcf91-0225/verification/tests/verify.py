@@ -686,6 +686,7 @@ def assert_case(case, scenario, report, requests, contract):
     expected_validation_checks = {
         "blankDepotFqdn",
         "blankDepotCertificate",
+        "invalidCorrelationId",
         "emptyComponentList",
         "blankComponentName",
         "blankComponentId",

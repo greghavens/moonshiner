@@ -21,6 +21,20 @@ function New-VcfVksClusterAndWait {
         [string] $KubernetesVersion,
 
         [Parameter(Mandatory)]
+        [hashtable] $TopologyVariables,
+
+        [Parameter(Mandatory)]
+        [string] $WorkerClass,
+
+        [string] $WorkerName = 'workers',
+
+        [ValidateRange(1, 100)]
+        [int] $ControlPlaneReplicas = 3,
+
+        [ValidateRange(1, 100)]
+        [int] $WorkerReplicas = 3,
+
+        [Parameter(Mandatory)]
         [string] $KubernetesToken,
 
         [ValidateRange(1, 100)]

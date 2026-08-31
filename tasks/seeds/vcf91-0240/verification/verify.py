@@ -45,7 +45,7 @@ PRECHECK_FAILURE_TEMPLATE = ("Compatibility validation failed for ops.vcf.lab.lo
 FORBIDDEN_IN_CLIENT = [
     OPS_ID, TASK_DEPOT, TASK_PRECHECK, TASK_APPLY,
     FAILED_STAGE_ID, PRECHECK_FAILED_STAGE_ID, AUTOMATION_VERSION, OPS_CURRENT_VERSION,
-    "CR-2026-0518-vcfops-91", "VCF_OPERATIONS", "VCF_AUTOMATION",
+    "CR-2026-0518-vcfops-91", "OPS", "VCFA",
     OPS_TARGET_VERSION, "depot.vcf.lab.local", "MIIB8jCCAZigAwIBAgIU",
     "post-upgrade service startup", "Compatibility validation failed",
     "com.broadcom.lcm.apply.appliance.startup.timeout",
@@ -59,10 +59,10 @@ PROTECTED = {
     "docs/contract.json": "9b91f5b635522d507d1e275e8aefd675a741b8ee1cdf20269051a951e57369f5",
     "docs/official_sources.json": "9b37b5e4002d3c39247fed91dc67d4d614339f9e35302d813dd20932d300c49d",
     "docs/client_api.md": "86d9fe27a660875bb9d76c678741545b02be10eb9d0a62db63cf7c7e32bd2de1",
-    "fixtures/upgrade-request.json": "b70374178624fa805db53fcdac2f261cbf2333be76547f222930cf39a547b434",
+    "fixtures/upgrade-request.json": "ddc8461d2cc3df49cc3c4f0053fc143fa703a0200d6136c9484fed316d6da836",
     "harness/Json.java": "54aa0a65640d340ea40bda8b2bf752bc53bdf09b071a209376a2a6a8f22ff782",
     "harness/TestMain.java": "b64c5dd2438459d104678864c6fb726547dc7bb5f8a13189c49933ca525d9852",
-    "mock/SddcLcmMock.java": "14c1e3463ed274ed753644c27c68ebb79c42d80c683229ff6b7c5637a3a5b3e5",
+    "mock/SddcLcmMock.java": "71209079d66dbd77a7de6e3a99928921aeef62eb3ee1ea82d64c1b31f9d541cb",
     "verify.py": None,  # self, not checked
 }
 
@@ -415,9 +415,9 @@ def check_report(report, fixture, correlation_id):
               % (report.get("correlationId"), correlation_id))
 
     want_resolved = [
-        {"component": "VCF_OPERATIONS", "version": OPS_TARGET_VERSION,
+        {"component": "OPS", "version": OPS_TARGET_VERSION,
          "binaryUrl": OPS_BINARY_URL},
-        {"component": "VCF_AUTOMATION", "version": AUTOMATION_VERSION,
+        {"component": "VCFA", "version": AUTOMATION_VERSION,
          "binaryUrl": AUTOMATION_BINARY_URL},
     ]
     check(report.get("resolvedComponentVersions") == want_resolved,

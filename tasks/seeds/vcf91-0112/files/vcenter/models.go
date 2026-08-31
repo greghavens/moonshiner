@@ -1,5 +1,4 @@
-// Package vcenter implements the focused VMware Cloud Foundation 9.1
-// vSphere Automation contract described in docs/contract.json.
+// Package vcenter implements a VMware Cloud Foundation 9.1 Content Library client.
 package vcenter
 
 import (
@@ -91,7 +90,7 @@ func (e *ProtocolError) Error() string {
 	return "vCenter response violated the contract"
 }
 
-// Client invokes the focused local Content Library contract.
+// Client invokes the local Content Library create operation.
 type Client struct {
 	baseURL      string
 	sessionToken string

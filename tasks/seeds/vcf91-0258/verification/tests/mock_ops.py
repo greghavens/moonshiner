@@ -242,8 +242,8 @@ class ContractServer(ThreadingHTTPServer):
                 "controlState": "OPEN",
                 "alertDefinitionId": "AlertDefinition-adapter-health",
                 "alertDefinitionName": config["decoy_alert_name"],
-                "type": "Application",
-                "subType": "Availability",
+                "type": "18",
+                "subType": "20",
                 "startTimeUTC": start + 60_000,
                 "updateTimeUTC": start + 120_000,
                 "cancelTimeUTC": 0,
@@ -256,8 +256,8 @@ class ContractServer(ThreadingHTTPServer):
                 "controlState": "OPEN",
                 "alertDefinitionId": "AlertDefinition-collection-age",
                 "alertDefinitionName": config["cause_alert_name"],
-                "type": "Application",
-                "subType": "Availability",
+                "type": "18",
+                "subType": "20",
                 "startTimeUTC": start + 30_000,
                 "updateTimeUTC": start + 150_000,
                 "cancelTimeUTC": 0,
@@ -273,8 +273,8 @@ class ContractServer(ThreadingHTTPServer):
                     "controlState": "CLOSED",
                     "alertDefinitionId": "AlertDefinition-stale",
                     "alertDefinitionName": config["cancelled_alert_name"],
-                    "type": "Application",
-                    "subType": "Availability",
+                    "type": "18",
+                    "subType": "20",
                     "startTimeUTC": start - 900_000,
                     "updateTimeUTC": start - 600_000,
                     "cancelTimeUTC": start - 600_000,
@@ -372,7 +372,7 @@ class ContractServer(ThreadingHTTPServer):
                 "token": config["token"],
                 "validity": config["token_validity"],
                 "expiresAt": config["token_expires_at"],
-                "roles": ["ContentAdmin", "PowerUser"],
+                "roles": [],
             }
 
         expected = "OpsToken " + config["token"]
@@ -386,8 +386,10 @@ class ContractServer(ThreadingHTTPServer):
                 "minor": 1,
                 "minorMinor": 0,
                 "patch": 0,
-                "releasedDate": config["start_time"] - 5_000_000_000,
-                "humanlyReadableReleaseDate": config["release_date"],
+                "buildNumber": 25541561,
+                "description": None,
+                "releasedDate": 1772539200000,
+                "humanlyReadableReleaseDate": "Tuesday, March 3, 2026 at 12:00:00 PM Coordinated Universal Time",
             }
         if operation_id == "getMatchingResources":
             return self.resources_response(body)

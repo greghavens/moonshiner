@@ -115,7 +115,7 @@ def verify_provenance(contract: dict, sources: dict) -> None:
     )
     require(
         isinstance(memory_properties, dict)
-        and list(memory_properties) == ["size_mib", "hot_add_enabled"],
+        and list(memory_properties) == ["size_MiB", "hot_add_enabled"],
         "memory update contract properties changed",
     )
 
@@ -238,7 +238,7 @@ def verify_requests(entries: list[dict], scenario: dict) -> None:
         ensure_ascii=False,
     ).encode("utf-8")
     memory_body = json.dumps(
-        {"size_mib": scenario["memory_mib"]},
+        {"size_MiB": scenario["memory_mib"]},
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
@@ -329,8 +329,8 @@ def verify_requests(entries: list[dict], scenario: dict) -> None:
     for index in (1, 2):
         require(
             entries[index]["bodyJson"]
-            == {"size_mib": scenario["memory_mib"]}
-            and list(entries[index]["bodyJson"]) == ["size_mib"],
+            == {"size_MiB": scenario["memory_mib"]}
+            and list(entries[index]["bodyJson"]) == ["size_MiB"],
             "memory body must omit every unset optional property",
         )
     require(
@@ -365,13 +365,13 @@ def main() -> int:
     for name in package.__all__:
         require(hasattr(package, name), f"vcf_vcenter does not expose {name}")
 
-    nonce = secrets.token_hex(8)
     scenario = {
-        "vm": f"vm/{nonce} snow \u03b2",
-        "cpu_count": 4 + 2 * secrets.randbelow(5),
-        "memory_mib": 12288 + 1024 * secrets.randbelow(9),
-        "initial_token": f"session-initial-{secrets.token_urlsafe(18)}",
-        "refreshed_token": f"session-refreshed-{secrets.token_urlsafe(18)}",
+        "vm": "vm-1032",
+        "exotic_vm": "vm/missing snow \u03b2",
+        "cpu_count": 6,
+        "memory_mib": 8192,
+        "initial_token": secrets.token_hex(16),
+        "refreshed_token": secrets.token_hex(16),
         "expired_message": f"session expired {secrets.token_hex(6)}",
     }
 
@@ -427,6 +427,46 @@ def main() -> int:
             verify_result(result, scenario)
             entries = read_log(log_file, 4)
             verify_requests(entries, scenario)
+
+            exotic_error = None
+            try:
+                client.resize_and_start(
+                    scenario["exotic_vm"],
+                    scenario["cpu_count"],
+                    scenario["memory_mib"],
+                )
+            except package.VCenterError as error:
+                exotic_error = error
+            require(exotic_error is not None, "the exotic VM must return 404")
+            require(exotic_error.status == 404, "the exotic VM status is wrong")
+            require(
+                exotic_error.body.get("error_type") == "NOT_FOUND",
+                "the exotic VM error type is wrong",
+            )
+            message_ids = [
+                message.get("id")
+                for message in exotic_error.body.get("messages", [])
+            ]
+            require(
+                message_ids
+                == [
+                    "com.vmware.api.vcenter.vm.not_found",
+                    "vmsg.ManagedObjectNotFound.summary",
+                ],
+                "the exotic VM error envelope is not live-shaped",
+            )
+            require(
+                provider.calls == [False, True],
+                "a non-401 VM error must not refresh the session",
+            )
+            all_entries = read_log(log_file, 5)
+            require(
+                len(all_entries) == 5
+                and all_entries[-1]["operationId"]
+                == "Vcenter.Vm.Hardware.Cpu_update"
+                and all_entries[-1]["status"] == 404,
+                "the exotic VM must stop after its first CPU request",
+            )
         finally:
             stop_process(process)
 

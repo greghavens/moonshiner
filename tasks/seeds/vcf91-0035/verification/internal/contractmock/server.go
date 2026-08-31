@@ -233,7 +233,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	case ModeRedirect:
 		writer.Header().Set(
 			"Location",
-			"/v1/domains?pageNumber=0&pageSize=2",
+			"/v1/domains?pageNumber=1&pageSize=2",
 		)
 		writer.WriteHeader(http.StatusFound)
 		return
@@ -252,7 +252,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if s.mode == ModeBadPageSize {
 		page.PageMetadata.PageSize++
 	}
-	if s.mode == ModeInconsistentTotals && pageNumber == 1 {
+	if s.mode == ModeInconsistentTotals && pageNumber == 2 {
 		page.PageMetadata.TotalElements--
 	}
 	if s.mode == ModeCountMismatch {
@@ -283,23 +283,23 @@ type domainPage struct {
 
 func (s *Server) page(pageNumber int, reversed bool) (domainPage, bool) {
 	if s.mode == ModeEmpty {
-		if pageNumber != 0 {
+		if pageNumber != 1 {
 			return domainPage{}, false
 		}
 		return domainPage{
 			Elements: []Domain{},
 			PageMetadata: pageMetadata{
-				PageNumber:    0,
+				PageNumber:    1,
 				PageSize:      0,
 				TotalElements: 0,
 				TotalPages:    0,
 			},
 		}, true
 	}
-	if pageNumber < 0 || pageNumber >= 3 {
+	if pageNumber < 1 || pageNumber > 3 {
 		return domainPage{}, false
 	}
-	start := pageNumber * s.runtime.TransportPageSize
+	start := (pageNumber - 1) * s.runtime.TransportPageSize
 	end := start + s.runtime.TransportPageSize
 	elements := append([]Domain(nil), s.runtime.Domains[start:end]...)
 	if reversed {
@@ -365,7 +365,7 @@ func parsePageQuery(values url.Values, pageSize int) (int, bool) {
 		return 0, false
 	}
 	pageNumber, err := strconv.Atoi(values.Get("pageNumber"))
-	return pageNumber, err == nil && pageNumber >= 0
+	return pageNumber, err == nil && pageNumber >= 1
 }
 
 func validateContract(path string) error {

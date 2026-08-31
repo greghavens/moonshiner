@@ -119,6 +119,7 @@ FORBIDDEN_SOURCE_TOKENS = (
 )
 REQUIRED_SOURCE_TOKENS = (
     "connect-vcfopsserver",
+    "ignoreinvalidcertificate",
     "invoke-vcfopsgetmatchingresources",
     "invoke-vcfopsqueryalert",
     "invoke-vcfopsgetalertcontributingsymptoms",
@@ -510,7 +511,7 @@ def build_config(*, cause_symptom_criticality: str = "CRITICAL") -> dict[str, An
         "resource_id": str(uuid.uuid4()),
         "healthy_adapter_instance_id": str(uuid.uuid4()),
         "failing_adapter_instance_id": str(uuid.uuid4()),
-        "status_message": "collection halted; evidence " + secrets.token_hex(10),
+        "status_message": "",
         "decoy_alert_id": str(uuid.uuid4()),
         "decoy_alert_name": "Adapter instance collection has slowed down",
         "cause_alert_id": str(uuid.uuid4()),

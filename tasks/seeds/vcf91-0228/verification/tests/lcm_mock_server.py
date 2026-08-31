@@ -232,7 +232,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         try:
             page_size = int(raw_size) if raw_size is not None else 50
-            page_number = int(raw_number) if raw_number is not None else 0
+            page_number = int(raw_number) if raw_number is not None else 1
         except ValueError:
             entry["status"] = 400
             self._error(400, "BAD_REQUEST", "pageNumber and pageSize must be integers")
@@ -242,14 +242,14 @@ class _Handler(BaseHTTPRequestHandler):
             entry["status"] = 400
             self._error(400, "BAD_REQUEST", "pageSize must be between 1 and 50")
             return
-        if page_number < 0:
+        if page_number < 1:
             entry["status"] = 400
-            self._error(400, "BAD_REQUEST", "pageNumber must not be negative")
+            self._error(400, "BAD_REQUEST", "pageNumber must be positive")
             return
 
         total_elements = len(elements)
         total_pages = (total_elements + page_size - 1) // page_size
-        start = page_number * page_size
+        start = (page_number - 1) * page_size
         window = elements[start : start + page_size]
 
         entry["status"] = 200

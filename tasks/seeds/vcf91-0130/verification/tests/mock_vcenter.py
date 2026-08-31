@@ -83,6 +83,7 @@ def main() -> int:
     expiry_namespace = scenario["expiry_namespace"]
     namespaces = scenario["namespaces"]
     clusters_by_namespace = scenario["clusters_by_namespace"]
+    live_blank_first = bool(scenario.get("live_blank_first"))
     if not isinstance(namespaces, list) or not namespaces:
         raise ValueError("scenario namespaces must be a non-empty list")
     if set(namespaces) != set(clusters_by_namespace):
@@ -158,20 +159,32 @@ def main() -> int:
                     else:
                         status = 200
                         state["vcenter_successes"] += 1
-                        collection_reversed = state["vcenter_successes"] % 2 == 1
-                        ordered_namespaces = list(namespaces)
-                        if collection_reversed:
-                            ordered_namespaces.reverse()
-                        endpoint = (
-                            f"http://127.0.0.1:{self.server.server_port}"
-                        )
-                        response = [
-                            {
-                                "namespace": namespace,
-                                "master_host": endpoint,
-                            }
-                            for namespace in ordered_namespaces
-                        ]
+                        if live_blank_first and state["vcenter_successes"] == 1:
+                            collection_reversed = False
+                            response = [
+                                {
+                                    "control_plane_api_server_port": 6443,
+                                    "master_host": "",
+                                    "namespace": "",
+                                }
+                            ]
+                            ordered_namespaces = None
+                        else:
+                            ordered_namespaces = list(namespaces)
+                        if ordered_namespaces is not None:
+                            collection_reversed = state["vcenter_successes"] % 2 == 1
+                            if collection_reversed:
+                                ordered_namespaces.reverse()
+                            endpoint = (
+                                f"http://127.0.0.1:{self.server.server_port}"
+                            )
+                            response = [
+                                {
+                                    "namespace": namespace,
+                                    "master_host": endpoint,
+                                }
+                                for namespace in ordered_namespaces
+                            ]
                 elif kube_namespace is not None:
                     operation_key = kube_operation["operationKey"]
                     bearer = (

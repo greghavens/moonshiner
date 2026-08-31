@@ -151,22 +151,22 @@ try {
         'runtime exports'
 
     $RunId = [guid]::NewGuid().ToString('N')
-    $OldToken = 'old-' + $RunId.Substring(0, 12)
-    $FreshToken = 'fresh-' + $RunId.Substring(12, 12)
-    $MarkerOne = 'after ' + $RunId.Substring(24, 4) + '/one+?&'
-    $MarkerTwo = 'after+' + $RunId.Substring(28, 4) + '/two ?'
+    $OldToken = $RunId
+    $FreshToken = [guid]::NewGuid().ToString('N')
+    $MarkerOne = 'AQID/' + $RunId.Substring(24, 4) + '+=='
+    $MarkerTwo = 'BwgJ+' + $RunId.Substring(28, 4) + '/='
     $Roles = @(
         [ordered]@{
-            role = 'role-z-' + $RunId.Substring(0, 4)
+            role = '-8'
             info = [ordered]@{
                 name = 'zulu'
                 description = 'runtime zulu'
                 privileges = @('System.Read')
-                system = $false
+                system = $true
             }
         },
         [ordered]@{
-            role = 'role-b-' + $RunId.Substring(4, 4)
+            role = '1005'
             info = [ordered]@{
                 name = 'Alpha'
                 description = 'runtime alpha b'
@@ -175,7 +175,7 @@ try {
             }
         },
         [ordered]@{
-            role = 'role-a-' + $RunId.Substring(8, 4)
+            role = '1004'
             info = [ordered]@{
                 name = 'Alpha'
                 description = 'runtime alpha a'
@@ -184,7 +184,7 @@ try {
             }
         },
         [ordered]@{
-            role = 'role-c-' + $RunId.Substring(12, 4)
+            role = '-7'
             info = [ordered]@{
                 name = 'bravo'
                 description = 'runtime bravo'
@@ -193,7 +193,7 @@ try {
             }
         },
         [ordered]@{
-            role = 'role-d-' + $RunId.Substring(16, 4)
+            role = '1006'
             info = [ordered]@{
                 name = 'alpha'
                 description = 'runtime lowercase alpha'
@@ -340,7 +340,7 @@ try {
 
     $First = @(Get-VcfVcenterRoleInventory -Session $Session -PageSize 2)
     $Second = @(Get-VcfVcenterRoleInventory -Session $Session -PageSize 2)
-    Assert-Equal $RefreshState.Count 1 'token refresh count'
+    Assert-Equal $RefreshState.Count 1 'API session refresh count'
     Assert-Equal $Session.Server.AccessToken $FreshToken `
         'session retains the replacement handle'
     Assert-Equal $First.Count 5 'first run preserves all roles'

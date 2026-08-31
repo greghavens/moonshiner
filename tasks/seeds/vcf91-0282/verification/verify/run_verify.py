@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 BASE = "/suite-api"
-SCHEME = "vRealizeOpsToken"
+SCHEME = "OpsToken"
 DATASTORE = "wld01-vsan-ds01"
 USER = "svc-diag"
 PASS = "R3d-Herring!2026"

@@ -40,7 +40,7 @@ func TestListAllHostsWirePaginationAndStableOrder(t *testing.T) {
 					{ID: "host-4", FQDN: "bravo.example.test", Status: "ASSIGNED"},
 				},
 			},
-			wantQueries: []string{"pageNumber=0", "pageNumber=1"},
+			wantQueries: []string{"pageNumber=1", "pageNumber=2"},
 			wantHosts: []vcf.Host{
 				{ID: "host-1", FQDN: "alpha.example.test", Status: "UNASSIGNED_USEABLE"},
 				{ID: "host-2", FQDN: "alpha.example.test", Status: "ASSIGNED"},
@@ -68,7 +68,7 @@ func TestListAllHostsWirePaginationAndStableOrder(t *testing.T) {
 				{ID: "host-9", FQDN: "esx-01.example.test", Status: "ASSIGNED"},
 			}},
 			wantQueries: []string{
-				"clusterId=cluster+1&datastoreName=datastore%2Fblue&domainId=domain+blue&fqdn=esx-01.example.test&ipAddressVersionForVmotion=IPv6&isLifecycleManaged=true&isStandalone=false&isVsanWitnessHost=false&networkpoolId=np-1&pageNumber=0&pageSize=3&status=ASSIGNED&storageType=VSAN_ESA",
+				"clusterId=cluster+1&datastoreName=datastore%2Fblue&domainId=domain+blue&fqdn=esx-01.example.test&ipAddressVersionForVmotion=IPv6&isLifecycleManaged=true&isStandalone=false&isVsanWitnessHost=false&networkpoolId=np-1&pageNumber=1&pageSize=3&status=ASSIGNED&storageType=VSAN_ESA",
 			},
 			wantHosts: []vcf.Host{{
 				ID: "host-9", FQDN: "esx-01.example.test", Status: "ASSIGNED",
@@ -88,7 +88,7 @@ func TestListAllHostsWirePaginationAndStableOrder(t *testing.T) {
 			pages: [][]contractmock.Host{{
 				{ID: "host-5", FQDN: "echo.example.test", Status: "ASSIGNED"},
 			}},
-			wantQueries: []string{"pageNumber=0"},
+			wantQueries: []string{"pageNumber=1"},
 			wantHosts: []vcf.Host{{
 				ID: "host-5", FQDN: "echo.example.test", Status: "ASSIGNED",
 			}},

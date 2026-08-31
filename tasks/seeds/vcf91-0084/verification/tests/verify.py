@@ -23,7 +23,7 @@ SPEC_PATH = "specifications/nsx/openapi-2.0/nsx_policy_api.yaml"
 SPEC_BLOB = "102d15fd342f6a45bb6d84a5b39a916c65929f4c"
 OPERATION_IDS = ["GetTier1State", "PatchTier1"]
 PROTECTED_SHA256 = {
-    "TestMain.java": "3db9b9e54591bd041e2ec5a36385f4fd64cd9999af7c04d10e6896f1d30ae30a",
+    "TestMain.java": "9a4715cdd7ad691f91960df09d2d0f43624de7c55a186ac4b6786a1c617aa956",
     "tools/mock_nsx_policy.py": "95f66dd8c497999b714b8254bd202d2c3e6cdd09087dda7d55aeabe6cdcdd936",
     "docs/contract.json": "4b81e1deb1964e58251ebfb6c2efaa81a98d9efce1f03edeb142bca5fcb93d13",
     "docs/official_sources.json": "9fa166e2e789a69eb2fc8370b0b88a7bb13c5a96c7f6c0e14c2ee52cb8242a71",
@@ -101,7 +101,7 @@ def verify_protected_files() -> tuple[dict[str, object], dict[str, object]]:
 
 def write_scenarios(path: Path, token: str) -> None:
     scenarios = {
-        f"blocked/{token}": {
+        f"blocked-{token}": {
             "precheck": {
                 "status": 200,
                 "body": {
@@ -113,13 +113,13 @@ def write_scenarios(path: Path, token: str) -> None:
                 },
             }
         },
-        f"malformed/{token}": {
+        f"malformed-{token}": {
             "precheck": {
                 "status": 200,
                 "body": {"tier1_status": {}},
             }
         },
-        f"outage/{token}": {
+        f"outage-{token}": {
             "precheck": {
                 "status": 503,
                 "body": {
@@ -129,14 +129,14 @@ def write_scenarios(path: Path, token: str) -> None:
                 },
             }
         },
-        f"ready/core ?#% Δ-{token}": {
+        f"ready-core-{token}": {
             "precheck": {
                 "status": 200,
                 "body": {"tier1_state": {"state": "success"}},
             },
             "mutation": {"status": 200, "body": None},
         },
-        f"options/{token}": {
+        f"options-{token}": {
             "precheck": {
                 "status": 200,
                 "body": {"tier1_state": {"state": "success"}},

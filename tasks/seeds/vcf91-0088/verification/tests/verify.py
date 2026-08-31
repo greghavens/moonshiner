@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Protected verifier for the VCF 9.1 token-refresh collection task."""
+"""Protected verifier for the VCF 9.1 Basic-auth collection task."""
 
 from __future__ import annotations
 
@@ -19,16 +19,16 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 PROTECTED_HASHES = {
     "docs/contract.json": (
-        "de66e1f1e0be310144566781e70e60b6b44d4e868bda0b82b617a552c6c78ced"
+        "81036e2a6338a6fd489ea068909904c20f1d9fdbe92c3f7a07daccfecae8f88c"
     ),
     "docs/official_sources.json": (
-        "8b8f2c88ec72e894a5685a8fd12db8b994848ffffe1c7037bdae2a251e7df8ca"
+        "92cfa0a2c903ebf8ec8ee623655fceb2df3bc43d2bd396f25007fe5eeae6ed10"
     ),
     "tests/TestMain.java": (
-        "014bda0897c6ef3c122be5e6e056fd7ee9b298deba3f74ecf68bd6bf464e04fb"
+        "2c14e9a23bbc88dfab7cdeefe1429f89103b81b3e108500fc9b3c499837a6b9a"
     ),
     "tests/mock_nsx_policy.py": (
-        "fc214f2bfed538f1884627cdd715170f538a2336f7576ce549eb60aaada403c4"
+        "c0aa575e0ff733886dcecad257c9c2d04742800047bc97a489a834c0c4b7b8e8"
     ),
 }
 COMMIT = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
@@ -63,6 +63,11 @@ def verify_protected_inputs() -> dict[str, Any]:
     require(contract["swagger"] == "2.0", "contract swagger version")
     require(contract["info"]["version"] == "9.1.0.0", "contract product version")
     require(contract["basePath"] == "/policy/api/v1", "contract base path")
+    require(
+        contract["security"] == [{"BasicAuth": []}]
+        and contract["securityDefinitions"]["BasicAuth"]["type"] == "basic",
+        "contract Basic authentication",
+    )
     require(set(contract["operations"]) == {OPERATION_ID}, "operation set")
     operation = contract["operations"][OPERATION_ID]
     require(operation["operationId"] == OPERATION_ID, "operationId")
@@ -123,6 +128,10 @@ def verify_protected_inputs() -> dict[str, Any]:
         and sources["operationIds"] == [OPERATION_ID],
         "official source provenance",
     )
+    require(
+        sources["security"] == {"name": "BasicAuth", "type": "basic"},
+        "official Basic authentication provenance",
+    )
     require(len(sources["operations"]) == 1, "official operation count")
     source_operation = sources["operations"][0]
     require(
@@ -141,8 +150,8 @@ def runtime_environment() -> dict[str, str]:
     environment = os.environ.copy()
     environment.update(
         {
-            "NSX_INITIAL_TOKEN": "initial." + secrets.token_urlsafe(18),
-            "NSX_REFRESHED_TOKEN": "refreshed." + secrets.token_urlsafe(18),
+            "NSX_USERNAME": "admin-" + marker,
+            "NSX_PASSWORD": "secret-" + secrets.token_urlsafe(18),
             "NSX_CURSOR": "next page/\u96ea + & ? " + marker,
             "NSX_SEGMENT_1_ID": "z-id-" + marker,
             "NSX_SEGMENT_1_NAME": "Zulu " + marker,
@@ -264,8 +273,11 @@ def run_harness(
                 mock.communicate(timeout=3)
 
 
-def bearer(token: str) -> str:
-    return "Bearer " + token
+def basic(username: str, password: str) -> str:
+    import base64
+
+    payload = f"{username}:{password}".encode("utf-8")
+    return "Basic " + base64.b64encode(payload).decode("ascii")
 
 
 def encoded(value: str) -> str:
@@ -288,7 +300,7 @@ def verify_request(
     headers = event["headers"]
     require(
         headers.get("authorization") == [authorization],
-        "Bearer Authorization wire value",
+        "Basic Authorization wire value",
     )
     require(
         headers.get("accept") == ["application/json"],
@@ -340,14 +352,18 @@ def verify_wire_log(
         ("cursor", environment["NSX_CURSOR"]),
         ("page_size", "2"),
     ]
-    initial = bearer(environment["NSX_INITIAL_TOKEN"])
-    refreshed = bearer(environment["NSX_REFRESHED_TOKEN"])
+    accepted = basic(
+        environment["NSX_USERNAME"], environment["NSX_PASSWORD"]
+    )
+    rejected = basic(
+        environment["NSX_USERNAME"], environment["NSX_PASSWORD"] + "-wrong"
+    )
     expected = [
-        (first_target, initial, 200, first_query),
-        (second_target, initial, 401, second_query),
-        (second_target, refreshed, 200, second_query),
-        (first_target, refreshed, 200, first_query),
-        (second_target, refreshed, 200, second_query),
+        (first_target, rejected, 403, first_query),
+        (first_target, accepted, 200, first_query),
+        (second_target, accepted, 200, second_query),
+        (first_target, accepted, 200, first_query),
+        (second_target, accepted, 200, second_query),
     ]
     for event, (target, auth, status, query) in zip(
             events, expected, strict=True):

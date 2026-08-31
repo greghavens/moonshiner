@@ -261,9 +261,10 @@ def validate_api(module: object) -> None:
         "supervisor",
         "cluster_name",
         "kubernetes_version",
-        "vm_class",
-        "storage_class",
         "cluster_class",
+        "topology_variables",
+        "worker_class",
+        "worker_name",
         "control_plane_replicas",
         "worker_replicas",
         "description",
@@ -280,8 +281,8 @@ def validate_api(module: object) -> None:
             f"{name} is keyword-only",
         )
     expected_defaults = {
-        "cluster_class": "builtin-generic-v3.6.0",
-        "control_plane_replicas": 1,
+        "worker_name": "workers",
+        "control_plane_replicas": 3,
         "worker_replicas": 3,
         "description": None,
         "namespace_storage_policy": None,
@@ -321,7 +322,24 @@ def validate_log(
 ) -> None:
     lines = log_path.read_text(encoding="utf-8").splitlines()
     entries = [json.loads(line) for line in lines if line.strip()]
-    assert_equal(len(entries), 6, "exact request count")
+    assert_equal(len(entries), 7, "exact request count")
+    live_gap = entries[0]
+    assert_equal(
+        (
+            live_gap["contractName"],
+            live_gap["method"],
+            live_gap["status"],
+            live_gap["rawTarget"],
+        ),
+        (
+            "createSupervisorNamespace",
+            "POST",
+            404,
+            "/api/vcenter/namespaces/instances/v2",
+        ),
+        "exact live no-Supervisor failure is exercised first",
+    )
+    entries = entries[1:]
     names = [entry["contractName"] for entry in entries]
     assert_equal(
         names,
@@ -471,12 +489,27 @@ def validate_log(
     topology = decoded_cluster["spec"]["topology"]
     assert_equal(
         list(topology),
-        ["class", "version", "controlPlane", "workers", "variables"],
+        ["classRef", "version", "controlPlane", "workers", "variables"],
         "Cluster topology member order",
     )
     assert_equal(
         [variable["name"] for variable in topology["variables"]],
-        ["vmClass", "storageClass"],
+        [
+            "datastore",
+            "dnsImageTag",
+            "imageRepository",
+            "infraServerThumbprint",
+            "network",
+            "infraServerURL",
+            "resourcePool",
+            "vmTemplate",
+            "datacenter",
+            "etcdImageTag",
+            "folder",
+            "controlPlaneIpAddr",
+            "credsSecretName",
+            "kubeVipPodManifest",
+        ],
         "Cluster variable order",
     )
 
@@ -490,14 +523,34 @@ def main() -> int:
     validate_api(vcf_vks)
 
     run_id = uuid.uuid4().hex
-    namespace = f"team-{run_id[:8]}"
-    supervisor = f"supervisor-{run_id[8:16]}"
-    cluster_name = f"orders-{run_id[16:24]}"
-    session_id = f"session-{run_id}"
+    namespace = "vmsp-platform"
+    supervisor = "domain-c8"
+    cluster_name = "moonshiner-live-0138"
+    session_id = run_id
     bearer_token = f"bearer-{run_id[::-1]}"
-    kubernetes_version = f"v1.35.{int(run_id[0], 16)}---vmware.2-vkr.4"
-    vm_class = f"best-effort-{run_id[1:7]}"
-    storage_class = f"gold-{run_id[7:13]}"
+    kubernetes_version = "v1.34.2"
+    cluster_class = "vsphere-9.1.2668"
+    worker_class = "vsphere-9.1.2668-worker"
+    topology_variable_names = [
+        "datastore",
+        "dnsImageTag",
+        "imageRepository",
+        "infraServerThumbprint",
+        "network",
+        "infraServerURL",
+        "resourcePool",
+        "vmTemplate",
+        "datacenter",
+        "etcdImageTag",
+        "folder",
+        "controlPlaneIpAddr",
+        "credsSecretName",
+        "kubeVipPodManifest",
+    ]
+    topology_variables = {
+        name: {"liveValidated": True, "name": name}
+        for name in topology_variable_names
+    }
     namespace_body = {
         "supervisor": supervisor,
         "namespace": namespace,
@@ -511,21 +564,21 @@ def main() -> int:
         },
         "spec": {
             "topology": {
-                "class": "builtin-generic-v3.6.0",
+                "classRef": {"name": cluster_class},
                 "version": kubernetes_version,
-                "controlPlane": {"replicas": 1},
+                "controlPlane": {"replicas": 3},
                 "workers": {
                     "machineDeployments": [
                         {
-                            "class": "node-pool",
+                            "class": worker_class,
                             "name": "workers",
                             "replicas": 3,
                         }
                     ]
                 },
                 "variables": [
-                    {"name": "vmClass", "value": vm_class},
-                    {"name": "storageClass", "value": storage_class},
+                    {"name": name, "value": topology_variables[name]}
+                    for name in topology_variable_names
                 ],
             }
         },
@@ -575,16 +628,29 @@ def main() -> int:
             assert_true(
                 not log_path.exists(), "client construction performs no request"
             )
-            final_cluster = client.provision_cluster(
-                namespace=namespace,
-                supervisor=supervisor,
-                cluster_name=cluster_name,
-                kubernetes_version=kubernetes_version,
-                vm_class=vm_class,
-                storage_class=storage_class,
-                poll_interval=0.001,
-                timeout=5.0,
-            )
+            workflow_arguments = {
+                "namespace": namespace,
+                "supervisor": supervisor,
+                "cluster_name": cluster_name,
+                "kubernetes_version": kubernetes_version,
+                "cluster_class": cluster_class,
+                "topology_variables": topology_variables,
+                "worker_class": worker_class,
+                "poll_interval": 0.001,
+                "timeout": 5.0,
+            }
+            try:
+                client.provision_cluster(**workflow_arguments)
+            except vcf_vks.ApiError as error:
+                assert_equal(error.status, 404, "live no-Supervisor status")
+                assert_equal(
+                    error.body.get("messages", [{}])[0].get("id"),
+                    "vcenter.wcp.supervisor.notfound",
+                    "live no-Supervisor message ID",
+                )
+            else:
+                fail("exact live no-Supervisor create unexpectedly succeeded")
+            final_cluster = client.provision_cluster(**workflow_arguments)
             assert_true(isinstance(final_cluster, dict), "final Cluster object")
             assert_equal(
                 final_cluster.get("apiVersion"),
@@ -599,18 +665,20 @@ def main() -> int:
                 cluster_name,
                 "final Cluster name",
             )
-            ready_conditions = [
+            available_conditions = [
                 condition
                 for condition in final_cluster.get("status", {}).get(
                     "conditions", []
                 )
-                if condition.get("type") == "Ready"
+                if condition.get("type") == "Available"
             ]
-            assert_equal(len(ready_conditions), 1, "one final Ready condition")
             assert_equal(
-                ready_conditions[0].get("status"),
+                len(available_conditions), 1, "one final Available condition"
+            )
+            assert_equal(
+                available_conditions[0].get("status"),
                 "True",
-                "terminal Ready condition",
+                "terminal Available condition",
             )
             validate_log(
                 log_path,

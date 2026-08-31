@@ -14,10 +14,10 @@ import (
 
 const (
 	maxJSONResponseBytes = 1 << 20
-	maxBundleBytes       = 4 << 20
-	maxArchiveEntries    = 64
-	maxArchiveFileBytes  = 1 << 20
-	maxArchiveExpanded   = 4 << 20
+	maxBundleBytes       = 32 << 20
+	maxArchiveEntries    = 128
+	maxArchiveFileBytes  = 32 << 20
+	maxArchiveExpanded   = 32 << 20
 )
 
 // ErrNotImplemented marks the two incomplete workflow functions.
@@ -326,7 +326,7 @@ func inspectEvidence(
 	archive []byte,
 	taskID string,
 	referenceTokens map[string]struct{},
-	eventIDs map[string]struct{},
+	correlatedEventID string,
 ) (cause string, evidencePath string, eventID string, err error) {
 	return "", "", "", ErrNotImplemented
 }

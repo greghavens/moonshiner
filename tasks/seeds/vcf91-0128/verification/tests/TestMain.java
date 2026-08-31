@@ -46,28 +46,30 @@ public final class TestMain {
         String token = "token";
         Duration timeout = Duration.ofSeconds(2);
         expectIllegalArgument(() -> new VcenterInventoryClient(
-                URI.create("ftp://example.test"), token, token, token, timeout));
+                URI.create("ftp://example.test"), token, token, token, token, token, timeout));
         expectIllegalArgument(() -> new VcenterInventoryClient(
-                URI.create("http://example.test/api"), token, token, token, timeout));
+                URI.create("http://example.test/api"), token, token, token, token, token, timeout));
         expectIllegalArgument(() -> new VcenterInventoryClient(
-                URI.create("http://user@example.test"), token, token, token, timeout));
+                URI.create("http://user@example.test"), token, token, token, token, token, timeout));
         expectIllegalArgument(() -> new VcenterInventoryClient(
-                URI.create("http://example.test?query=1"), token, token, token, timeout));
+                URI.create("http://example.test?query=1"), token, token, token, token, token, timeout));
         expectIllegalArgument(() -> new VcenterInventoryClient(
-                URI.create("http://example.test"), "bad\nheader", token, token, timeout));
+                URI.create("http://example.test"), "bad\nheader", token, token, token, token, timeout));
         expectIllegalArgument(() -> new VcenterInventoryClient(
-                URI.create("http://example.test"), token, " ", token, timeout));
+                URI.create("http://example.test"), token, " ", token, token, token, timeout));
         expectIllegalArgument(() -> new VcenterInventoryClient(
-                URI.create("http://example.test"), token, token, token, Duration.ZERO));
+                URI.create("http://example.test"), token, token, token, token, token, Duration.ZERO));
     }
 
     private static void validateRefreshResumeAndStableOrdering() throws Exception {
         String suffix = UUID.randomUUID().toString().replace("-", "");
         MockVcenterServer.Fixture fixture = new MockVcenterServer.Fixture(
-                "access-old-" + UUID.randomUUID(),
-                "access-new-" + UUID.randomUUID(),
-                "subject+" + UUID.randomUUID() + "/=",
-                "urn:ietf:params:oauth:token-type:jwt",
+                "0123456789abcdef0123456789abcdef",
+                "fedcba9876543210fedcba9876543210",
+                "PHNhbWwyOkFzc2VydGlvbiBJRD0iX2NvbnRyYWN0X2NvdmVyYWdlXyIvPg==",
+                "SAML2",
+                "vcf91-contract-coverage",
+                "JWT_ID",
                 suffix);
 
         try (MockVcenterServer server = new MockVcenterServer(CONTRACT, fixture)) {
@@ -76,6 +78,8 @@ public final class TestMain {
                     fixture.initialAccessToken(),
                     fixture.subjectToken(),
                     fixture.subjectTokenType(),
+                    fixture.audience(),
+                    fixture.requestedTokenType(),
                     Duration.ofSeconds(3),
                     server.client());
 
@@ -99,42 +103,34 @@ public final class TestMain {
         return new VcenterInventoryClient.Inventory(
                 List.of(
                         new VcenterInventoryClient.VM(
-                                "vm-a-" + suffix,
-                                "alpha",
-                                "POWERED_ON",
-                                null,
-                                null),
+                                "vm-19", "sddcm01", "POWERED_ON", 4L, 16384L),
                         new VcenterInventoryClient.VM(
-                                "vm-m-" + suffix,
-                                "middle \"quoted\"",
-                                "SUSPENDED",
-                                4L,
-                                8192L),
+                                "vm-20", "vc01", "POWERED_ON", 4L, 21504L),
                         new VcenterInventoryClient.VM(
-                                "vm-z-" + suffix,
-                                "zeta",
-                                "POWERED_OFF",
-                                8L,
-                                16384L)),
+                                "vm-28", "nsx01a", "POWERED_ON", 6L, 24576L),
+                        new VcenterInventoryClient.VM(
+                                "vm-33", "vcf-msr01-nxpxf", "POWERED_ON", 4L, 10240L),
+                        new VcenterInventoryClient.VM(
+                                "vm-34", "vcf-msr01-5ghdn", "POWERED_ON", 8L, 24576L),
+                        new VcenterInventoryClient.VM(
+                                "vm-35", "vcf-msr01-x6j88", "POWERED_ON", 8L, 24576L),
+                        new VcenterInventoryClient.VM(
+                                "vm-36", "vcf-msr01-6zpgq", "POWERED_ON", 8L, 24576L),
+                        new VcenterInventoryClient.VM(
+                                "vm-37", "vcf01", "POWERED_ON", 4L, 16384L),
+                        new VcenterInventoryClient.VM(
+                                "vm-38", "vcf-proxy01", "POWERED_ON", 4L, 16384L),
+                        new VcenterInventoryClient.VM(
+                                "vm-39", "vcf-lic01", "POWERED_ON", 2L, 4096L),
+                        new VcenterInventoryClient.VM(
+                                "vm-43", "vcf-asr01-szwjz", "POWERED_ON", 8L, 98304L)),
                 List.of(
                         new VcenterInventoryClient.Host(
-                                "host-a-" + suffix,
-                                "esx-a.example.test",
+                                "host-12",
+                                "esx01.vcf.lab",
                                 "CONNECTED",
-                                null,
-                                null),
-                        new VcenterInventoryClient.Host(
-                                "host-m-" + suffix,
-                                "esx-m.example.test",
-                                "NOT_RESPONDING",
-                                null,
-                                null),
-                        new VcenterInventoryClient.Host(
-                                "host-z-" + suffix,
-                                "esx-z.example.test",
-                                "DISCONNECTED",
-                                "POWERED_OFF",
-                                "uuid-" + suffix)));
+                                "POWERED_ON",
+                                "312680c6-8a28-4302-90c6-319869516823")));
     }
 
     private static void assertImmutable(VcenterInventoryClient.Inventory inventory) {
@@ -244,6 +240,9 @@ public final class TestMain {
                 "token request must send the contract form media type");
         String expectedBody = "grant_type="
                 + formEncode(MockVcenterServer.GRANT_TYPE)
+                + "&audience=" + formEncode(fixture.audience())
+                + "&requested_token_type="
+                + formEncode(fixture.requestedTokenType())
                 + "&subject_token=" + formEncode(fixture.subjectToken())
                 + "&subject_token_type=" + formEncode(fixture.subjectTokenType());
         require(new String(request.body(), StandardCharsets.UTF_8).equals(expectedBody),

@@ -22,8 +22,8 @@ OLD_USER = "svc-vks"
 OLD_PASSWORD = "dummy-old-41f6"
 NEW_USER = "svc-vks"
 NEW_PASSWORD = "dummy-new-92ab"
-OLD_SESSION = "session-old-1f6d4a"
-NEW_SESSION = "session-new-8c0e27"
+OLD_SESSION = "0123456789abcdef0123456789abcdef"
+NEW_SESSION = "fedcba9876543210fedcba9876543210"
 SUPERVISOR = "domain-c8:supervisor-7ca91"
 
 
@@ -174,7 +174,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
             self._send(
                 200,
-                [
+                [] if token == OLD_SESSION else [
                     {
                         "supervisor": SUPERVISOR,
                         "namespace": "payments-dev",
@@ -206,7 +206,19 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path.startswith(prefix) and parsed.path.endswith(suffix):
             supervisor = unquote(parsed.path[len(prefix) : -len(suffix)])
             if supervisor != SUPERVISOR:
-                self._error(404, "Supervisor not found")
+                self._send(
+                    404,
+                    {
+                        "error_type": "NOT_FOUND",
+                        "messages": [
+                            {
+                                "id": "vcenter.wcp.supervisor.notfound",
+                                "default_message": "The Supervisor with identifier supervisor-live-validation-missing was not found.",
+                                "args": ["supervisor-live-validation-missing"],
+                            }
+                        ],
+                    },
+                )
                 return
             with self.server.state_lock:
                 payload = dict(self.server.settings)
@@ -231,7 +243,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         supervisor = unquote(parsed.path[len(prefix) : -len(suffix)])
         if supervisor != SUPERVISOR:
-            self._error(404, "Supervisor not found")
+            self._send(
+                404,
+                {
+                    "error_type": "NOT_FOUND",
+                    "messages": [
+                        {
+                            "id": "vcenter.wcp.supervisor.notfound",
+                            "default_message": "The Supervisor with identifier supervisor-live-validation-missing was not found.",
+                            "args": ["supervisor-live-validation-missing"],
+                        }
+                    ],
+                },
+            )
             return
         if not (request["content_type"] or "").lower().startswith("application/json"):
             self._error(415, "UpdateSpec must use application/json")

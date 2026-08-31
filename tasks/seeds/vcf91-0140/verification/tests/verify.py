@@ -700,11 +700,11 @@ def run_verification() -> None:
     )
 
     nonce = secrets.token_hex(6)
-    namespace = f"team-{nonce}"
+    namespace = "vmsp-platform"
     distractor = f"other-{secrets.token_hex(6)}"
-    session_token = "vc-" + secrets.token_urlsafe(30)
+    session_token = secrets.token_hex(16)
     kubernetes_token = "k8s-" + secrets.token_urlsafe(34)
-    page_size = 137
+    page_size = 200
     markers = [
         "next/one+ =%雪~" + secrets.token_urlsafe(7),
         "next/two?&=+#" + secrets.token_urlsafe(7),
@@ -722,6 +722,22 @@ def run_verification() -> None:
     clusters = [
         make_cluster(namespace, name, marker) for name in names
     ]
+    live_cluster = {
+        "apiVersion": "cluster.x-k8s.io/v1beta2",
+        "kind": "Cluster",
+        "metadata": {
+            "name": "vcf-msr01",
+            "namespace": namespace,
+            "uid": "fcccd77e-e4fa-4ab8-a6a2-4dadf2b34212",
+        },
+        "spec": {
+            "topology": {
+                "classRef": {"name": "vsphere-9.1.2668"},
+                "version": "v1.34.2",
+            }
+        },
+        "status": {"phase": "Provisioned"},
+    }
     pages = [
         [clusters[0], clusters[3], clusters[1]],
         [clusters[6], clusters[2]],
@@ -758,9 +774,10 @@ def run_verification() -> None:
                     "page_size": page_size,
                     "markers": markers,
                     "pages": pages,
+                    "live_cluster": live_cluster,
                     "resource_version": secrets.token_hex(12),
                     "fault": "wrong_item_namespace",
-                    "fault_collection": 2,
+                    "fault_collection": 3,
                 },
                 ensure_ascii=False,
             ),
@@ -808,6 +825,44 @@ def run_verification() -> None:
                 session_token,
                 kubernetes_token,
             )
+
+            try:
+                client.list_clusters(namespace, page_size=page_size)
+            except ProtocolError as exc:
+                require(
+                    exc.operation_id == DISCOVERY_OPERATION,
+                    "live blank namespace used the wrong operation",
+                )
+            else:
+                raise VerificationError(
+                    "live blank namespace summary unexpectedly succeeded"
+                )
+            primary_discovery = read_requests(log_path)
+            require(
+                len(primary_discovery) == 1
+                and primary_discovery[0]["operation"] == DISCOVERY_OPERATION,
+                "live blank namespace did not stop before Kubernetes",
+            )
+
+            live_result = client.list_clusters(
+                namespace,
+                page_size=page_size,
+            )
+            require(
+                live_result == [live_cluster],
+                "live one-page VKS inventory shape changed",
+            )
+            primary_requests = read_requests(log_path)[1:]
+            require(
+                len(primary_requests) == 2
+                and primary_requests[1]["raw_target"]
+                == (
+                    "/apis/cluster.x-k8s.io/v1beta2/namespaces/"
+                    "vmsp-platform/clusters?limit=200"
+                ),
+                "live one-page Kubernetes request changed",
+            )
+            log_path.write_text("", encoding="utf-8")
 
             first = client.list_clusters(
                 namespace,

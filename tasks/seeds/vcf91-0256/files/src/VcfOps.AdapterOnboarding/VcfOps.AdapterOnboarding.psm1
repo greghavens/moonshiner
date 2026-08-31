@@ -6,8 +6,8 @@ Set-StrictMode -Version Latest
 
 .DESCRIPTION
     Runs the `testConnection` precheck first and only issues the mutating
-    `createAdapterInstance` call when the precheck succeeds, so a failed precheck
-    leaves the target unchanged.
+    `createAdapterInstance` call when the precheck succeeds. A failed precheck
+    leaves no adapter instance, although it may persist a newly supplied credential.
 
     Implement this function using the VMware.Sdk.Vcf.Ops cmdlets supplied by the
     environment. Do not hand-roll HTTP requests and do not vendor the SDK.
@@ -36,6 +36,18 @@ function Register-VcfOpsAdapterInstance {
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
         [string] $AdapterKindKey,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $AdapterCredentialName,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $AdapterCredentialKindKey,
+
+        [string] $AdapterCredentialId,
+
+        [System.Collections.Specialized.OrderedDictionary] $AdapterCredentialField,
 
         [ValidateSet('http', 'https')]
         [string] $Protocol = 'https',

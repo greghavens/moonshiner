@@ -103,15 +103,17 @@ type Server struct {
 }
 
 type tokenState struct {
-	value  string
-	served int
-	limit  int
+	value    string
+	served   int
+	limit    int
+	released bool
 }
 
 // handlers is the set of operationIds this mock knows how to serve. A contract
 // that names anything else is a contract error.
 var handlers = map[string]func(*Server, http.ResponseWriter, *http.Request, *Request, Operation){
 	"acquireToken":           (*Server).handleAcquireToken,
+	"releaseToken":           (*Server).handleReleaseToken,
 	"getResources":           (*Server).handleGetResources,
 	"addResourcesProperties": (*Server).handleAddResourcesProperties,
 }
@@ -287,6 +289,9 @@ func (s *Server) consumeToken(value string) bool {
 		if tok.value != value {
 			continue
 		}
+		if tok.released {
+			return false
+		}
 		if tok.limit > 0 && tok.served >= tok.limit {
 			return false
 		}
@@ -335,6 +340,23 @@ func (s *Server) handleAcquireToken(w http.ResponseWriter, r *http.Request, entr
 		"expiresAt": "Thursday, January 1, 2026 06:00:00 AM UTC",
 		"roles":     []string{"ContentAdmin"},
 	})
+}
+
+func (s *Server) handleReleaseToken(w http.ResponseWriter, r *http.Request, entry *Request, op Operation) {
+	if len(entry.Body) != 0 || r.Header.Get("Content-Type") != "" {
+		s.finish(w, entry, http.StatusBadRequest, nil)
+		return
+	}
+
+	s.mu.Lock()
+	for _, tok := range s.tokens {
+		if tok.value == entry.Token {
+			tok.released = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	s.finish(w, entry, op.SuccessStatus, nil)
 }
 
 func (s *Server) handleGetResources(w http.ResponseWriter, r *http.Request, entry *Request, op Operation) {

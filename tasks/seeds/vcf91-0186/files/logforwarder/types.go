@@ -1,5 +1,4 @@
-// Package logforwarder implements the focused VCF Operations Log Management
-// contract recorded in docs/contract.json.
+// Package logforwarder implements focused VCF Operations Log Management calls.
 package logforwarder
 
 import (

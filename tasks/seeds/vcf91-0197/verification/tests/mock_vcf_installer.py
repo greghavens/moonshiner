@@ -136,7 +136,7 @@ class Handler(BaseHTTPRequestHandler):
             self._not_found()
             return
         self._json(
-            201,
+            200,
             {
                 "accessToken": "loopback-access-token",
                 "refreshToken": {"id": "loopback-refresh-token"},
@@ -181,6 +181,18 @@ class Handler(BaseHTTPRequestHandler):
         path, query = self._record(body)
         if query:
             self._not_found()
+            return
+        if path == "/v1/sddc-manager":
+            self._json(
+                200,
+                {
+                    "domain": {"id": "074533e9-e871-4ba1-93b2-d65bfd7d7a86"},
+                    "basicAuthDetails": {"status": "ENABLED", "username": "admin"},
+                    "id": "79796231-499a-48d8-a697-3b532269b7ab",
+                    "fqdn": "sddcm01.vcf.lab",
+                    "version": "9.1.0.0400.25570100",
+                },
+            )
             return
         if path == "/v1/system/appliance-info":
             self._json(

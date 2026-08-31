@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -286,12 +287,17 @@ func (s *Server) Close() {
 	_ = s.httpServer.Close()
 }
 
-// ServeHTTP exposes exactly getNetworkPool and createNetworkPool.
+// ServeHTTP exposes exactly the three focused network-pool operations.
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	body, _ := io.ReadAll(io.LimitReader(request.Body, (1<<20)+1))
+	if request.Method == http.MethodGet &&
+		strings.HasPrefix(request.URL.Path, "/v1/network-pools/") &&
+		strings.HasSuffix(request.URL.Path, "/networks") {
+		s.serveNetworks(writer, request, body)
+		return
+	}
 	if request.URL.Path != "/v1/network-pools" ||
-		(request.Method != http.MethodGet &&
-			request.Method != http.MethodPost) {
+		(request.Method != http.MethodGet && request.Method != http.MethodPost) {
 		s.record(request, body, false)
 		http.NotFound(writer, request)
 		return
@@ -343,15 +349,15 @@ func (s *Server) serveList(
 	}
 
 	pools := s.snapshotPools(reversed)
-	totalPages := 1
-	if len(pools) == 0 {
-		totalPages = 0
+	for index := range pools {
+		for networkIndex := range pools[index].Networks {
+			pools[index].Networks[networkIndex] = Network{
+				ID: pools[index].Networks[networkIndex].ID,
+			}
+		}
 	}
 	metadata := pageMetadata{
-		PageNumber:    0,
-		PageSize:      len(pools),
 		TotalElements: len(pools),
-		TotalPages:    totalPages,
 	}
 	if s.mode == ModeBadMetadata {
 		metadata.TotalElements++
@@ -365,6 +371,51 @@ func (s *Server) serveList(
 	if s.mode == ModeTrailingList {
 		_, _ = io.WriteString(writer, "{}\n")
 	}
+}
+
+func (s *Server) serveNetworks(
+	writer http.ResponseWriter,
+	request *http.Request,
+	body []byte,
+) {
+	s.record(request, body, false)
+	if !s.validHeaders(request, false) ||
+		request.URL.RawQuery != "" ||
+		len(body) != 0 ||
+		len(request.TransferEncoding) != 0 {
+		s.writeAPIError(writer, http.StatusBadRequest)
+		return
+	}
+	rawID := strings.TrimSuffix(
+		strings.TrimPrefix(request.URL.EscapedPath(), "/v1/network-pools/"),
+		"/networks",
+	)
+	id, err := url.PathUnescape(rawID)
+	if err != nil || id == "" {
+		s.writeAPIError(writer, http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	var networks []Network
+	for _, pool := range s.pools {
+		if pool.ID == id {
+			networks = clonePools([]NetworkPool{pool})[0].Networks
+			break
+		}
+	}
+	s.mu.Unlock()
+	if networks == nil {
+		s.writeAPIError(writer, http.StatusNotFound)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	writer.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(writer).Encode(networkPage{
+		Elements: networks,
+		PageMetadata: pageMetadata{
+			TotalElements: len(networks),
+		},
+	})
 }
 
 func (s *Server) serveCreate(
@@ -420,7 +471,16 @@ func (s *Server) serveCreate(
 
 	writer.Header().Set("Content-Type", "application/json")
 	writer.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(writer).Encode(created)
+	shallow := NetworkPool{
+		ID:         created.ID,
+		Name:       created.Name,
+		HostsCount: created.HostsCount,
+		Networks:   make([]Network, len(created.Networks)),
+	}
+	for index, network := range created.Networks {
+		shallow.Networks[index].ID = network.ID
+	}
+	_ = json.NewEncoder(writer).Encode(shallow)
 	if s.mode == ModeTrailingCreate {
 		_, _ = io.WriteString(writer, "{}\n")
 	}
@@ -442,15 +502,20 @@ func (s *Server) validHeaders(
 }
 
 type pageMetadata struct {
-	PageNumber    int `json:"pageNumber"`
-	PageSize      int `json:"pageSize"`
+	PageNumber    int `json:"pageNumber,omitempty"`
+	PageSize      int `json:"pageSize,omitempty"`
 	TotalElements int `json:"totalElements"`
-	TotalPages    int `json:"totalPages"`
+	TotalPages    int `json:"totalPages,omitempty"`
 }
 
 type networkPoolPage struct {
 	Elements     []NetworkPool `json:"elements"`
 	PageMetadata pageMetadata  `json:"pageMetadata"`
+}
+
+type networkPage struct {
+	Elements     []Network   `json:"elements"`
+	PageMetadata pageMetadata `json:"pageMetadata"`
 }
 
 func (s *Server) nextReversal() bool {
@@ -637,18 +702,19 @@ func validateContract(path string) error {
 	if err := json.Unmarshal(content, &contract); err != nil {
 		return fmt.Errorf("decode contract: %w", err)
 	}
-	if len(contract.Operations) != 2 {
-		return errors.New("contract fixture requires exactly two operations")
+	if len(contract.Operations) != 3 {
+		return errors.New("contract fixture requires exactly three operations")
 	}
-	want := map[string]string{
-		"getNetworkPool":    http.MethodGet,
-		"createNetworkPool": http.MethodPost,
+	want := map[string][2]string{
+		"getNetworkPool":            {http.MethodGet, "/v1/network-pools"},
+		"createNetworkPool":         {http.MethodPost, "/v1/network-pools"},
+		"getNetworksOfNetworkPool": {http.MethodGet, "/v1/network-pools/{id}/networks"},
 	}
 	for _, operation := range contract.Operations {
-		method, ok := want[operation.OperationID]
+		expected, ok := want[operation.OperationID]
 		if !ok ||
-			operation.Method != method ||
-			operation.Path != "/v1/network-pools" {
+			operation.Method != expected[0] ||
+			operation.Path != expected[1] {
 			return errors.New("contract fixture has an unexpected operation")
 		}
 		delete(want, operation.OperationID)

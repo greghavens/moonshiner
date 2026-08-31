@@ -22,7 +22,6 @@ is created for that vCenter.**
 | `src/vcfon_vcenter/client.py` | Three body builders and one method per contract operation. **To implement.** |
 | `src/vcfon_vcenter/onboarding.py` | `onboard_vcenters`. **To implement.** |
 | `fixtures/*.json` | Example plans. |
-| `tests/mock_appliance.py` | Loopback mock appliance pinned to `docs/contract.json`, with a JSONL request log. |
 | `tests/verify.py` | The verifier. `python3 tests/verify.py` |
 
 ## Operations used
@@ -133,9 +132,3 @@ omit-when-unset discipline as the wire:
 ```
 python3 tests/verify.py
 ```
-
-The verifier starts the loopback mock on `127.0.0.1`, runs three plans through
-it, and checks both the returned report and the recorded request log. The mock
-builds its routes and its accepted property sets out of `docs/contract.json`, so
-it serves only the four contract operations and rejects any property that belongs
-to a neighbouring schema. It contacts no live VMware endpoint.

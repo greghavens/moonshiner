@@ -178,7 +178,13 @@ def run_case(
         combined_error = "\n".join(part for part in (result.stdout, result.stderr) if part)
         if expect_failure:
             require(result.returncode != 0, "terminal failure case unexpectedly succeeded")
-            require("Failed" in combined_error, "terminal phase missing from thrown error")
+            if scenario == "cluster_failed":
+                require("Failed" in combined_error, "terminal phase missing from thrown error")
+            elif scenario == "no_supervisor":
+                require(
+                    "404" in combined_error,
+                    "live no-Supervisor failure did not preserve the HTTP 404",
+                )
             return records, None, combined_error
 
         require(
@@ -272,7 +278,7 @@ def assert_headers(record: dict[str, Any], plane: str, has_body: bool) -> None:
         require(record["body"] is None and record["body_bytes"] == 0, "GET sent a body")
     if plane == "vcenter":
         require(
-            headers.get("vmware-api-session-id") == "vc-session-token",
+            headers.get("vmware-api-session-id") == "0123456789abcdef0123456789abcdef",
             "vCenter session header missing",
         )
         require("authorization" not in headers, "Kubernetes token leaked to vCenter")
@@ -367,8 +373,8 @@ def base_config() -> dict[str, Any]:
         "namespace": "payments",
         "storage_policy": "gold-storage",
         "cluster_name": "payments-vks",
-        "kubernetes_version": "v1.32.0+vmware.6-vkr.2",
-        "cluster_class": "builtin-generic-v3.5.0",
+        "kubernetes_version": "v1.34.2",
+        "cluster_class": "vsphere-9.1.2668",
         "vm_class": "best-effort-medium",
         "control_plane_replicas": 3,
         "worker_replicas": 2,
@@ -381,6 +387,13 @@ def main() -> int:
     try:
         contract = validate_contract()
         validate_prerequisite()
+
+        live_gap_config = base_config()
+        records, _, _ = run_case(contract, live_gap_config, "no_supervisor", True)
+        require(len(records) == 1, "live no-Supervisor case crossed the failed vCenter boundary")
+        require(records[0]["method"] == "POST", "live no-Supervisor case did not attempt namespace creation")
+        require(records[0]["body"] == expected_namespace_body(live_gap_config), "live no-Supervisor request body differs")
+        assert_headers(records[0], "vcenter", True)
 
         unset_config = base_config()
         records, result, _ = run_case(contract, unset_config, "ready", False)

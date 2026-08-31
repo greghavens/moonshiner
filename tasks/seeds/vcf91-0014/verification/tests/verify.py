@@ -21,7 +21,7 @@ CONTRACT_PATH = ROOT / "docs" / "contract.json"
 SOURCES_PATH = ROOT / "docs" / "official_sources.json"
 MOCK_PATH = Path(__file__).with_name("mock_sddc_manager.py")
 EXPECTED_CONTRACT_SHA256 = (
-    "1710a6e94c65b1ef11db166e823f851d30d7a716d26831ef4c6e3e140533ca91"
+    "b836b605d05a9b92cde6814e512f8c2f54c833e9ff5c8c453fed3bb4c64cabc7"
 )
 EXPECTED_SOURCE_SHA = "c3f3b52c845dd967cabbc21680e893292077d5ba"
 EXPECTED_SPEC_PATH = (
@@ -306,7 +306,7 @@ def verify_wire(requests: list[dict[str, object]]) -> None:
             "authorization": None,
             "contentType": "application/json",
             "body": '{"username":"svc-inventory","password":"fixture-password"}',
-            "responseStatus": 201,
+            "responseStatus": 200,
         },
         {
             "operationId": "getDomains",

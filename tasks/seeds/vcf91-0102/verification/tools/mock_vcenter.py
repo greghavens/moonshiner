@@ -17,7 +17,13 @@ from urllib.parse import quote, urlsplit
 OPERATION_ID = "Vcenter.Vm.Hardware.Cpu_update"
 SPEC_PATH = "/vcenter/vm/{vm}/hardware/cpu"
 METHOD = "PATCH"
-BEHAVIORS = {"disconnect_once", "disconnect_always", "http_error"}
+BEHAVIORS = {
+    "disconnect_once",
+    "disconnect_always",
+    "http_400",
+    "http_401",
+    "http_404",
+}
 
 
 def load_object(path: Path) -> dict:
@@ -263,18 +269,49 @@ def main() -> int:
                         "error_type": "INVALID_ARGUMENT",
                         "messages": [],
                     }
-                elif behavior == "http_error":
-                    status = 503
+                elif behavior == "http_400":
+                    status = 400
                     response = {
-                        "error_type": "SERVICE_UNAVAILABLE",
+                        "error_type": "INVALID_ARGUMENT",
                         "messages": [
                             {
                                 "args": [],
                                 "default_message": error_secret,
-                                "id": (
-                                    "com.vmware.vapi.std.errors."
-                                    "service_unavailable"
-                                ),
+                                "id": "com.vmware.api.vcenter.vm.hardware.cpu.invalid_num_cpu",
+                            },
+                            {
+                                "args": [],
+                                "default_message": "Invalid argument.",
+                                "id": "vmsg.InvalidArgument.summary",
+                            },
+                        ],
+                    }
+                elif behavior == "http_401":
+                    status = 401
+                    response = {
+                        "error_type": "UNAUTHENTICATED",
+                        "messages": [
+                            {
+                                "args": [],
+                                "default_message": error_secret,
+                                "id": "com.vmware.api.vcenter.unauthenticated",
+                            }
+                        ],
+                    }
+                elif behavior == "http_404":
+                    status = 404
+                    response = {
+                        "error_type": "NOT_FOUND",
+                        "messages": [
+                            {
+                                "args": [vm],
+                                "default_message": error_secret,
+                                "id": "com.vmware.api.vcenter.vm.not_found",
+                            },
+                            {
+                                "args": [],
+                                "default_message": "The object was not found.",
+                                "id": "vmsg.ManagedObjectNotFound.summary",
                             }
                         ],
                     }

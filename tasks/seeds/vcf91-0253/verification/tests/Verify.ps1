@@ -20,7 +20,7 @@
                    supplied. Three pages, one repeat, and a pageInfo.totalCount
                    that over-reports.
 
-      boundary  -- an empty terminal collection with a two-value Name filter,
+      boundary  -- an empty terminal collection with a single Name filter,
                    CreatedAfter 0, and explicitly bound empty property filters.
 
     Exits 0 when every assertion holds, 1 otherwise.
@@ -123,11 +123,11 @@ $expected = @{
         DuplicatesDropped  = 0
         ReportedTotalCount = 0
         Token              = 'ops-token-boundary-71c5e2'
-        QueryPrefix        = 'name=zero%7Cname&name=zero_name&recentlyAdded=0&propertyName=&propertyValue=&'
+        QueryPrefix        = 'name=zero%7Cname&recentlyAdded=0&propertyName=&propertyValue=&'
         SuppliedQueryNames = @('name', 'recentlyAdded', 'propertyName', 'propertyValue')
         AllowedEmptyNames  = @('propertyName', 'propertyValue')
         Arguments          = @{
-            Name                   = 'zero|name,zero_name'
+            Name                   = 'zero|name'
             CreatedAfter           = 0
             BindEmptyStringFilters = $true
         }
@@ -294,6 +294,41 @@ try {
                 -Detail ("sent but never supplied by the caller: " + ($unset -join ', '))
         }
     }
+
+    Write-Host ''
+    Write-Host 'Scenario: multiple names rejected' -ForegroundColor Cyan
+    $logPath = Join-Path $workDir 'multiple-names.requests.jsonl'
+    $boundaryPath = Join-Path $workDir 'multiple-names.boundary'
+    $resultPath = Join-Path $workDir 'multiple-names.result.json'
+    $stdoutPath = Join-Path $workDir 'multiple-names.stdout'
+    $stderrPath = Join-Path $workDir 'multiple-names.stderr'
+    $mock = Start-VcfOpsMock `
+        -FixturePath (Join-Path $repoRoot 'tools/mock/fixtures/scenario-boundary.json') `
+        -LogPath $logPath
+    try {
+        $arguments = @(
+            '-NoProfile', '-File', (Join-Path $repoRoot 'tests/harness/Invoke-InventoryRun.ps1'),
+            '-Port', $mock.Port,
+            '-ModulePath', $modulePath,
+            '-LogPath', $logPath,
+            '-BoundaryPath', $boundaryPath,
+            '-ResultPath', $resultPath,
+            '-PageSize', 3,
+            '-Name', 'zero|name,zero_name'
+        )
+        $process = Start-Process -FilePath $pwshPath -ArgumentList $arguments -PassThru -NoNewWindow `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        $null = $process.WaitForExit(240000)
+        Assert-That -What 'multiple names are rejected' -Condition ($process.ExitCode -ne 0) `
+            -Detail 'the call unexpectedly succeeded'
+    }
+    finally {
+        Stop-VcfOpsMock -Mock $mock
+    }
+    $multipleNameRequests = Get-VcfOpsMockRequests -LogPath $logPath
+    $getResourcesRequests = @($multipleNameRequests | Where-Object { $_.served -eq 'getResources' })
+    Assert-Equal -What 'multiple-name rejection issues no getResources request' `
+        -Expected 0 -Actual $getResourcesRequests.Count
 }
 finally {
     Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue

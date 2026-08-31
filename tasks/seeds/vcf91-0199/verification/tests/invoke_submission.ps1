@@ -60,6 +60,17 @@ try {
         throw 'The default page-size call did not return the complete collection.'
     }
 
+    $emptyTasks = @(
+        Get-VcfInstallerTaskInventory `
+            -Server $connection `
+            -PageSize 3 `
+            -TaskName 'MOONSHINER_EMPTY' `
+            -ErrorAction Stop
+    )
+    if ($emptyTasks.Count -ne 0) {
+        throw 'The live empty-collection shape did not return an empty inventory.'
+    }
+
     foreach ($invalidPageSize in @(0, 101)) {
         $rejected = $false
         try {
@@ -113,6 +124,6 @@ try {
 }
 finally {
     if ($null -ne $connection) {
-        Disconnect-VcfInstallerServer -Server $connection -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+        Disconnect-VcfInstallerServer -Server $connection -ErrorAction SilentlyContinue | Out-Null
     }
 }

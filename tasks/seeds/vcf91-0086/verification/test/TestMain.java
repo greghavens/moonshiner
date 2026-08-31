@@ -19,9 +19,9 @@ public final class TestMain {
                 "s3cret");
 
         NsxPolicyClient.DiagnosticReport report =
-                client.diagnoseConnectivityFailure("tf incident/42");
+                client.diagnoseConnectivityFailure("tf-incident-42");
 
-        check(report.traceflowId().equals("tf incident/42"), "traceflow id was not preserved");
+        check(report.traceflowId().equals("tf-incident-42"), "traceflow id was not preserved");
 
         List<NsxPolicyClient.AlarmEvidence> alarms = report.errorAlarms();
         check(alarms.size() == 2, "expected exactly the two ERROR alarms");
@@ -68,6 +68,14 @@ public final class TestMain {
             immutable = true;
         }
         check(immutable, "diagnostic evidence lists must be immutable snapshots");
+
+        boolean encodedSlashRejected = false;
+        try {
+            client.diagnoseConnectivityFailure("tf-incident/42");
+        } catch (java.io.IOException expected) {
+            encodedSlashRejected = expected.getMessage().contains("HTTP 400");
+        }
+        check(encodedSlashRejected, "encoded-slash traceflow ID was not rejected like live NSX");
 
         System.out.println("TEST_MAIN_OK");
     }

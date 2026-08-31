@@ -45,6 +45,23 @@ try {
         $Handler
     )
 
+    $LiveGapError = $null
+    try {
+        $null = Get-VcfVksFailureDiagnosis `
+            -NamespaceApi $Api `
+            -Namespace $Config.namespace `
+            -ClusterName $Config.cluster_name `
+            -KubernetesToken $Config.kubernetes_bearer_token `
+            -ControllerNamespace $Config.controller_namespace `
+            -KubernetesScheme http
+    }
+    catch {
+        $LiveGapError = $_
+    }
+    if ($null -eq $LiveGapError) {
+        throw 'The exact live blank namespace summary unexpectedly succeeded.'
+    }
+
     $Result = Get-VcfVksFailureDiagnosis `
         -NamespaceApi $Api `
         -Namespace $Config.namespace `

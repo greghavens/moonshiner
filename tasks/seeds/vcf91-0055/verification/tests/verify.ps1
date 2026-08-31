@@ -376,6 +376,8 @@ try {
     $LogPath = Join-Path $TempRoot 'requests.jsonl'
     $ScenarioPath = Join-Path $TempRoot 'scenario.json'
     $ReleasePath = Join-Path $TempRoot 'release-old-request'
+    $CutoverPath = Join-Path $TempRoot 'server-credential-cutover'
+    $CutoverEvidencePath = Join-Path $TempRoot 'cutover-evidence.json'
     $StdoutPath = Join-Path $TempRoot 'mock.stdout'
     $StderrPath = Join-Path $TempRoot 'mock.stderr'
     $Scenario = [ordered]@{
@@ -402,7 +404,8 @@ try {
         $LogPath,
         $ContractPath,
         $ScenarioPath,
-        $ReleasePath
+        $ReleasePath,
+        $CutoverPath
     ) -PassThru -RedirectStandardOutput $StdoutPath `
       -RedirectStandardError $StderrPath
     Wait-Until -Message 'loopback mock startup' -Condition {
@@ -429,6 +432,28 @@ try {
         $IndependentGate.Lock
     )) 'new gates have independent synchronization'
 
+    $CutoverAction = {
+        $Evidence = [ordered]@{
+            writeLockHeld = $Gate.Lock.IsWriteLockHeld
+            currentClientIsOld = [object]::ReferenceEquals(
+                $Gate.PolicyApi,
+                $OldBundle.Api
+            )
+            activeReaders = $Gate.Lock.CurrentReadCount
+        }
+        [System.IO.File]::WriteAllText(
+            $CutoverEvidencePath,
+            ($Evidence | ConvertTo-Json -Compress),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        [System.IO.File]::WriteAllText(
+            $CutoverPath,
+            'new credential active',
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        return $NewBundle.Api
+    }.GetNewClosure()
+
     $OldCall = Start-ModuleCall `
         -CommandName 'Get-VcfNsxGroupPage' `
         -Parameters @{
@@ -445,7 +470,7 @@ try {
         -CommandName 'Set-VcfNsxCredential' `
         -Parameters @{
             Gate = $Gate
-            PolicyApi = $NewBundle.Api
+            Cutover = $CutoverAction
         }
     Wait-Until -Message 'credential cutover waits for old request' -Condition {
         $Gate.Lock.WaitingWriteCount -eq 1
@@ -456,6 +481,8 @@ try {
         $Gate.PolicyApi,
         $OldBundle.Api
     )) 'old client remains published while its request is active'
+    Assert-True (-not (Test-Path -LiteralPath $CutoverPath)) `
+        'server credential has not rotated before old requests drain'
 
     $NewCall = Start-ModuleCall `
         -CommandName 'Get-VcfNsxGroupPage' `
@@ -517,6 +544,16 @@ try {
         $Gate.PolicyApi,
         $NewBundle.Api
     )) 'new client is atomically published after the drain'
+    Assert-True (Test-Path -LiteralPath $CutoverPath) `
+        'exclusive action performed the server-side credential rotation'
+    $CutoverEvidence = Get-Content -Raw -LiteralPath `
+        $CutoverEvidencePath | ConvertFrom-Json
+    Assert-True ($CutoverEvidence.writeLockHeld -eq $true) `
+        'server rotation executes while the exclusive lock is held'
+    Assert-True ($CutoverEvidence.currentClientIsOld -eq $true) `
+        'new client is not published before the server rotation action'
+    Assert-Equal $CutoverEvidence.activeReaders 0 `
+        'server rotation executes only after old readers drain'
 
     $Entries = @(Get-RequestEntries -Path $LogPath)
     Assert-Equal $Entries.Count 2 `

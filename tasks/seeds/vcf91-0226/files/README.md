@@ -174,28 +174,7 @@ string literals in the client.
 
 ---
 
-## 3. Local mock service
-
-`tests/lcm_mock_server.py` is a loopback-only HTTP service pinned to your
-contract: it reads `docs/contract.json`, builds its routing table from the
-operations named there, and serves **nothing else**. If the contract names an
-operation it does not implement, or omits a required one, it refuses to start.
-
-Run it by hand while developing:
-
-```sh
-python3 tests/lcm_mock_server.py --contract docs/contract.json --log /tmp/req.jsonl
-```
-
-It prints one line, `READY <base-url> <token>`, then serves on `127.0.0.1` on an
-ephemeral port. Every request is appended to the log file as one JSON object per
-line, including the full header list, so the exact wire shape is inspectable.
-
-The mock contacts no VMware endpoint, and neither does the test suite.
-
----
-
-## 4. Verify
+## 3. Verify
 
 ```sh
 python3 -B tests/verify.py

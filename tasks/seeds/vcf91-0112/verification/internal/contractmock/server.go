@@ -123,7 +123,7 @@ func Start(
 		t.Fatalf("unexpected protected operation: base=%q op=%#v", c.BasePath, op)
 	}
 	if scenario.LibraryID == "" {
-		scenario.LibraryID = "library-1"
+		scenario.LibraryID = "92e84cd2-3ad7-4dd5-9745-83360a89c4bf"
 	}
 	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
 		t.Fatalf("create request log: %v", err)
@@ -289,12 +289,20 @@ func apply(
 func writeError(w http.ResponseWriter, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
+	errorType := "INVALID_ARGUMENT"
+	messageID := "com.vmware.vdcs.cls-main.multiple_storage_backings_unsupported"
+	defaultMessage := "Multiple storage backings are not supported."
+	if status != http.StatusBadRequest {
+		errorType = strings.ToUpper(strings.ReplaceAll(http.StatusText(status), " ", "_"))
+		messageID = "contract.error.coverage"
+		defaultMessage = http.StatusText(status)
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error_type": "INVALID_ARGUMENT",
+		"error_type": errorType,
 		"messages": []map[string]any{
 			{
-				"id":              "contractmock.private",
-				"default_message": "fixture response body must remain private",
+				"id":              messageID,
+				"default_message": defaultMessage,
 				"args":            []string{},
 			},
 		},

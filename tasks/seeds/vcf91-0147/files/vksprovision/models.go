@@ -29,6 +29,12 @@ type Config struct {
 	MaxPolls        int
 }
 
+// TopologyVariable is one ordered ClusterClass variable.
+type TopologyVariable struct {
+	Name  string
+	Value any
+}
+
 // ProvisionRequest is the supported projection of the vCenter namespace
 // CreateSpecV2 and a topology-managed VKS Cluster.
 type ProvisionRequest struct {
@@ -38,9 +44,10 @@ type ProvisionRequest struct {
 	ClusterName          string
 	ClusterClass         string
 	KubernetesVersion    string
-	VMClass              string
-	StorageClass         string
+	TopologyVariables    []TopologyVariable
 	ControlPlaneReplicas int32
+	WorkerClass          string
+	WorkerName           string
 	WorkerReplicas       *int32
 	PodCIDRs             []string
 	ServiceCIDRs         []string

@@ -227,7 +227,7 @@ def verify_contract() -> dict[str, Any]:
         == [
             {
                 "name": "labelSelector",
-                "value": "app.kubernetes.io/name=vks-cluster-controller",
+                "value": "cluster.x-k8s.io/provider=cluster-api,control-plane=controller-manager",
                 "position": 1,
             }
         ],
@@ -244,7 +244,7 @@ def verify_contract() -> dict[str, Any]:
     )
     require(
         kop[3]["responseContentType"] == "text/plain"
-        and kop[3]["responseFormat"] == "newline-delimited JSON",
+        and kop[3]["responseFormat"] == "klog text",
         "Pod log response contract changed",
     )
     require(
@@ -412,9 +412,9 @@ def verify_report(report: dict[str, Any], config: dict[str, str]) -> None:
             "Phase",
             "EventReason",
             "ControllerPod",
-            "CorrelationId",
+            "ReconcileId",
             "Diagnosis",
-            "MissingStorageClass",
+            "ControllerMessage",
         ],
         "result property order or shape changed",
     )
@@ -429,7 +429,7 @@ def verify_report(report: dict[str, Any], config: dict[str, str]) -> None:
     )
     require(report["Phase"] == "Provisioning", "phase result mismatch")
     require(
-        report["EventReason"] == "ReconcileError",
+        report["EventReason"] == "ReconcileFailed",
         "event reason result mismatch",
     )
     require(
@@ -437,16 +437,16 @@ def verify_report(report: dict[str, Any], config: dict[str, str]) -> None:
         "controller pod was not discovered",
     )
     require(
-        report["CorrelationId"] == config["correlation_id"],
+        report["ReconcileId"] == config["reconcile_id"],
         "Event and log correlation was not preserved",
     )
     require(
-        report["Diagnosis"] == "StorageClassNotFound",
+        report["Diagnosis"] == "TopologyReconcileFailed",
         "correlated log cause mismatch",
     )
     require(
-        report["MissingStorageClass"] == config["missing_storage_class"],
-        "storage class was not extracted from the correlated log",
+        report["ControllerMessage"] == config["controller_message"],
+        "controller error was not extracted from the correlated klog line",
     )
     rendered = json.dumps(report, separators=(",", ":"))
     require(
@@ -459,7 +459,15 @@ def verify_report(report: dict[str, Any], config: dict[str, str]) -> None:
 def verify_requests(
     records: list[dict[str, Any]], config: dict[str, str]
 ) -> None:
-    require(len(records) == 5, "expected exactly five requests")
+    require(len(records) == 6, "expected one live-gap discovery and five diagnostic requests")
+    live_gap = records[0]
+    require(
+        live_gap["operation"] == "namespace.listAuthorized"
+        and live_gap["method"] == "GET"
+        and live_gap["raw_target"] == "/api/vcenter/namespaces-user/namespaces",
+        "live blank-summary case did not use exact namespace discovery",
+    )
+    records = records[1:]
     require(
         [item["operation"] for item in records]
         == ["namespace.listAuthorized", *KUBERNETES_NAMES],
@@ -493,7 +501,7 @@ def verify_requests(
         (
             f"/api/v1/namespaces/{controller_ns}/pods?labelSelector="
             + quote(
-                "app.kubernetes.io/name=vks-cluster-controller",
+                "cluster.x-k8s.io/provider=cluster-api,control-plane=controller-manager",
                 safe="",
             )
         ),
@@ -636,9 +644,8 @@ def invoke_case(
     for sensitive in (
         config["kubernetes_bearer_token"],
         config["vcenter_session_id"],
-        config["decoy_correlation_id"],
-        "NetworkUnavailable",
-        "wrong-" + config["suffix"],
+        config["decoy_reconcile_id"],
+        "decoy",
     ):
         require(sensitive not in combined, "sensitive or raw log content leaked")
     require(output_path.exists(), "PowerShell did not write a result")
@@ -654,16 +661,17 @@ def main() -> int:
             suffix = secrets.token_hex(6)
             config = {
                 "suffix": suffix,
-                "namespace": "team-" + suffix,
-                "cluster_name": "orders-" + suffix,
-                "controller_namespace": "vks-system-" + suffix,
-                "controller_pod": "vks-cluster-controller-" + suffix,
-                "cluster_uid": str(uuid.uuid4()),
+                "namespace": "vmsp-platform",
+                "cluster_name": "vcf-msr01",
+                "controller_namespace": "capi-system",
+                "controller_pod": "capi-controller-manager-a",
+                "second_controller_pod": "capi-controller-manager-b",
+                "cluster_uid": "fcccd77e-e4fa-4ab8-a6a2-4dadf2b34212",
                 "resource_version": str(secrets.randbelow(8_000_000) + 1_000_000),
-                "correlation_id": "corr-" + secrets.token_hex(12),
-                "decoy_correlation_id": "corr-" + secrets.token_hex(12),
-                "missing_storage_class": "gold-" + secrets.token_hex(8),
-                "vcenter_session_id": "vc-" + secrets.token_urlsafe(24),
+                "reconcile_id": "reconcile-" + secrets.token_hex(12),
+                "decoy_reconcile_id": "reconcile-" + secrets.token_hex(12),
+                "controller_message": "topology reconciliation failed",
+                "vcenter_session_id": secrets.token_hex(16),
                 "kubernetes_bearer_token": "k8s-" + secrets.token_urlsafe(28),
             }
             config_path = temp / "config.json"

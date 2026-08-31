@@ -36,6 +36,7 @@ SOURCES_PATH = ROOT / "docs" / "official_sources.json"
 EXPECTED_SHA = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
 EXPECTED_BLOB = "8028b0824c4ff3503d05f44814f967938a795c40"
 EXPECTED_SPEC = "specifications/vsphere/openapi/automation/vcenter.yaml"
+SERVICE_UUID = "7978ee81-a66c-4c37-8653-c577c0161e9d"
 
 
 def require(condition: bool, message: str) -> None:
@@ -103,11 +104,23 @@ def assert_provenance() -> dict[str, Any]:
     require(contract["source"]["spec_path"] == EXPECTED_SPEC, "wrong spec path")
     require(sources["spec_path"] == EXPECTED_SPEC, "wrong sources spec path")
     require(contract["server_base_path"] == "/api", "wrong API base path")
+    observation = contract["live_environment_observation"]
+    require(
+        observation["supervisor_summary_items"] == [],
+        "live Supervisor inventory must be empty",
+    )
+    require(observation["absent_supervisor"] == "domain-c9", "wrong live ID")
+    require(observation["create_status"] == 404, "wrong live create status")
+    require(observation["error_type"] == "NOT_FOUND", "wrong live error type")
+    require(
+        observation["message_id"] == "vcenter.wcp.supervisor.notfound",
+        "wrong live message ID",
+    )
     return contract
 
 
 def assert_constructor_validation() -> None:
-    token = "validation-" + secrets.token_urlsafe(12)
+    token = secrets.token_hex(16)
     invalid_origins = [
         "/relative",
         "ftp://127.0.0.1",
@@ -158,14 +171,11 @@ def assert_constructor_validation() -> None:
 
 
 def run_primary_case(directory: Path) -> None:
-    token = "session-" + secrets.token_urlsafe(24)
+    token = secrets.token_hex(16)
     supervisor = "supervisor " + secrets.token_urlsafe(9) + "/blue"
     comment = "nightly " + secrets.token_urlsafe(7) + " café"
-    task_id = "task/" + secrets.token_urlsafe(18)
-    result_value = {
-        "archive": "archive-" + secrets.token_urlsafe(12),
-        "retained": True,
-    }
+    task_id = "task-4135:" + SERVICE_UUID
+    result_value = None
     log_path = directory / "primary.jsonl"
 
     with ContractMock(
@@ -262,8 +272,8 @@ def run_primary_case(directory: Path) -> None:
 
 
 def run_explicit_false_case(directory: Path) -> None:
-    token = "session-" + secrets.token_urlsafe(20)
-    task_id = "task-" + secrets.token_urlsafe(14)
+    token = secrets.token_hex(16)
+    task_id = "task-4136:" + SERVICE_UUID
     supervisor = "sup-" + secrets.token_urlsafe(8)
     log_path = directory / "explicit-false.jsonl"
 
@@ -293,9 +303,57 @@ def run_explicit_false_case(directory: Path) -> None:
     )
 
 
+def run_live_absent_supervisor_case(directory: Path) -> None:
+    token = secrets.token_hex(16)
+    task_id = "task-4139:" + SERVICE_UUID
+    payload = {
+        "error_type": "NOT_FOUND",
+        "messages": [
+            {
+                "args": ["domain-c9"],
+                "default_message": (
+                    "The Supervisor with identifier domain-c9 was not found."
+                ),
+                "id": "vcenter.wcp.supervisor.notfound",
+            }
+        ],
+    }
+    log_path = directory / "live-absent-supervisor.jsonl"
+
+    with ContractMock(
+        CONTRACT_PATH,
+        log_path,
+        task_id=task_id,
+        states=["SUCCEEDED"],
+        result=None,
+        create_error=(404, payload),
+    ) as mock:
+        error = require_raises(
+            VcenterError,
+            lambda: SupervisorBackupClient(
+                mock.base_url,
+                token,
+                max_polls=1,
+            ).create_backup("domain-c9"),
+            "the live absent-Supervisor response was not rejected",
+        )
+
+    require(getattr(error, "status_code", None) == 404, "wrong 404 status")
+    require(getattr(error, "payload", None) == payload, "wrong live 404 payload")
+    records = read_log(log_path)
+    require(len(records) == 1, "an absent Supervisor must not create or poll a task")
+    require(records[0]["operation_id"] == CREATE_OPERATION, "wrong live operation")
+    require(
+        records[0]["raw_target"].endswith(
+            "/supervisors/domain-c9/recovery/backup/jobs"
+        ),
+        "wrong live absent-Supervisor target",
+    )
+
+
 def run_failed_case(directory: Path) -> None:
-    token = "session-" + secrets.token_urlsafe(20)
-    task_id = "task-" + secrets.token_urlsafe(14)
+    token = secrets.token_hex(16)
+    task_id = "task-4137:" + SERVICE_UUID
     hidden_failure = {
         "id": "failure-" + secrets.token_urlsafe(10),
         "secret_detail": secrets.token_urlsafe(24),
@@ -332,8 +390,8 @@ def run_failed_case(directory: Path) -> None:
 
 
 def run_timeout_case(directory: Path) -> None:
-    token = "session-" + secrets.token_urlsafe(20)
-    task_id = "task-" + secrets.token_urlsafe(14)
+    token = secrets.token_hex(16)
+    task_id = "task-4138:" + SERVICE_UUID
     log_path = directory / "timeout.jsonl"
 
     with ContractMock(
@@ -382,6 +440,7 @@ def main() -> None:
         directory = Path(raw_directory)
         run_primary_case(directory)
         run_explicit_false_case(directory)
+        run_live_absent_supervisor_case(directory)
         run_failed_case(directory)
         run_timeout_case(directory)
     print("PASS: vCenter Supervisor backup contract verified")

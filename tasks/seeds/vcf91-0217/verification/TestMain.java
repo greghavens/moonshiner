@@ -82,7 +82,7 @@ public final class TestMain {
                 case "BAD_METADATA" -> {
                     send(exchange, 200, """
                             {"elements":[],"pageMetadata":{
-                              "pageNumber":0,"pageSize":2,"totalElements":0
+                              "pageNumber":1,"pageSize":2,"totalElements":0
                             }}
                             """);
                     return;
@@ -95,31 +95,26 @@ public final class TestMain {
                                 "creationTimestamp":"2026-05-01T12:00:00Z"
                               }],
                               "pageMetadata":{
-                                "pageNumber":0,"pageSize":1,
+                                "pageNumber":1,"pageSize":1,
                                 "totalElements":1,"totalPages":1
                               }
                             }
                             """);
                     return;
                 }
+                case "EMPTY" -> {
+                    send(exchange, 200, "{\"elements\":[],\"pageMetadata\":{}}");
+                    return;
+                }
                 default -> { /* normal paginated fixture */ }
             }
 
             String response = switch (page) {
-                case 0 -> """
+                case 1 -> """
                         {
                           "elements": [
                             {"id":"task-c","name":"Configure network","type":"SDDC_CONFIGURE","status":"IN_PROGRESS","creationTimestamp":"2026-05-01T09:00:00Z"},
                             {"id":"task-b","name":"Validate inputs","type":"SDDC_VALIDATE","status":"SUCCESSFUL","creationTimestamp":"2026-05-01T08:00:00Z","completionTimestamp":"2026-05-01T08:05:00Z"}
-                          ],
-                          "pageMetadata":{"pageNumber":0,"pageSize":2,"totalElements":5,"totalPages":3}
-                        }
-                        """;
-                case 1 -> """
-                        {
-                          "elements": [
-                            {"id":"task-e","name":"Deploy workload domain","type":"SDDC_DEPLOY","status":"PENDING","creationTimestamp":"2026-05-01T10:00:00Z"},
-                            {"id":"task-a","name":"Deploy \\"Management\\" domain","type":"SDDC_DEPLOY","status":"IN_PROGRESS","creationTimestamp":"2026-05-01T09:00:00Z"}
                           ],
                           "pageMetadata":{"pageNumber":1,"pageSize":2,"totalElements":5,"totalPages":3}
                         }
@@ -127,9 +122,18 @@ public final class TestMain {
                 case 2 -> """
                         {
                           "elements": [
+                            {"id":"task-e","name":"Deploy workload domain","type":"SDDC_DEPLOY","status":"PENDING","creationTimestamp":"2026-05-01T10:00:00Z"},
+                            {"id":"task-a","name":"Deploy \\"Management\\" domain","type":"SDDC_DEPLOY","status":"IN_PROGRESS","creationTimestamp":"2026-05-01T09:00:00Z"}
+                          ],
+                          "pageMetadata":{"pageNumber":2,"pageSize":2,"totalElements":5,"totalPages":3}
+                        }
+                        """;
+                case 3 -> """
+                        {
+                          "elements": [
                             {"id":"task-d","name":"Finalize inventory","type":"SDDC_FINALIZE","status":"QUEUED","creationTimestamp":"2026-05-01T11:00:00Z"}
                           ],
-                          "pageMetadata":{"pageNumber":2,"pageSize":1,"totalElements":5,"totalPages":3}
+                          "pageMetadata":{"pageNumber":3,"pageSize":1,"totalElements":5,"totalPages":3}
                         }
                         """;
                 default -> null;
@@ -215,6 +219,19 @@ public final class TestMain {
                     "unset filters must not interfere with pagination");
             assertUnsetWireLog(mock.requests());
 
+            mock.clearRequests();
+            List<VcfInstallerClient.Task> empty = client.getAllTasks(
+                    new VcfInstallerClient.TaskQuery()
+                            .taskStatus("EMPTY")
+                            .pageSize(2));
+            assertEquals(List.of(), empty,
+                    "the live empty collection shape must return an empty list");
+            assertEquals(1, mock.requests().size(),
+                    "the live empty collection must stop after page one");
+            assertEquals("1", ContractPinnedMock.decodeQuery(
+                            mock.requests().get(0).rawQuery()).get("pageNumber"),
+                    "the empty collection request must use page one");
+
             HttpResponse<String> unknown = http.send(
                     HttpRequest.newBuilder(mock.baseUri().resolve("/v1/not-in-contract"))
                             .GET().build(),
@@ -259,8 +276,8 @@ public final class TestMain {
 
     private static void assertWireLog(List<LoggedRequest> requests) {
         assertEquals(3, requests.size(), "exactly three API pages must be requested");
-        for (int page = 0; page < requests.size(); page++) {
-            LoggedRequest request = requests.get(page);
+        for (int page = 1; page <= requests.size(); page++) {
+            LoggedRequest request = requests.get(page - 1);
             assertEquals("GET", request.method(), "request method");
             assertEquals("/v1/tasks", request.rawPath(), "request path");
             assertEquals(Map.ofEntries(
@@ -292,8 +309,8 @@ public final class TestMain {
 
     private static void assertUnsetWireLog(List<LoggedRequest> requests) {
         assertEquals(3, requests.size(), "the unfiltered call must still retrieve all pages");
-        for (int page = 0; page < requests.size(); page++) {
-            LoggedRequest request = requests.get(page);
+        for (int page = 1; page <= requests.size(); page++) {
+            LoggedRequest request = requests.get(page - 1);
             assertEquals(Map.of(
                             "pageNumber", Integer.toString(page),
                             "pageSize", "2"),

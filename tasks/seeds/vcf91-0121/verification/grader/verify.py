@@ -18,8 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PROTECTED_SHA256 = {
     "docs/contract.json": "71d10e683ba60779e57f4815d600adc6db559212c25b0a6c9910404be7c26cef",
     "docs/official_sources.json": "11d6e1337545d2a7756fa3575200fe7f79830f0dcba5f3f7e3ae0c84a68dc4d1",
-    "grader/MockVcenterServer.java": "f01ba19df891e4fd41200691ce73bc30fa82c338f6b40a35b818251d04658e65",
-    "grader/TestMain.java": "4a9eab8e485c111843b51c7b10ab1f793c24d125c9cfbb0698513a80a7a54ab1",
+    "grader/MockVcenterServer.java": "7fd29ecdce35720120ac99d5011d03c012f695bb1b007c52ebbee40b05e6075b",
+    "grader/TestMain.java": "d851f7b60e0bfc97af59712ceea02d98422ee9bd98ffb1aa1e749339699af02b",
 }
 
 EXPECTED_COMMIT = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"

@@ -20,4 +20,4 @@ def apply_firewall_change(
 ) -> dict[str, Any]:
     """Apply the two-step change and return its deterministic outcome report."""
 
-    raise NotImplementedError("implement the contract-pinned workflow")
+    raise NotImplementedError("implement the focused workflow")

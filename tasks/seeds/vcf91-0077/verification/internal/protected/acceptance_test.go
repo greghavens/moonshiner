@@ -173,11 +173,12 @@ func TestPollsToTerminalAndSortsEveryFlippedCollection(t *testing.T) {
 				}},
 			}
 
-			first, err := client.ApplyTagAndWait(context.Background(), tt.operationID, request)
+			operationIDs := []string{tt.operationID + "-first", tt.operationID + "-comparison"}
+			first, err := client.ApplyTagAndWait(context.Background(), operationIDs[0], request)
 			if err != nil {
 				t.Fatalf("first ApplyTagAndWait: %v", err)
 			}
-			second, err := client.ApplyTagAndWait(context.Background(), tt.operationID, request)
+			second, err := client.ApplyTagAndWait(context.Background(), operationIDs[1], request)
 			if err != nil {
 				t.Fatalf("second ApplyTagAndWait: %v", err)
 			}
@@ -187,8 +188,8 @@ func TestPollsToTerminalAndSortsEveryFlippedCollection(t *testing.T) {
 				if iteration == 0 {
 					wantPolls = tt.wantFirst
 				}
-				if result.OperationID != tt.operationID ||
-					result.Path != "/infra/tags/tag-operations/"+tt.operationID ||
+				if result.OperationID != operationIDs[iteration] ||
+					result.Path != "/infra/tags/tag-operations/"+operationIDs[iteration] ||
 					result.Polls != wantPolls || !reflect.DeepEqual(result.Outcomes, wantOutcomes) {
 					t.Fatalf("iteration %d result is not terminal and sorted:\n got: %#v\nwant outcomes: %#v", iteration, result, wantOutcomes)
 				}
@@ -199,10 +200,14 @@ func TestPollsToTerminalAndSortsEveryFlippedCollection(t *testing.T) {
 			if len(log) != wantCount {
 				t.Fatalf("request log has %d entries, want %d: %#v", len(log), wantCount, log)
 			}
-			putPath := "/policy/api/v1/infra/tags/tag-operations/" + escapeOperationID(tt.operationID)
-			statusPath := putPath + "/status"
 			putIndexes := map[int]bool{0: true, tt.wantFirst + 1: true}
 			for i, entry := range log {
+				operationID := operationIDs[0]
+				if i >= tt.wantFirst+1 {
+					operationID = operationIDs[1]
+				}
+				putPath := "/policy/api/v1/infra/tags/tag-operations/" + escapeOperationID(operationID)
+				statusPath := putPath + "/status"
 				if putIndexes[i] {
 					assertWire(t, i, entry, nsxpolicy.OperationTagBulkUpdate, http.MethodPut, putPath)
 					wantBody := `{"tag":{"scope":"env/prod","tag":"blue"},"apply_to":[{"resource_type":"VirtualMachine","resource_ids":["vm-shared","vm-b"]}],"remove_from":[{"resource_type":"VirtualMachine","resource_ids":["vm-d","vm-shared"]}]}`
@@ -223,6 +228,28 @@ func TestPollsToTerminalAndSortsEveryFlippedCollection(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDuplicateOperationIDIsRejectedWithoutStatusPoll(t *testing.T) {
+	srv := contractmock.New(t, contractPath, contractmock.Script{Statuses: []string{"Success"}})
+	client := newClient(t, srv, 3, 0)
+	const operationID = "duplicate-operation"
+	if _, err := client.ApplyTagAndWait(context.Background(), operationID, validRequest()); err != nil {
+		t.Fatalf("first ApplyTagAndWait: %v", err)
+	}
+	before := len(srv.Requests())
+	_, err := client.ApplyTagAndWait(context.Background(), operationID, validRequest())
+	var apiErr *nsxpolicy.APIError
+	if !errors.As(err, &apiErr) || apiErr.OperationID != nsxpolicy.OperationTagBulkUpdate ||
+		apiErr.StatusCode != http.StatusBadRequest || apiErr.ErrorCode == nil || *apiErr.ErrorCode != 527004 ||
+		apiErr.ModuleName != "policy" {
+		t.Fatalf("duplicate error = %#v, want live 400/527004 APIError", err)
+	}
+	log := srv.Requests()
+	if len(log) != before+1 || log[len(log)-1].OperationID != contractmock.TagBulkUpdate ||
+		log[len(log)-1].Method != http.MethodPut {
+		t.Fatalf("duplicate request log = %#v, want one failed PUT and no status GET", log[before:])
 	}
 }
 

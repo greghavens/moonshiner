@@ -40,10 +40,10 @@ EXPECTED_CONTRACT_OPERATIONS = [
 # Filled with hashes of protected fixture files. The verifier itself is protected
 # by the harness and intentionally is not self-hashed.
 PROTECTED_SHA256 = {
-    "TestMain.java": "078d6d5edb729a3bda6570f6f054097fe18ce472387201ca4a7abeda8cc77a4e",
+    "TestMain.java": "6387ad278959740853a4237a5889eaa85ffbdf65c91cea0c7757e6e9becc84ac",
     "docs/contract.json": "27193c6f32817aba25621272049d4bfb280a0e176ea26b30df4fdedece8c5dd3",
     "docs/official_sources.json": "1818ff37ff3f1b19fd1b5a53475f81d7ee11fb7d5a3629def06138b02561c5fd",
-    "tools/contract_mock.py": "a2de42ac5538e226706cfeb86bb842fbfb0faf992c8a7c251ca4047f12c37166",
+    "tools/contract_mock.py": "91b766654a2f31e9b94c4d1b8a4362e8082e6796a1194870d246d4676d836448",
 }
 
 
@@ -179,8 +179,14 @@ def assert_request_log(
         ]
     elif scenario == "unstable":
         expected_operations = ["getSupervisorNamespace", "getVksDeployment"]
-    elif scenario == "namespace_not_ready":
+    elif scenario in {"namespace_not_ready", "live_namespace_404"}:
         expected_operations = ["getSupervisorNamespace"]
+    elif scenario == "live_backup_unavailable":
+        expected_operations = [
+            "getSupervisorNamespace",
+            "getVksDeployment",
+            "createSupervisorBackup",
+        ]
     elif scenario == "poll_limit":
         expected_operations = [
             "getSupervisorNamespace",
@@ -213,7 +219,7 @@ def assert_request_log(
         "Authorization",
     )
 
-    if scenario == "namespace_not_ready":
+    if scenario in {"namespace_not_ready", "live_namespace_404"}:
         return
 
     assert_get_wire(
@@ -326,6 +332,17 @@ def run_scenario(
         "memoryUsed": 512 + secrets.randbelow(1024),
         "storageUsed": 2048 + secrets.randbelow(4096),
     }
+    if scenario in {"live_namespace_404", "live_backup_unavailable"}:
+        config.update(
+            {
+                "session": "8a1d0d1b3fe94ad0b05f3a8fcfd92ab5",
+                "supervisorNamespace": "vmsp-platform",
+                "workloadNamespace": "kube-system",
+                "deployment": "antrea-controller",
+                "generation": 1,
+                "replicas": 1,
+            }
+        )
 
     with tempfile.TemporaryDirectory(prefix=f"vcf91-{scenario}-") as temp_name:
         temp = Path(temp_name)
@@ -476,6 +493,8 @@ def main() -> None:
         run_scenario(build_dir, "task_failed", 0, 5, use_loopback)
         run_scenario(build_dir, "unstable", 0, 5, use_loopback)
         run_scenario(build_dir, "namespace_not_ready", 0, 5, use_loopback)
+        run_scenario(build_dir, "live_namespace_404", 0, 5, use_loopback)
+        run_scenario(build_dir, "live_backup_unavailable", 0, 5, use_loopback)
         run_scenario(build_dir, "poll_limit", 0, 2, use_loopback)
 
     print("PASS: VCF 9.1 Supervisor backup client contract verified")

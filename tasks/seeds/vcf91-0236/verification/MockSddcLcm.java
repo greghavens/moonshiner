@@ -360,14 +360,12 @@ public final class MockSddcLcm implements AutoCloseable {
         TaskScript script = taskScripts.get(taskId);
         StringBuilder out = new StringBuilder("{");
         out.append("\"id\":").append(Json.quote(taskId));
-        out.append(",\"name\":").append(Json.quote("sddc_lcm_support_bundle"));
+        String workflowName = deleteTasks.containsValue(taskId)
+                ? "DELETE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW"
+                : "CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW";
+        out.append(",\"name\":").append(Json.quote(workflowName));
         out.append(",\"status\":").append(Json.quote(status));
-        out.append(",\"type\":").append(Json.quote("support-bundle"));
         out.append(",\"createdBy\":").append(Json.quote("admin"));
-        if (componentId != null) {
-            out.append(",\"resourceId\":").append(Json.quote(componentId));
-            out.append(",\"resourceType\":").append(Json.quote("COMPONENT"));
-        }
         out.append(",\"createTime\":").append(Json.quote("2026-05-13T11:27:00.000Z"));
         out.append(",\"startTime\":").append(Json.quote("2026-05-13T11:27:01.000Z"));
         out.append(",\"cancellable\":").append(!terminal);

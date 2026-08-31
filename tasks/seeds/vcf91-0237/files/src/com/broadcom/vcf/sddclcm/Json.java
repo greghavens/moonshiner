@@ -7,7 +7,7 @@ import java.util.Map;
 
 /**
  * Minimal dependency-free JSON codec shared by the SDDC LCM client and the
- * protected verification harness.
+ * caller-visible API contract.
  *
  * <p>Decoding maps a JSON object to a {@link LinkedHashMap}, a JSON array to an
  * {@link ArrayList}, a JSON string to {@link String}, a JSON number to

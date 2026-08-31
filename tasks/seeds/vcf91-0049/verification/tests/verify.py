@@ -465,7 +465,7 @@ function global:Invoke-ReadIntentStatus {
     foreach ($item in $PSBoundParameters.GetEnumerator()) { $bound[$item.Key] = $item.Value }
     $global:SdkCalls.Add([pscustomobject] @{ Command = 'Invoke-ReadIntentStatus'; Bound = $bound })
     return [pscustomobject] @{
-        consolidated_status = [pscustomobject] @{ consolidated_status = 'SUCCESS' }
+        ConsolidatedStatus = [pscustomobject] @{ _ConsolidatedStatus = 'SUCCESS' }
     }
 }
 

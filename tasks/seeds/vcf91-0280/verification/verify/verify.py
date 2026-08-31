@@ -27,10 +27,10 @@ CONTRACT = ROOT / "docs" / "contract.json"
 PROTECTED = {
     ".gitignore": "644cd942b33791a68ebaabf435a0832002d7fcd41b37f5eaa8edb8da2f4de4af",
     "README.md": "fe7f1032c556ba7cbe0c8a224fbcbc3200a0c97698c0064afcd4caef455ae195",
-    "docs/contract.json": "3c9a96cf08e8089800bababc856c36caee0283a3e982796491dddcfbf772eadf",
+    "docs/contract.json": "ce2e3490c07c835efe456403875807bdcaf0ceb0e6c6dc54bfacb59082aad44a",
     "docs/official_sources.json": "a964d0ba2f7406077a5e2076a7e1c326b1fe7af682c74a95968bcb17e3613312",
-    "harness/MockOpsServer.java": "0bc671985ba20ca5c425e8e2fe996823e39a8bc2d33e125f4c4446b20c5cbce0",
-    "harness/TestMain.java": "7c73cfae63bc948fe7220b62114d4c085006e2659b9d1ca0ca416658ea9a1d88",
+    "harness/MockOpsServer.java": "395c9157f1c8a3cd589a3a4e4fccf62582057589dda29b26ad674477d63f3954",
+    "harness/TestMain.java": "eba6006cfe50ffea6ceb231f8734f404e365fe0b186eeff36fbe6edf02abd5ed",
     "verify/verify.py": "",
 }
 
@@ -215,6 +215,40 @@ def assert_no_placeholders(body, label: str) -> None:
           "; ".join(stray))
 
 
+def assert_credential_transition(pre_body: dict, create_body: dict, label: str) -> None:
+    """Checks the deployed precheck-to-create credential lifecycle."""
+    pre_without = dict(pre_body)
+    create_without = dict(create_body)
+    pre_credential = pre_without.pop("credential", None)
+    create_credential = create_without.pop("credential", None)
+    check(pre_without == create_without,
+          f"{label}: adapter settings outside credential are unchanged",
+          f"precheck {pre_without} vs create {create_without}")
+    if pre_credential is None:
+        check(create_credential is None,
+              f"{label}: a credential is not invented for create",
+              f"create credential was {create_credential!r}")
+        return
+    if not check(isinstance(pre_credential, dict),
+                 f"{label}: precheck credential is an object", repr(pre_credential)):
+        return
+    check("id" not in pre_credential,
+          f"{label}: new inline credential has no id during precheck",
+          repr(pre_credential))
+    if not check(isinstance(create_credential, dict),
+                 f"{label}: create credential is an object", repr(create_credential)):
+        return
+    expected = {
+        "name": pre_credential.get("name"),
+        "adapterKindKey": pre_credential.get("adapterKindKey"),
+        "credentialKindKey": pre_credential.get("credentialKindKey"),
+        "id": java_name_uuid("credential:" + str(pre_credential.get("name"))),
+    }
+    check(create_credential == expected,
+          f"{label}: create reuses the precheck credential id without secret fields",
+          f"saw {create_credential}, want {expected}")
+
+
 def main() -> None:
     verify_protected()
     stdout = compile_and_run()
@@ -270,11 +304,12 @@ def main() -> None:
             else:
                 check(False, f"{scenario} request {i + 1}: unexpected extra request")
         if len(reqs) == 2:
-            check(reqs[0]["body"] == reqs[1]["body"],
-                  f"{scenario}: precheck and mutation carry the identical serialized payload",
-                  f"precheck {reqs[0]['body']!r} vs mutation {reqs[1]['body']!r}")
+            assert_credential_transition(
+                body_of(reqs[0], scenario + " precheck"),
+                body_of(reqs[1], scenario + " create"),
+                scenario)
 
-    # --- full_onboarding: precheck passes, mutation follows with the identical payload -----------
+    # --- full_onboarding: precheck persists credential, mutation reuses its id --------------------
     reqs = log["full_onboarding"]
     if check(len(reqs) == 2, "full_onboarding: precheck then mutation", f"saw {len(reqs)} requests"):
         pre, mut = reqs
@@ -297,8 +332,6 @@ def main() -> None:
 
         pre_body = body_of(pre, "full_onboarding precheck")
         mut_body = body_of(mut, "full_onboarding mutation")
-        check(pre_body == mut_body, "full_onboarding: both calls carry the same payload",
-              f"precheck {pre_body} vs mutation {mut_body}")
         for label, body in (("full_onboarding precheck", pre_body), ("full_onboarding mutation", mut_body)):
             check(set(body) == {"name", "adapterKindKey", "description", "collectorId",
                                 "collectorGroupId", "physicalDatacenterId", "monitoringInterval",
@@ -326,15 +359,26 @@ def main() -> None:
                           {"name": "VCURL", "value": "vcenter-a.lab.local"}],
                   f"{label}: resourceIdentifiers are name-value pairs in call order",
                   f"saw {ids}")
-            cred = body.get("credential")
-            if check(isinstance(cred, dict), f"{label}: credential is an object", f"saw {cred!r}"):
-                check(set(cred) == {"name", "adapterKindKey", "credentialKindKey", "fields"},
-                      f"{label}: credential omits id and editable",
-                      f"saw {sorted(cred)}")
-                check(cred.get("fields") == [{"name": "USER", "value": "svc-vcfops@lab.local"},
-                                             {"name": "PASSWORD", "value": "s3cr3t"}],
-                      f"{label}: credential fields are name-value pairs in call order",
-                      f"saw {cred.get('fields')}")
+        pre_cred = pre_body.get("credential")
+        if check(isinstance(pre_cred, dict), "full_onboarding precheck: credential is an object",
+                 f"saw {pre_cred!r}"):
+            check(set(pre_cred) == {"name", "adapterKindKey", "credentialKindKey", "fields"},
+                  "full_onboarding precheck: inline credential omits id and editable",
+                  f"saw {sorted(pre_cred)}")
+            check(pre_cred.get("fields") == [{"name": "USER", "value": "svc-vcfops@lab.local"},
+                                              {"name": "PASSWORD", "value": "s3cr3t"}],
+                  "full_onboarding precheck: credential fields are sent in call order",
+                  f"saw {pre_cred.get('fields')}")
+        create_cred = mut_body.get("credential")
+        expected_create_cred = {
+            "name": "Prod VC Adapter Instance Credential",
+            "adapterKindKey": "VMWARE",
+            "credentialKindKey": "PRINCIPALCREDENTIAL",
+            "id": java_name_uuid("credential:Prod VC Adapter Instance Credential"),
+        }
+        check(create_cred == expected_create_cred,
+              "full_onboarding mutation: returned credential id replaces secret fields",
+              f"saw {create_cred}")
 
     r = results["full_onboarding"]
     check(r.get("precheckPassed") == "true" and r.get("precheckStatus") == "201",
@@ -373,9 +417,6 @@ def main() -> None:
              f"saw {len(reqs)} requests"):
         pre_body = body_of(reqs[0], "credential_without_fields precheck")
         mut_body = body_of(reqs[1], "credential_without_fields mutation")
-        check(pre_body == mut_body,
-              "credential_without_fields: both calls carry the same payload",
-              f"precheck {pre_body} vs mutation {mut_body}")
         for req, body, label in (
                 (reqs[0], pre_body, "credential_without_fields precheck"),
                 (reqs[1], mut_body, "credential_without_fields mutation")):
@@ -383,14 +424,20 @@ def main() -> None:
             check(set(body) == {"name", "adapterKindKey", "credential"},
                   f"{label}: top-level unset optional properties are absent",
                   f"saw {sorted(body)}")
-            cred = body.get("credential")
-            if check(isinstance(cred, dict), f"{label}: credential is an object", f"saw {cred!r}"):
-                check(cred == {"name": "Empty Principal Credential",
-                               "adapterKindKey": "VMWARE",
-                               "credentialKindKey": "PRINCIPALCREDENTIAL"},
-                      f"{label}: unset fields is absent and id/editable are never sent",
-                      f"saw {cred}")
             assert_no_placeholders(body, label)
+        pre_cred = pre_body.get("credential")
+        check(pre_cred == {"name": "Empty Principal Credential",
+                           "adapterKindKey": "VMWARE",
+                           "credentialKindKey": "PRINCIPALCREDENTIAL"},
+              "credential_without_fields precheck: unset fields and id are absent",
+              f"saw {pre_cred}")
+        create_cred = mut_body.get("credential")
+        check(create_cred == {"name": "Empty Principal Credential",
+                              "adapterKindKey": "VMWARE",
+                              "credentialKindKey": "PRINCIPALCREDENTIAL",
+                              "id": java_name_uuid("credential:Empty Principal Credential")},
+              "credential_without_fields mutation: returned id is sent without fields",
+              f"saw {create_cred}")
         check(reqs[0]["query"] == {},
               "credential_without_fields: precheck sends no query parameters",
               f"saw {reqs[0]['query']}")
@@ -426,7 +473,7 @@ def main() -> None:
               f"raw body was {reqs[0]['body']}")
 
     r = results["precheck_blocks_mutation"]
-    check(r.get("precheckPassed") == "false" and r.get("precheckStatus") == "400",
+    check(r.get("precheckPassed") == "false" and r.get("precheckStatus") == "500",
           "precheck_blocks_mutation: precheck reported as failed", str(r))
     check(r.get("created") == "false" and r.get("createStatus") == "0",
           "precheck_blocks_mutation: the mutation is reported as never attempted", str(r))
@@ -439,6 +486,10 @@ def main() -> None:
           f"detail was {detail!r}")
     check(set(r.get("details", {})) == {"precheck"},
           "precheck_blocks_mutation: only precheck detail is reported", str(r))
+    if reqs:
+        check(reqs[0].get("credentialPersisted") is True,
+              "precheck_blocks_mutation: failed live-style precheck persisted its inline credential",
+              str(reqs[0]))
 
     # --- identifier_defaults_requested: the optional query parameter is added --------------------
     reqs = log["identifier_defaults_requested"]
@@ -464,19 +515,19 @@ def main() -> None:
     # --- create_rejected: precheck passes but the mutation is refused ----------------------------
     reqs = log["create_rejected"]
     if check(len(reqs) == 2, "create_rejected: precheck then mutation", f"saw {len(reqs)} requests"):
-        check(reqs[0]["responseStatus"] == 201 and reqs[1]["responseStatus"] == 400,
+        check(reqs[0]["responseStatus"] == 201 and reqs[1]["responseStatus"] == 500,
               "create_rejected: the precheck passed and the mutation was refused",
               f"saw {reqs[0]['responseStatus']} then {reqs[1]['responseStatus']}")
 
     r = results["create_rejected"]
     check(r.get("precheckPassed") == "true" and r.get("precheckStatus") == "201",
           "create_rejected: precheck reported as passed", str(r))
-    check(r.get("created") == "false" and r.get("createStatus") == "400",
+    check(r.get("created") == "false" and r.get("createStatus") == "500",
           "create_rejected: the refused mutation is reported as not created", str(r))
     check(r.get("adapterInstanceId") == "null",
           "create_rejected: no adapter instance id is reported", str(r))
     detail = r.get("details", {}).get("create", "")
-    check(detail == "An adapter instance named 'Duplicate VC Adapter Instance' already exists",
+    check(detail == "Internal Server error, cause unknown.",
           "create_rejected: the service's explanation is surfaced verbatim",
           f"detail was {detail!r}")
     check(set(r.get("details", {})) == {"create"},

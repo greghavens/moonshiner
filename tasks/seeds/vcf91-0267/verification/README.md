@@ -16,12 +16,13 @@ Cloud Foundation Operations 9.1 appliance.
 
 ## The flow
 
-Four operations, all named in `docs/contract.json`:
+Five operations, all named in `docs/contract.json`:
 
 1. `acquireToken` — `POST /suite-api/api/auth/token/acquire`
 2. `createReport` — `POST /suite-api/api/reports`
 3. `getReport` — `GET /suite-api/api/reports/{id}` (poll until terminal)
 4. `downloadReport` — `GET /suite-api/api/reports/{id}/download`
+5. `releaseToken` — `POST /suite-api/api/auth/token/release`
 
 `createReport` returns as soon as the request is queued. Its response status is
 `QUEUED`, never the outcome, so the report must be polled with `getReport` until
@@ -30,7 +31,7 @@ Four operations, all named in `docs/contract.json`:
 ## The mock
 
 `internal/mockops` builds its routing table from `docs/contract.json` and serves
-only the four operations the contract names — everything else answers 404 and is
+only the five operations the contract names — everything else answers 404 and is
 recorded with an empty `OperationID`. Every request is logged in arrival order
 and readable with `srv.Requests()`, which returns a copy and is safe under
 `-race`.

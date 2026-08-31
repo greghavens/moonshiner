@@ -314,6 +314,8 @@ func (s *Server) dispatch(op contract.Operation, rec Request) (int, any, string)
 		return s.getReport(rec)
 	case "downloadReport":
 		return s.downloadReport(rec)
+	case "releaseToken":
+		return s.releaseToken(rec)
 	default:
 		// Unreachable while the contract and this switch agree; a contract that
 		// names an operation the mock cannot serve is a wiring bug, not a 404.
@@ -454,6 +456,20 @@ func (s *Server) downloadReport(rec Request) (int, any, string) {
 		}
 	}
 	return http.StatusOK, s.scenario.DownloadBody, ct
+}
+
+func (s *Server) releaseToken(rec Request) (int, any, string) {
+	if len(rec.Body) != 0 {
+		return http.StatusBadRequest, map[string]any{
+			"message": "releaseToken must not carry a request body",
+		}, ""
+	}
+	if rec.Header.Get("Content-Type") != "" {
+		return http.StatusBadRequest, map[string]any{
+			"message": "releaseToken must not carry a Content-Type header",
+		}, ""
+	}
+	return http.StatusOK, nil, ""
 }
 
 func (s *Server) record(rec Request) {

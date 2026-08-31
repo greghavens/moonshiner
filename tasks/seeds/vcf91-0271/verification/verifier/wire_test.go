@@ -42,6 +42,7 @@ func goodChange() opsrollout.Change {
 			AdapterKindKey:        opsmock.KnownAdapterKind,
 			ResourceKindKey:       opsmock.KnownResourceKind,
 			AutoResolveMembership: true,
+			IncludedResourceIDs:   []string{opsmock.KnownResourceID},
 		},
 		PolicyID: opsmock.KnownPolicyID,
 		Rule: opsrollout.RuleSpec{
@@ -144,7 +145,7 @@ func TestRequestWireShape(t *testing.T) {
 			},
 			wantBodies: map[string]string{
 				"acquireToken": `{"password":"Rq4-still-lantern-88","username":"svc-ops-admin"}`,
-				"createCustomGroup": `{"autoResolveMembership":true,"membershipDefinition":{},` +
+				"createCustomGroup": `{"autoResolveMembership":true,"membershipDefinition":{"includedResources":["529c2a31-a993-430f-ae30-e467d04f8d6e"]},` +
 					`"resourceKey":{"adapterKindKey":"Container","name":"Production Workloads","resourceKindKey":"Environment"}}`,
 				"assignPolicy": `{"groupIds":["9613f1e4-6b93-4d9d-ba82-09beb46d75a6"]}`,
 				"createNotificationPluginRule": `{"enabled":true,"name":"Production Workloads notifications",` +
@@ -289,8 +290,8 @@ func canonicalJSON(b []byte) (string, error) {
 
 // assertNoEmptyValues rejects a body that encodes an unset optional property as
 // null, as an empty string, or as an empty array anywhere in the document. The
-// one legitimate empty object is custom-group.membershipDefinition, which is a
-// required property whose own properties are all optional.
+// no empty object is legitimate in this change: the live appliance requires
+// custom-group membership to include at least one resource.
 func assertNoEmptyValues(t *testing.T, operationID string, body []byte) {
 	t.Helper()
 	var doc any
@@ -317,7 +318,7 @@ func assertNoEmptyValues(t *testing.T, operationID string, body []byte) {
 				walk(fmt.Sprintf("%s[%d]", path, i), e)
 			}
 		case map[string]any:
-			if len(tv) == 0 && path != "membershipDefinition" {
+			if len(tv) == 0 {
 				t.Errorf("%s: %s is an empty object; an unset optional property must be omitted (body: %s)",
 					operationID, path, body)
 			}
@@ -380,15 +381,15 @@ func TestPartiallyAppliedChangeIsReported(t *testing.T) {
 			name:        "the second step fails after the token was acquired",
 			mutate:      func(ch *opsrollout.Change) { ch.Group.ResourceKindKey = "NoSuchResourceKind" },
 			failIndex:   1,
-			wantStatus:  http.StatusUnprocessableEntity,
-			wantMessage: "unknown resource kind",
+			wantStatus:  http.StatusInternalServerError,
+			wantMessage: "Internal Server error, cause unknown.",
 		},
 		{
 			name:        "the third step fails after the group was created",
 			mutate:      func(ch *opsrollout.Change) { ch.PolicyID = "00000000-0000-0000-0000-000000000000" },
 			failIndex:   2,
 			wantStatus:  http.StatusNotFound,
-			wantMessage: "no policy with id",
+			wantMessage: "No such Policy",
 		},
 		{
 			name: "the last step fails after the group was created and the policy assigned",
@@ -397,14 +398,14 @@ func TestPartiallyAppliedChangeIsReported(t *testing.T) {
 			},
 			failIndex:   3,
 			wantStatus:  http.StatusNotFound,
-			wantMessage: "unknown alert definition identifier",
+			wantMessage: "Entity was not found.",
 		},
 		{
-			name:        "the last step is rejected as unprocessable",
+			name:        "the last step rejects an unknown plugin",
 			mutate:      func(ch *opsrollout.Change) { ch.Rule.PluginID = "11111111-2222-3333-4444-555555555555" },
 			failIndex:   3,
-			wantStatus:  http.StatusUnprocessableEntity,
-			wantMessage: "no notification plugin instance",
+			wantStatus:  http.StatusNotFound,
+			wantMessage: "No such Notification Plugin",
 		},
 	}
 
@@ -504,6 +505,30 @@ func TestPartiallyAppliedChangeIsReported(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEmptyMembershipFailsBeforeCreateTraffic(t *testing.T) {
+	c, srv := newClient(t)
+	ch := goodChange()
+	ch.Group.IncludedResourceIDs = nil
+	ch.Group.ExcludedResourceIDs = []string{"1f2c3d44-5e6f-4708-91a2-b3c4d5e6f708"}
+
+	rep, err := c.Apply(context.Background(), ch)
+	if err == nil {
+		t.Fatal("Apply succeeded with excluded-only membership")
+	}
+	assertReportShape(t, rep)
+	if len(srv.Requests()) != 1 || srv.Requests()[0].OperationID != "acquireToken" {
+		t.Fatalf("requests = %s, want only acquireToken", summarize(srv.Requests()))
+	}
+	if step := rep.Steps[1]; step.Status != opsrollout.StatusFailed || step.HTTPStatus != 0 {
+		t.Fatalf("create step = %+v, want FAILED with status 0", step)
+	}
+	for _, step := range rep.Steps[2:] {
+		if step.Status != opsrollout.StatusSkipped || step.HTTPStatus != 0 {
+			t.Errorf("later step = %+v, want SKIPPED with status 0", step)
+		}
 	}
 }
 

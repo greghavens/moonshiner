@@ -81,7 +81,13 @@ def assert_request_log(
         "/apis/cluster.x-k8s.io/v1beta2/namespaces/"
         f"zeta-team/clusters?continue={encoded['zeta-team']}&limit=2",
     ]
-    expected_targets = one_call + one_call
+    primary = [
+        "/api/vcenter/namespaces-user/namespaces",
+        "/api/vcenter/namespaces-user/namespaces",
+        "/apis/cluster.x-k8s.io/v1beta2/namespaces/"
+        "vm-service-domain-c8/clusters?limit=200",
+    ]
+    expected_targets = primary + one_call + one_call
     if len(entries) != len(expected_targets):
         fail(
             f"expected {len(expected_targets)} requests, got {len(entries)}")
@@ -117,7 +123,7 @@ def assert_request_log(
         if any(value != "0" for value in lengths):
             fail(f"request {index} had a positive Content-Length")
 
-        is_vcenter = index in (0, 5)
+        is_vcenter = index in (0, 1, 3, 8)
         if is_vcenter:
             if headers(entry, "vmware-api-session-id") != [session]:
                 fail("vCenter request had the wrong session header")

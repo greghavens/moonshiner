@@ -100,6 +100,20 @@ public final class TestMain {
             require(result.retired(), "successful rotation was not retired");
             require(Files.exists(retiredMarker), "retirement callback did not run");
 
+            NsxPolicyClient retiredClient = new NsxPolicyClient(
+                    args[0], oldCredential, REQUEST_TIMEOUT);
+            try {
+                retiredClient.listTier1s(null, null);
+                throw new AssertionError("retired credential remained usable");
+            } catch (NsxPolicyClient.NsxPolicyException expected) {
+                require(expected.statusCode() == 403, "retired credential status");
+                require(expected.responseBody().contains("\"error_code\":403"),
+                        "retired credential live error envelope");
+            }
+            String postRetirementBody = client.listTier1s(null, null);
+            require(postRetirementBody.contains("\"central-new\""),
+                    "new generation failed after old credential retirement");
+
             inspectCentralRequests(
                     requestLog, oldCredential, newCredential);
         } finally {
@@ -244,7 +258,7 @@ public final class TestMain {
                 .stream()
                 .filter(line -> line.contains("\"event\":\"request\""))
                 .toList();
-        require(requests.size() == 2, "central scenario request count");
+        require(requests.size() == 4, "central scenario request count");
         require(
                 requests.get(0).contains("\"operationId\":\"ListTier1\""),
                 "old request operationId");
@@ -258,6 +272,12 @@ public final class TestMain {
         require(
                 requests.get(1).contains(authorization(newCredential)),
                 "new request did not use new generation");
+        require(
+                requests.get(2).contains(authorization(oldCredential)),
+                "post-retirement probe did not use old generation");
+        require(
+                requests.get(3).contains(authorization(newCredential)),
+                "post-retirement request did not use new generation");
     }
 
     private static String authorization(NsxPolicyClient.Credentials credential) {

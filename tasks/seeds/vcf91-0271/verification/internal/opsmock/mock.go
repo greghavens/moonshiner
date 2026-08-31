@@ -58,6 +58,8 @@ const (
 	KnownResourceKind = "Environment"
 	// KnownPluginID is the only notification plugin instance the appliance has.
 	KnownPluginID = "8e9b3d17-2c40-4f6a-9e51-a7bd0c62f3aa"
+	// DefaultTemplateID is the template the known plugin supplies when omitted.
+	DefaultTemplateID = "4cfe6060-f92f-4a07-90e8-aab3d1449cb3"
 	// KnownAlertDefinitionID is the only alert definition the appliance knows.
 	KnownAlertDefinitionID = "AlertDefinition-VMWARE-VirtualMachine-CpuContention"
 	// KnownResourceID is the only resource id assignPolicy accepts.
@@ -221,13 +223,19 @@ func readBody(r *http.Request) []byte {
 // fail writes a JSON error body and records the rejection reason. The body
 // shape mirrors what the appliance returns for a rejected request.
 func (s *Server) fail(w http.ResponseWriter, seq, status int, reason string) {
+	s.failPayload(w, seq, status, reason, map[string]any{
+		"httpStatusCode": status,
+		"apiErrorCode":   status,
+		"message":        reason,
+		"type":           "Error",
+	})
+}
+
+func (s *Server) failPayload(w http.ResponseWriter, seq, status int, reason string, payload map[string]any) {
 	s.finish(seq, status, reason)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"httpStatusCode": status,
-		"message":        reason,
-	})
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 // ok writes a success body and records the status.
@@ -416,11 +424,25 @@ func (s *Server) handleCustomGroups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// membershipDefinition is required, so the empty object is the correct value
-	// when nothing is configured. Its own properties are all optional.
 	var membership map[string]json.RawMessage
 	if err := json.Unmarshal(obj["membershipDefinition"], &membership); err != nil {
 		s.fail(w, seq, http.StatusBadRequest, "custom-group.membershipDefinition must be an object")
+		return
+	}
+	var included []string
+	_ = json.Unmarshal(membership["includedResources"], &included)
+	if len(included) == 0 {
+		message := "Invalid request... #2 violations found."
+		s.failPayload(w, seq, http.StatusBadRequest, message, map[string]any{
+			"type":    "Error",
+			"message": message,
+			"validationFailures": []map[string]any{
+				{"failureMessage": "Define member criteria or objects to include.", "violationPath": "membershipDefinition.definition"},
+				{"failureMessage": "Define member criteria or objects to include.", "violationPath": "membershipDefinition.validMembershipDefinition"},
+			},
+			"httpStatusCode": 400,
+			"apiErrorCode":   400,
+		})
 		return
 	}
 	if status, reason := checkProps(membership, "custom-group-membership", membershipProps, nil); status != 0 {
@@ -446,16 +468,36 @@ func (s *Server) handleCustomGroups(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(obj["resourceKey"], &rk)
 	if rk.AdapterKindKey != KnownAdapterKind || rk.ResourceKindKey != KnownResourceKind {
-		s.fail(w, seq, http.StatusUnprocessableEntity, fmt.Sprintf(
-			"unknown resource kind %s/%s", rk.AdapterKindKey, rk.ResourceKindKey))
+		message := "Internal Server error, cause unknown."
+		s.failPayload(w, seq, http.StatusInternalServerError, message, map[string]any{
+			"type":    "Error",
+			"message": message,
+			"moreInformation": []map[string]string{{
+				"name": "reason",
+				"value": fmt.Sprintf(
+					"Custom group creation failed: Cannot find ResourceKind by ResourceKindKey {adKind=%s, resKind=%s}",
+					rk.AdapterKindKey, rk.ResourceKindKey),
+			}},
+			"httpStatusCode": 500,
+			"apiErrorCode":   500,
+		})
 		return
 	}
 
+	var resourceKey map[string]any
+	_ = json.Unmarshal(obj["resourceKey"], &resourceKey)
+	resourceKey["resourceIdentifiers"] = []any{}
+	var membershipOut map[string]any
+	_ = json.Unmarshal(obj["membershipDefinition"], &membershipOut)
+	membershipOut["excludedResources"] = []any{}
+	membershipOut["custom-group-properties"] = []any{}
+	membershipOut["rules"] = []any{}
 	out := map[string]any{
 		"id":                    AssignedGroupID,
-		"resourceKey":           json.RawMessage(obj["resourceKey"]),
-		"membershipDefinition":  json.RawMessage(obj["membershipDefinition"]),
+		"resourceKey":           resourceKey,
+		"membershipDefinition":  membershipOut,
 		"autoResolveMembership": json.RawMessage(orDefault(obj["autoResolveMembership"], "false")),
+		"policy":                nil,
 	}
 	s.ok(w, seq, http.StatusCreated, out)
 }
@@ -493,7 +535,7 @@ func (s *Server) handlePolicies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if policyID != KnownPolicyID {
-		s.fail(w, seq, http.StatusNotFound, fmt.Sprintf("no policy with id %s", policyID))
+		s.fail(w, seq, http.StatusNotFound, fmt.Sprintf("No such Policy - %s.", policyID))
 		return
 	}
 
@@ -576,8 +618,8 @@ func (s *Server) handleNotificationRules(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if rule.PluginID != KnownPluginID {
-		s.fail(w, seq, http.StatusUnprocessableEntity,
-			fmt.Sprintf("no notification plugin instance with id %s", rule.PluginID))
+		s.fail(w, seq, http.StatusNotFound,
+			fmt.Sprintf("No such Notification Plugin - %s.", rule.PluginID))
 		return
 	}
 	// The spec's documented 404 for this operation: an invalid alert definition
@@ -590,16 +632,46 @@ func (s *Server) handleNotificationRules(w http.ResponseWriter, r *http.Request)
 		}
 		for _, id := range rule.AlertDefinitionIDFilters.Values {
 			if id != KnownAlertDefinitionID {
-				s.fail(w, seq, http.StatusNotFound,
-					fmt.Sprintf("unknown alert definition identifier %s in alertDefinitionIdFilters", id))
+				message := "Entity was not found."
+				s.failPayload(w, seq, http.StatusNotFound, message, map[string]any{
+					"type":    "Error",
+					"message": message,
+					"moreInformation": []map[string]string{{
+						"name":  "errorMessage",
+						"value": fmt.Sprintf("Alert Definition Ids [%s] not found.", id),
+					}},
+					"httpStatusCode": 404,
+					"apiErrorCode":   404,
+				})
 				return
 			}
 		}
 	}
 
-	out := map[string]any{"id": AssignedRuleID}
+	out := map[string]any{
+		"id":                  AssignedRuleID,
+		"alertControlStates":  []any{},
+		"alertStatuses":       []any{},
+		"actionStatuses":      []any{},
+		"resourceKindFilters": []any{},
+		"resourceFilters":     []any{},
+		"alertTypeFilters":    []any{},
+		"properties":          []any{},
+		"sendHeartbeat":       false,
+		"links": []map[string]string{{
+			"href": "/suite-api/api/notifications/rules/" + AssignedRuleID,
+			"rel":  "SELF",
+			"name": "linkToSelf",
+		}},
+	}
 	for k, v := range obj {
 		out[k] = json.RawMessage(v)
+	}
+	if _, ok := out["templateId"]; !ok {
+		out["templateId"] = DefaultTemplateID
+	}
+	if _, ok := out["criticalities"]; !ok {
+		out["criticalities"] = []any{}
 	}
 	s.ok(w, seq, http.StatusCreated, out)
 }

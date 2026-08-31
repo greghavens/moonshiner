@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from mock_api import ContractMockServer  # noqa: E402
-from vcf_vks_retry import VksRetryClient  # noqa: E402
+from vcf_vks_retry import ApiError, VksRetryClient  # noqa: E402
 
 
 def fail(message: str) -> None:
@@ -147,16 +147,16 @@ def main() -> None:
     validate_source_contract()
 
     suffix = secrets.token_hex(6)
-    namespace = f"team blue/ñ-{suffix}"
-    cluster_after = f"payments-{suffix}"
+    namespace = "vmsp-platform"
+    cluster_after = "vcf-msr01"
     cluster_before = f"search-{suffix}"
     supervisor_id = f"supervisor-{secrets.token_hex(8)}"
-    session_id = secrets.token_urlsafe(25)
+    session_id = secrets.token_hex(16)
     token = secrets.token_urlsafe(31)
     maintenance_id = f"maint π/{secrets.token_hex(7)}"
     existing_key = f"existing.example/{secrets.token_hex(4)}"
     existing_value = secrets.token_hex(9)
-    uid_after = secrets.token_hex(16)
+    uid_after = "fcccd77e-e4fa-4ab8-a6a2-4dadf2b34212"
     uid_before = secrets.token_hex(16)
 
     namespace_info = {
@@ -182,14 +182,14 @@ def main() -> None:
             },
             "spec": {
                 "topology": {
-                    "class": "builtin-generic-v3.6.0",
-                    "version": "v1.33.6+vmware.1",
+                    "classRef": {"name": "vsphere-9.1.2668"},
+                    "version": "v1.34.2",
                 }
             },
         }
 
     initial_clusters = {
-        cluster_after: cluster(cluster_after, uid_after, "410"),
+        cluster_after: cluster(cluster_after, uid_after, "2545994"),
         cluster_before: cluster(cluster_before, uid_before, "830"),
     }
 
@@ -259,6 +259,24 @@ def main() -> None:
                 expect_raises((TypeError, ValueError), call, label)
             if read_log(request_log):
                 fail("input validation was not completed before traffic")
+
+            try:
+                client.mark_clusters(
+                    namespace=namespace,
+                    cluster_names=[cluster_after],
+                    maintenance_id=maintenance_id,
+                )
+            except ApiError as error:
+                if error.status_code != 404:
+                    fail("live namespace failure did not preserve HTTP 404")
+            else:
+                fail("live absent namespace unexpectedly passed the gate")
+            primary_records = read_log(request_log)
+            if len(primary_records) != 1 or not primary_records[0][
+                "target"
+            ].startswith("/api/vcenter/namespaces/instances/v2/"):
+                fail("live namespace 404 did not stop before Kubernetes")
+            request_log.write_text("", encoding="utf-8")
 
             result = client.mark_clusters(
                 namespace=namespace,
@@ -374,7 +392,7 @@ def main() -> None:
         record for record in records if record["method"] == "PATCH"
     ]
     expected_patch_bodies = [
-        expected_patch("410"),
+        expected_patch("2545994"),
         expected_patch("830"),
         expected_patch("830"),
     ]

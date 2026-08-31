@@ -8,8 +8,9 @@ type NameValue struct {
 
 // Credential is the credential instance an adapter instance authenticates with.
 //
-// Fields is optional.
+// ID identifies an existing credential and is optional. Fields is optional.
 type Credential struct {
+	ID                string
 	Name              string
 	AdapterKindKey    string
 	CredentialKindKey string

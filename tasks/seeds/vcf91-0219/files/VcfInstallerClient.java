@@ -12,26 +12,16 @@ public final class VcfInstallerClient {
             Boolean isAuthenticated) {
     }
 
-    /** Writable DepotAccount members, in specification declaration order. */
-    public record DepotAccount(
-            String username,
-            String password,
-            String downloadToken,
-            String downloadActivationCode) {
+    public record ServiceNodeAddress(String type, String value) {
     }
 
-    /** isOfflineDepot is required whenever this nested object is present. */
-    public record DepotConfiguration(
-            boolean isOfflineDepot,
-            String hostname,
-            Integer port,
-            String url) {
+    public record ServiceNode(String name, List<ServiceNodeAddress> addresses) {
     }
 
-    public record DepotSettings(
-            DepotAccount vmwareAccount,
-            DepotAccount offlineAccount,
-            DepotConfiguration depotConfiguration) {
+    public record ServiceConfig(String name, String type, String key, List<ServiceNode> nodes) {
+    }
+
+    public record ServicesConfig(List<ServiceConfig> services) {
     }
 
     public enum Outcome {
@@ -158,8 +148,8 @@ public final class VcfInstallerClient {
         // TODO: implement validation and client construction.
     }
 
-    /** Applies proxy, depot settings, and metadata sync in contract order. */
-    public ChangeReport configureDepotAccess(ProxyConfiguration proxy, DepotSettings depot)
+    /** Applies proxy, services configuration, and metadata sync in contract order. */
+    public ChangeReport configureDepotAccess(ProxyConfiguration proxy, ServicesConfig services)
             throws ChangeException {
         throw new UnsupportedOperationException("not implemented");
     }

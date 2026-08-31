@@ -16,18 +16,18 @@ from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parent
 CONTRACT_PATH = ROOT / "docs" / "contract.json"
-OPERATION_ID = "UpdateGroupForDomain"
+OPERATION_ID = "PatchGroupForDomain"
 
 
 def load_contract() -> tuple[str, dict[str, object]]:
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
     operations = contract.get("operations")
     if not isinstance(operations, dict) or list(operations) != [OPERATION_ID]:
-        raise RuntimeError("mock contract must name only UpdateGroupForDomain")
+        raise RuntimeError("mock contract must name only PatchGroupForDomain")
     operation = operations[OPERATION_ID]
     if (
         operation.get("operationId") != OPERATION_ID
-        or operation.get("method") != "PUT"
+        or operation.get("method") != "PATCH"
         or operation.get("path")
         != "/infra/domains/{domain-id}/groups/{group-id}"
     ):
@@ -116,7 +116,7 @@ class Handler(BaseHTTPRequestHandler):
             },
         )
 
-    def do_PUT(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+    def do_PATCH(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         target = urlsplit(self.path)
         match = ROUTE.fullmatch(target.path)
         if match is None or target.query or target.fragment:
@@ -245,15 +245,15 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.close()
             return
 
-        response = copy.deepcopy(decoded)
-        response["id"] = group_id
-        response["path"] = f"/infra/domains/{domain_id}/groups/{group_id}"
-        response["_revision"] = 0
-        self._send_json(200, response)
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
 
     do_GET = _not_found
     do_POST = _not_found
-    do_PATCH = _not_found
+    do_PUT = _not_found
     do_DELETE = _not_found
 
 

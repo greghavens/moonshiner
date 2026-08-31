@@ -67,6 +67,17 @@ class State:
                 os.fsync(stream.fileno())
 
     def discovery_payload(self, authority: str) -> list[dict[str, str]]:
+        with self.lock:
+            first = self.discovery_count == 0
+            self.discovery_count += 1
+        if self.config.get("live_blank_first") and first:
+            return [
+                {
+                    "control_plane_api_server_port": 6443,
+                    "master_host": "",
+                    "namespace": "",
+                }
+            ]
         target = {
             "namespace": self.config["namespace"],
             "master_host": authority,
@@ -77,7 +88,6 @@ class State:
         }
         with self.lock:
             reverse = self.discovery_count % 2 == 1
-            self.discovery_count += 1
         values = [distractor, target]
         if reverse:
             values.reverse()

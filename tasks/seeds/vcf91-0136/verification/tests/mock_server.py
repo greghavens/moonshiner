@@ -80,6 +80,7 @@ class ContractServer(ThreadingHTTPServer):
         self.log_path = log_path
         self.config = config
         self.lock = threading.Lock()
+        self.namespace_list_count = 0
 
     def match_route(
         self, method: str, path: str
@@ -156,6 +157,19 @@ class Handler(BaseHTTPRequestHandler):
         decoded = tuple(unquote(value) for value in captures)
 
         if name == "namespace.listAuthorized":
+            self.server.namespace_list_count += 1
+            if self.server.namespace_list_count == 1:
+                self._json(
+                    200,
+                    [
+                        {
+                            "control_plane_api_server_port": 6443,
+                            "master_host": "",
+                            "namespace": "",
+                        }
+                    ],
+                )
+                return
             self._json(
                 200,
                 [
@@ -189,10 +203,10 @@ class Handler(BaseHTTPRequestHandler):
                         "phase": "Provisioning",
                         "conditions": [
                             {
-                                "type": "Ready",
+                                "type": "TopologyReconciled",
                                 "status": "False",
-                                "reason": "ReconcileError",
-                                "message": "Controller reconciliation failed.",
+                                "reason": "ReconcileFailed",
+                                "message": "Topology reconciliation failed.",
                             }
                         ],
                     },
@@ -226,10 +240,10 @@ class Handler(BaseHTTPRequestHandler):
                                 "uid": config["cluster_uid"],
                             },
                             "type": "Warning",
-                            "reason": "ReconcileError",
+                            "reason": "ReconcileFailed",
                             "message": (
-                                "VKS reconciliation failed; correlationId="
-                                + config["correlation_id"]
+                                "Topology reconciliation failed; reconcileID="
+                                + config["reconcile_id"]
                             ),
                         }
                     ],
@@ -255,9 +269,8 @@ class Handler(BaseHTTPRequestHandler):
                                 "name": config["controller_pod"],
                                 "namespace": config["controller_namespace"],
                                 "labels": {
-                                    "app.kubernetes.io/name": (
-                                        "vks-cluster-controller"
-                                    )
+                                    "cluster.x-k8s.io/provider": "cluster-api",
+                                    "control-plane": "controller-manager",
                                 },
                             },
                             "status": {
@@ -269,7 +282,23 @@ class Handler(BaseHTTPRequestHandler):
                                     }
                                 ],
                             },
-                        }
+                        },
+                        {
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "metadata": {
+                                "name": config["second_controller_pod"],
+                                "namespace": config["controller_namespace"],
+                                "labels": {
+                                    "cluster.x-k8s.io/provider": "cluster-api",
+                                    "control-plane": "controller-manager",
+                                },
+                            },
+                            "status": {
+                                "phase": "Running",
+                                "containerStatuses": [{"name": "manager", "ready": True}],
+                            },
+                        },
                     ],
                 },
             )
@@ -282,35 +311,14 @@ class Handler(BaseHTTPRequestHandler):
             ):
                 self._status(404, "NotFound")
                 return
-            lines = [
-                {
-                    "level": "error",
-                    "correlationId": config["decoy_correlation_id"],
-                    "namespace": config["namespace"],
-                    "cluster": config["cluster_name"],
-                    "cause": "NetworkUnavailable",
-                    "storageClass": "decoy-" + config["suffix"],
-                },
-                {
-                    "level": "error",
-                    "correlationId": config["correlation_id"],
-                    "namespace": config["namespace"],
-                    "cluster": config["cluster_name"],
-                    "cause": "StorageClassNotFound",
-                    "storageClass": config["missing_storage_class"],
-                },
-                {
-                    "level": "error",
-                    "correlationId": config["decoy_correlation_id"],
-                    "namespace": "unrelated-" + config["suffix"],
-                    "cluster": config["cluster_name"],
-                    "cause": "StorageClassNotFound",
-                    "storageClass": "wrong-" + config["suffix"],
-                },
-            ]
-            payload = "".join(
-                json.dumps(item, separators=(",", ":")) + "\n"
-                for item in lines
+            payload = (
+                'E0831 12:00:00.000000 1 controller.go:100] "Reconciler error" '
+                f'Cluster="{config["namespace"]}/{config["cluster_name"]}" '
+                f'reconcileID="{config["decoy_reconcile_id"]}" error="decoy"\n'
+                'E0831 12:00:01.000000 1 controller.go:101] "Reconciler error" '
+                f'Cluster="{config["namespace"]}/{config["cluster_name"]}" '
+                f'reconcileID="{config["reconcile_id"]}" '
+                f'error="{config["controller_message"]}"\n'
             )
             self._text(200, payload)
             return

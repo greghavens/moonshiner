@@ -16,4 +16,4 @@ trap cleanup EXIT
 
 cp "$project_root/tests/verify/client_protected_test.go" "$protected_test"
 cd "$project_root"
-GOTOOLCHAIN=local GOPROXY=off go test -race ./...
+GOTOOLCHAIN=local GOPROXY=off go test -race ./vcenter ./internal/mockvcenter

@@ -159,7 +159,19 @@ class Handler(BaseHTTPRequestHandler):
         config = self.server.config
         if name == "namespace.getV2":
             if captures[0] != config["namespace"] or not self.server.namespace_exists:
-                self._json(404, {"error_type": "NOT_FOUND"})
+                self._json(
+                    404,
+                    {
+                        "error_type": "NOT_FOUND",
+                        "messages": [
+                            {
+                                "id": "vcenter.wcp.workload.notfound",
+                                "default_message": "Namespace was not found.",
+                                "args": [config["namespace"]],
+                            }
+                        ],
+                    },
+                )
                 return
             self._json(
                 200,
@@ -173,12 +185,24 @@ class Handler(BaseHTTPRequestHandler):
         if name == "namespace.createV2":
             with self.server.lock:
                 self.server.namespace_create_attempts += 1
-                self.server.namespace_exists = True
                 first_attempt = self.server.namespace_create_attempts == 1
             if first_attempt:
-                self._json(503, {"error_type": "SERVICE_UNAVAILABLE"})
+                self._json(
+                    404,
+                    {
+                        "error_type": "NOT_FOUND",
+                        "messages": [
+                            {
+                                "id": "vcenter.wcp.supervisor.notfound",
+                                "default_message": "The Supervisor with identifier supervisor-live-validation-missing was not found.",
+                                "args": ["supervisor-live-validation-missing"],
+                            }
+                        ],
+                    },
+                )
             else:
-                self._empty(204)
+                self.server.namespace_exists = True
+                self._json(503, {"error_type": "SERVICE_UNAVAILABLE"})
             return
 
         if name == "kubernetes.cluster.get":
@@ -219,13 +243,29 @@ class Handler(BaseHTTPRequestHandler):
             "metadata": {
                 "name": config["cluster_name"],
                 "namespace": config["namespace"],
+                "uid": "fcccd77e-e4fa-4ab8-a6a2-4dadf2b34212",
             },
             "spec": {
                 "topology": {
-                    "class": config["cluster_class"],
+                    "classRef": {"name": config["cluster_class"]},
                     "version": config["kubernetes_version"],
+                    "controlPlane": {"replicas": config["control_plane_replicas"]},
+                    "workers": {
+                        "machineDeployments": [
+                            {
+                                "class": config["worker_class"],
+                                "name": config["worker_name"],
+                                "replicas": config["worker_replicas"],
+                            }
+                        ]
+                    },
+                    "variables": [
+                        {"name": name, "value": config["topology_variables"][name]}
+                        for name in config["topology_variable_order"]
+                    ],
                 }
             },
+            "status": {"phase": "Provisioned"},
         }
 
     def _empty(self, status: int) -> None:

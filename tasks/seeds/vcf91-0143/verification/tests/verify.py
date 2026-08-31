@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from mock_api import ContractMockServer  # noqa: E402
-from vcf_vks_guard import GuardedClusterClient  # noqa: E402
+from vcf_vks_guard import ApiError, GuardedClusterClient  # noqa: E402
 
 
 COMMIT = "c3f3b52c845dd967cabbc21680e893292077d5ba"
@@ -418,16 +418,16 @@ def main() -> None:
     validate_python_shape()
 
     suffix = secrets.token_hex(7)
-    namespace = f"team blue/ñ-{suffix}"
-    cluster_name = f"payments #1/{suffix}"
+    namespace = "vmsp-platform"
+    cluster_name = "vcf-msr01"
     supervisor = f"supervisor-{secrets.token_hex(9)}"
-    old_version = f"v1.32.{secrets.randbelow(8) + 1}+vmware.1"
+    old_version = "v1.34.2"
     target_version = (
         f"v1.33.{secrets.randbelow(8) + 1}+vmware.2-π"
     )
-    session_id = secrets.token_urlsafe(27)
+    session_id = secrets.token_hex(16)
     token = secrets.token_urlsafe(35)
-    statuses = ["ERROR", "RUNNING"]
+    statuses = ["NOT_FOUND", "ERROR", "RUNNING"]
 
     with tempfile.TemporaryDirectory(
         prefix="vcf-vks-guard-"
@@ -478,6 +478,24 @@ def main() -> None:
                 "argument validation was not completed before traffic",
             )
 
+            try:
+                client.reconcile_version(**valid_arguments)
+            except ApiError as error:
+                require(
+                    "HTTP 404" in str(error),
+                    "live namespace absence did not preserve HTTP 404",
+                )
+            else:
+                fail("live absent namespace unexpectedly passed the gate")
+            primary_records = read_log(request_log)
+            require(
+                len(primary_records) == 1
+                and primary_records[0]["operation"]
+                == "getSupervisorNamespace",
+                "live namespace 404 did not stop before Kubernetes",
+            )
+            request_log.write_text("", encoding="utf-8")
+
             blocked = client.reconcile_version(
                 supervisor=supervisor,
                 namespace=namespace,
@@ -522,7 +540,7 @@ def main() -> None:
         after_blocked_state
         == {
             "cluster_version": old_version,
-            "namespace_get_count": 1,
+            "namespace_get_count": 2,
             "cluster_patch_attempts": 0,
         },
         f"failed precheck changed state: {after_blocked_state!r}",
@@ -542,7 +560,7 @@ def main() -> None:
         final_state
         == {
             "cluster_version": target_version,
-            "namespace_get_count": 2,
+            "namespace_get_count": 3,
             "cluster_patch_attempts": 1,
         },
         f"successful gated state differs: {final_state!r}",

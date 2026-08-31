@@ -4,15 +4,15 @@ import java.util.ArrayList;
 import java.util.List;
 
 public final class TestMain {
-    private static final String SESSION_ID = "session-test-9.1";
+    private static final String SESSION_ID = "0123456789abcdef0123456789abcdef";
 
     private static final String EXPECTED_JSON_LINES = """
-            {"category_id":"cat-a1","name":"Alpha","description":"first alpha\\nline","cardinality":"MULTIPLE","associable_types":["Datastore"],"used_by":[]}
-            {"category_id":"cat-a2","name":"Alpha","description":"second alpha","cardinality":"SINGLE","associable_types":[],"used_by":["com.acme.ops"]}
-            {"category_id":"cat-b","name":"Beta","description":"middle","cardinality":"SINGLE","associable_types":[],"used_by":[]}
-            {"category_id":"cat-q","name":"Quote \\"Ops\\"","description":"path C:\\\\inventory","cardinality":"SINGLE","associable_types":["Folder"],"used_by":["team-a","team-b"]}
-            {"category_id":"cat-z","name":"Zulu","description":"last page-order item","cardinality":"MULTIPLE","associable_types":["VirtualMachine"],"used_by":[]}
-            {"category_id":"cat-omega","name":"Ωmega","description":"unicode name","cardinality":"MULTIPLE","associable_types":["VirtualMachine","Datastore"],"used_by":[]}
+            {"category_id":"urn:vmomi:InventoryServiceCategory:11111111-1111-4111-8111-111111111111:GLOBAL","name":"Alpha","description":"first alpha\\nline","cardinality":"MULTIPLE","associable_types":["urn:vim25:Datastore"],"used_by":[]}
+            {"category_id":"urn:vmomi:InventoryServiceCategory:22222222-2222-4222-8222-222222222222:GLOBAL","name":"Alpha","description":"second alpha","cardinality":"SINGLE","associable_types":[],"used_by":[]}
+            {"category_id":"urn:vmomi:InventoryServiceCategory:33333333-3333-4333-8333-333333333333:GLOBAL","name":"Beta","description":"middle","cardinality":"SINGLE","associable_types":[],"used_by":[]}
+            {"category_id":"urn:vmomi:InventoryServiceCategory:44444444-4444-4444-8444-444444444444:GLOBAL","name":"Quote \\"Ops\\"","description":"path C:\\\\inventory","cardinality":"SINGLE","associable_types":["urn:vim25:Folder"],"used_by":[]}
+            {"category_id":"urn:vmomi:InventoryServiceCategory:66666666-6666-4666-8666-666666666666:GLOBAL","name":"Zulu","description":"last page-order item","cardinality":"MULTIPLE","associable_types":["urn:vim25:VirtualMachine"],"used_by":[]}
+            {"category_id":"urn:vmomi:InventoryServiceCategory:55555555-5555-4555-8555-555555555555:GLOBAL","name":"Ωmega","description":"unicode name","cardinality":"MULTIPLE","associable_types":["urn:vim25:VirtualMachine","urn:vim25:Datastore"],"used_by":[]}
             """;
 
     public static void main(String[] arguments) throws Exception {
@@ -72,12 +72,12 @@ public final class TestMain {
             }
             checkEquals(label + " complete returned collection order",
                     List.of(
-                            "Alpha\u0000cat-a1",
-                            "Alpha\u0000cat-a2",
-                            "Beta\u0000cat-b",
-                            "Quote \"Ops\"\u0000cat-q",
-                            "Zulu\u0000cat-z",
-                            "Ωmega\u0000cat-omega"),
+                            "Alpha\u0000urn:vmomi:InventoryServiceCategory:11111111-1111-4111-8111-111111111111:GLOBAL",
+                            "Alpha\u0000urn:vmomi:InventoryServiceCategory:22222222-2222-4222-8222-222222222222:GLOBAL",
+                            "Beta\u0000urn:vmomi:InventoryServiceCategory:33333333-3333-4333-8333-333333333333:GLOBAL",
+                            "Quote \"Ops\"\u0000urn:vmomi:InventoryServiceCategory:44444444-4444-4444-8444-444444444444:GLOBAL",
+                            "Zulu\u0000urn:vmomi:InventoryServiceCategory:66666666-6666-4666-8666-666666666666:GLOBAL",
+                            "Ωmega\u0000urn:vmomi:InventoryServiceCategory:55555555-5555-4555-8555-555555555555:GLOBAL"),
                     order, failures);
 
             StringBuilder output = new StringBuilder();
@@ -118,7 +118,7 @@ public final class TestMain {
 
         String[] expectedQueries = {
                 null,
-                "marker=next+marker%2F2%3Fafter%3Dcat-z%26full%3Dtrue%2Bkeep",
+                MockVcenterServer.liveShapedMarkerQuery(),
                 "marker=final%2Bpage%2F3"
         };
         for (int index = 0; index < log.size(); index++) {

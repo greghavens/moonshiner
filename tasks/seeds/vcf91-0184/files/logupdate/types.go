@@ -1,5 +1,4 @@
-// Package logupdate implements the focused VCF Operations Log Management
-// contract recorded in docs/contract.json.
+// Package logupdate implements focused VCF Operations Log Management updates.
 package logupdate
 
 import (

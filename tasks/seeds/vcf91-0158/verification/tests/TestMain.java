@@ -15,6 +15,45 @@ public final class TestMain {
                 .version(HttpClient.Version.HTTP_1_1)
                 .build();
 
+        VcfVksPagedInventoryClient blankDiscoveryClient =
+                new VcfVksPagedInventoryClient(
+                        URI.create(base + "/api"),
+                        session,
+                        token,
+                        2,
+                        Duration.ofSeconds(3),
+                        httpClient);
+        try {
+            blankDiscoveryClient.listInventory();
+            throw new AssertionError(
+                    "live blank namespace discovery must be rejected");
+        } catch (java.io.IOException expected) {
+            check(!expected.getMessage().contains(session),
+                    "blank discovery failure leaked the vCenter session");
+            check(!expected.getMessage().contains(token),
+                    "blank discovery failure leaked the Kubernetes token");
+        }
+
+        VcfVksPagedInventoryClient liveOnePageClient =
+                new VcfVksPagedInventoryClient(
+                        URI.create(base + "/api"),
+                        session,
+                        token,
+                        200,
+                        Duration.ofSeconds(3),
+                        httpClient);
+        List<VcfVksPagedInventoryClient.ClusterRecord> liveOnePage =
+                liveOnePageClient.listInventory();
+        check(liveOnePage.size() == 1,
+                "live one-page fixture must return exactly one Cluster");
+        var liveCluster = liveOnePage.get(0);
+        check(liveCluster.supervisorNamespace().equals(
+                        "vm-service-domain-c8")
+                        && liveCluster.name().equals("vcf-msr01")
+                        && liveCluster.kubernetesVersion().equals("v1.34.2")
+                        && liveCluster.phase().equals("Provisioned"),
+                "live one-page Cluster projection changed");
+
         VcfVksPagedInventoryClient client =
                 new VcfVksPagedInventoryClient(
                         URI.create(base + "/api"),

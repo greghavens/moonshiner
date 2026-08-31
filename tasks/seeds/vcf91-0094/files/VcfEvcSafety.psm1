@@ -14,8 +14,12 @@ function Set-VcfClusterEvcModeSafely {
         [ValidateNotNullOrEmpty()]
         [string] $ClusterId,
 
-        [Parameter()]
+        [Parameter(Mandatory)]
+        [ValidateNotNull()]
         [object] $EvcMode,
+
+        [Parameter()]
+        [switch] $SkipCertificateCheck,
 
         [Parameter()]
         [ValidateRange(1, 3600)]

@@ -5,6 +5,7 @@ package verifier
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -176,6 +177,88 @@ func TestAcquireTokenWireShape(t *testing.T) {
 				t.Errorf("token = %q, want %q", c.Token(), opsmock.IssuedToken)
 			}
 		})
+	}
+}
+
+func TestReleaseTokenWireShapeAndLifecycle(t *testing.T) {
+	c, srv := newAuthedClient(t, 3)
+
+	if err := c.ReleaseToken(context.Background()); err != nil {
+		t.Fatalf("ReleaseToken: %v", err)
+	}
+	reqs := srv.Requests()
+	if len(reqs) != 1 {
+		t.Fatalf("request count = %d, want 1: %s", len(reqs), summarize(reqs))
+	}
+	r := reqs[0]
+	if r.Method != http.MethodPost || r.Path != opsmock.PathReleaseToken {
+		t.Errorf("route = %s %s, want POST %s", r.Method, r.Path, opsmock.PathReleaseToken)
+	}
+	if r.RawQuery != "" {
+		t.Errorf("raw query = %q, want none", r.RawQuery)
+	}
+	if len(r.Body) != 0 {
+		t.Errorf("body = %q, want none", r.Body)
+	}
+	if r.ContentType != "" {
+		t.Errorf("Content-Type = %q, want none for a bodyless request", r.ContentType)
+	}
+	if !acceptsJSON(r.Accept) {
+		t.Errorf("Accept = %q, want it to allow application/json", r.Accept)
+	}
+	if want := opsmock.TokenPrefix + opsmock.IssuedToken; r.Authorization != want {
+		t.Errorf("Authorization = %q, want %q", r.Authorization, want)
+	}
+	if r.Status != http.StatusOK {
+		t.Errorf("status = %d, want 200", r.Status)
+	}
+	if c.Token() != "" {
+		t.Errorf("Token() = %q after release, want empty", c.Token())
+	}
+
+	srv.Reset()
+	if err := c.ReleaseToken(context.Background()); err != nil {
+		t.Fatalf("second ReleaseToken: %v", err)
+	}
+	if reqs := srv.Requests(); len(reqs) != 0 {
+		t.Fatalf("idempotent ReleaseToken sent %d requests, want none", len(reqs))
+	}
+	if _, err := c.ListSymptomDefinitions(context.Background(), opsclient.Filter{}); err == nil {
+		t.Fatal("ListSymptomDefinitions after release succeeded, want a no-token error")
+	}
+	if reqs := srv.Requests(); len(reqs) != 0 {
+		t.Fatalf("list after release sent %d requests, want none", len(reqs))
+	}
+}
+
+func TestFailedReleaseKeepsTheStoredToken(t *testing.T) {
+	c, srv := newAuthedClient(t, 1)
+
+	// Terminate the mock session behind the client's back so the client's own
+	// release receives 401.
+	req, err := http.NewRequest(http.MethodPost, srv.URL()+"/api/auth/token/release", nil)
+	if err != nil {
+		t.Fatalf("build external release: %v", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", opsmock.TokenPrefix+opsmock.IssuedToken)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("external release: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("external release status = %d, want 200", resp.StatusCode)
+	}
+
+	srv.Reset()
+	err = c.ReleaseToken(context.Background())
+	var apiErr *opsclient.APIError
+	if !errors.As(err, &apiErr) || apiErr.OperationID != "releaseToken" || apiErr.Status != http.StatusUnauthorized {
+		t.Fatalf("ReleaseToken error = %v, want releaseToken APIError with status 401", err)
+	}
+	if c.Token() != opsmock.IssuedToken {
+		t.Errorf("Token() = %q after failed release, want original token %q retained", c.Token(), opsmock.IssuedToken)
 	}
 }
 

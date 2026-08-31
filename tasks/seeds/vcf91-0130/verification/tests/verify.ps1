@@ -138,7 +138,7 @@ try {
         'Vcenter.Namespaces.User.Instances_list' `
         'contract vCenter operationId'
     Assert-Equal $VcenterOperation.sdkCmdlet `
-        'Invoke-VcenterNamespacesUserInstancesList' `
+        'Invoke-ListNamespacesUser' `
         'contract SDK cmdlet'
     Assert-Equal $VcenterOperation.method 'GET' `
         'contract vCenter method'
@@ -202,7 +202,7 @@ try {
     $SourceText = Get-Content -Raw -LiteralPath $ModulePath
     foreach ($Required in @(
         'VMware.Sdk.vSphere',
-        'Invoke-VcenterNamespacesUserInstancesList',
+        'Invoke-ListNamespacesUser',
         'System.Net.Http.HttpRequestMessage',
         'Import-Module'
     )) {
@@ -239,7 +239,7 @@ try {
     $Suffix = $RunId.Substring(0, 6).ToLowerInvariant()
     $OldToken = 'old-' + $RunId.Substring(6, 16)
     $FreshToken = 'fresh-' + $RunId.Substring(22, 10)
-    $NamespaceAlpha = 'alpha-' + $Suffix
+    $NamespaceAlpha = 'vmsp-platform'
     $NamespaceMiddle = 'middle-' + $Suffix
     $NamespaceZulu = 'zulu-' + $Suffix
     $Namespaces = @(
@@ -251,9 +251,9 @@ try {
     $Clusters[$NamespaceAlpha] = @(
         (New-ClusterFixture `
             -Namespace $NamespaceAlpha `
-            -Name ('zeta-' + $Suffix) `
-            -Uid ([guid]::NewGuid().ToString()) `
-            -Version 'v1.34.2+vmware.1' `
+            -Name 'vcf-msr01' `
+            -Uid 'fcccd77e-e4fa-4ab8-a6a2-4dadf2b34212' `
+            -Version 'v1.34.2' `
             -Phase 'Provisioned'),
         (New-ClusterFixture `
             -Namespace $NamespaceAlpha `
@@ -287,9 +287,10 @@ try {
     $Scenario = [ordered]@{
         old_token = $OldToken
         fresh_token = $FreshToken
-        expiry_namespace = $NamespaceMiddle
+        expiry_namespace = $NamespaceAlpha
         namespaces = $Namespaces
         clusters_by_namespace = $Clusters
+        live_blank_first = $true
     }
     [IO.File]::WriteAllText(
         $ScenarioPath,
@@ -419,6 +420,18 @@ try {
     Assert-Equal @(Read-RequestLog).Count 0 `
         'session construction performs no traffic'
 
+    $LiveGapError = $null
+    try {
+        $null = Get-VcfVksClusterInventory -Session $Session
+    }
+    catch {
+        $LiveGapError = $_
+    }
+    Assert-True ($null -ne $LiveGapError) `
+        'exact live blank namespace summary must fail validation'
+    Assert-Equal @(Read-RequestLog).Count 1 `
+        'blank live namespace summary fails before Kubernetes fan-out'
+
     $First = Get-VcfVksClusterInventory -Session $Session
     $Second = Get-VcfVksClusterInventory -Session $Session
 
@@ -437,8 +450,8 @@ try {
 
     $Expected = @(
         foreach ($Namespace in @(
-            $NamespaceAlpha,
             $NamespaceMiddle,
+            $NamespaceAlpha,
             $NamespaceZulu
         )) {
             foreach ($Cluster in @(
@@ -482,9 +495,15 @@ try {
     }
 
     $Requests = @(Read-RequestLog)
-    Assert-Equal $Requests.Count 9 `
+    Assert-Equal $Requests.Count 10 `
         'exact request count across initial and replacement generations'
     $ExpectedRequests = @(
+        [pscustomobject]@{
+            Kind = 'vcenter'
+            Target = '/api/vcenter/namespaces-user/namespaces'
+            Token = $OldToken
+            Status = 200
+        },
         [pscustomobject]@{
             Kind = 'vcenter'
             Target = '/api/vcenter/namespaces-user/namespaces'
@@ -495,7 +514,7 @@ try {
             Kind = 'kube'
             Target = (
                 '/apis/cluster.x-k8s.io/v1beta2/namespaces/' +
-                $NamespaceAlpha + '/clusters'
+                $NamespaceMiddle + '/clusters'
             )
             Token = $OldToken
             Status = 200
@@ -504,7 +523,7 @@ try {
             Kind = 'kube'
             Target = (
                 '/apis/cluster.x-k8s.io/v1beta2/namespaces/' +
-                $NamespaceMiddle + '/clusters'
+                $NamespaceAlpha + '/clusters'
             )
             Token = $OldToken
             Status = 401
@@ -513,7 +532,7 @@ try {
             Kind = 'kube'
             Target = (
                 '/apis/cluster.x-k8s.io/v1beta2/namespaces/' +
-                $NamespaceMiddle + '/clusters'
+                $NamespaceAlpha + '/clusters'
             )
             Token = $FreshToken
             Status = 200
@@ -537,7 +556,7 @@ try {
             Kind = 'kube'
             Target = (
                 '/apis/cluster.x-k8s.io/v1beta2/namespaces/' +
-                $NamespaceAlpha + '/clusters'
+                $NamespaceMiddle + '/clusters'
             )
             Token = $FreshToken
             Status = 200
@@ -546,7 +565,7 @@ try {
             Kind = 'kube'
             Target = (
                 '/apis/cluster.x-k8s.io/v1beta2/namespaces/' +
-                $NamespaceMiddle + '/clusters'
+                $NamespaceAlpha + '/clusters'
             )
             Token = $FreshToken
             Status = 200
@@ -608,22 +627,22 @@ try {
                 "request $Index omits vCenter session header"
         }
     }
-    Assert-Equal $Requests[2].rawTarget $Requests[3].rawTarget `
+    Assert-Equal $Requests[3].rawTarget $Requests[4].rawTarget `
         'refresh retries the byte-identical interrupted target'
     Assert-Equal @(
         $Requests |
         Where-Object {
-            $_.rawTarget -ceq $ExpectedRequests[1].Target
+            $_.rawTarget -ceq $ExpectedRequests[2].Target
         }
     ).Count 2 `
         'completed first namespace is not repeated during refresh'
-    Assert-True ([bool] $Requests[0].collectionReversed) `
-        'first vCenter result was reversed'
-    Assert-True (-not [bool] $Requests[5].collectionReversed) `
-        'second vCenter result used the opposite order'
+    Assert-True (-not [bool] $Requests[1].collectionReversed) `
+        'first contract-coverage vCenter result retained service order'
+    Assert-True ([bool] $Requests[6].collectionReversed) `
+        'second contract-coverage vCenter result used the opposite order'
     Assert-True (
-        [bool] $Requests[1].collectionReversed -ne
-        [bool] $Requests[6].collectionReversed
+        [bool] $Requests[2].collectionReversed -ne
+        [bool] $Requests[7].collectionReversed
     ) `
         'same VKS collection used opposite item order across calls'
 

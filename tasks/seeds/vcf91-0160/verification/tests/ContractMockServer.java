@@ -53,6 +53,7 @@ final class ContractMockServer implements AutoCloseable {
 
     enum FailurePoint {
         NONE,
+        LIVE_NAMESPACE_404,
         NAMESPACE,
         LABEL,
         VERSION,
@@ -322,6 +323,15 @@ final class ContractMockServer implements AutoCloseable {
         if (fixture.failurePoint() == FailurePoint.NAMESPACE) {
             return new Response(
                     409, bytes("{\"error\":\"namespace_conflict\"}"));
+        }
+        if (fixture.failurePoint() == FailurePoint.LIVE_NAMESPACE_404) {
+            return new Response(
+                    404,
+                    bytes("{\"error_type\":\"NOT_FOUND\","
+                            + "\"messages\":[{\"id\":"
+                            + "\"vcenter.wcp.workload.notfound\","
+                            + "\"default_message\":"
+                            + "\"Workload not found.\"}]}"));
         }
         namespaceCommitted = true;
         return new Response(204, new byte[0]);

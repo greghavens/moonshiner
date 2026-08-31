@@ -26,10 +26,9 @@ $script:Password = 'VMw@re123!Ops'
 $script:AuthSource = 'vIDMAuthSource'
 $script:SessionToken = '8f2c41d7a05b4e9ab6d33c7e15f08a24::9a1f'
 $script:AssignedPluginId = '5d1b7f60-8a24-4c39-b0e7-2f96ac41d853'
-$script:CriticalTemplateId = '3e6c9a71-4d02-4f18-b5ad-2c7e91f6b830'
+$script:CriticalTemplateId = 'd3139f94-3f04-420c-ab71-ba447be0f687'
 $script:DigestRuleId = 'a2f47c98-6b31-4d05-8e7a-19c4f0b3d276'
-$script:ExpectedRejection = "Notification rule 'vcfops-critical-oncall' was rejected: payload template 3e6c9a71-4d02-4f18-b5ad-2c7e91f6b830 is bound to outbound method StandardEmailPlugin but no delivery address property is configured on plugin 5d1b7f60-8a24-4c39-b0e7-2f96ac41d853."
-$script:ExpectedMissingRule = 'No notification rule fixture is defined for this rule name.'
+$script:ExpectedRejection = 'Internal Server error, cause unknown.'
 
 $script:Failures = [System.Collections.Generic.List[string]]::new()
 $script:Checks = 0
@@ -298,7 +297,7 @@ function Invoke-CaseA {
             -PluginTypeId 'StandardEmailPlugin' `
             -ConfigValue ([ordered] @{ SMTP_HOST = 'smtp.corp.example.com'; SMTP_PORT = '25' }) `
             -RuleName 'vcfops-critical-oncall' `
-            -TemplateName 'Critical Alert Email' `
+            -TemplateName 'Default Email Template' `
             -Criticality @('CRITICAL', 'IMMEDIATE')
     } finally {
         Stop-ContractMock $mock
@@ -345,7 +344,7 @@ function Invoke-CaseA {
         # defaults and must not be transmitted just because they exist.
         Assert-SetEqual @('name') (Get-QueryKeys $entry) `
             'getNotificationTemplates must send only the name filter; unset optional query fields are omitted, not sent empty'
-        Assert-Equal 'Critical Alert Email' (@(Get-Value $entry.query 'name')[0]) 'getNotificationTemplates name filter'
+        Assert-Equal 'Default Email Template' (@(Get-Value $entry.query 'name')[0]) 'getNotificationTemplates name filter'
     }
 
     # -- createNotificationPluginRule wire shape ---------------------------
@@ -374,7 +373,7 @@ function Invoke-CaseA {
         Assert-Equal $script:AssignedPluginId $report.OrphanedPluginId `
             'the plugin created before the failure is still on the appliance and must be reported as orphaned'
         Assert-Equal 'createNotificationPluginRule' $report.FailedOperationId 'the failing operationId'
-        Assert-Equal 422 $report.FailureStatusCode 'the declared 422 status must be reported verbatim'
+        Assert-Equal 500 $report.FailureStatusCode 'the live missing-property HTTP 500 status must be reported verbatim'
         Assert-Equal $script:ExpectedRejection $report.FailureMessage `
             'the server-supplied rejection message must be reported, not a rewritten one'
 
@@ -400,10 +399,11 @@ function Invoke-CaseB {
             -Connection $session `
             -PluginName 'vcfops-digest-email' `
             -PluginTypeId 'StandardEmailPlugin' `
-            -ConfigValue ([ordered] @{ SMTP_HOST = 'smtp.corp.example.com' }) `
+            -ConfigValue ([ordered] @{ SMTP_HOST = 'smtp.corp.example.com'; SMTP_PORT = '25' }) `
             -PluginDescription 'Warning digest delivery target' `
             -RuleName 'vcfops-warning-digest' `
-            -CollectorGroupId 'cg-7742'
+            -CollectorGroupId 'cg-7742' `
+            -RuleProperty ([ordered] @{ emailaddr = 'nobody@example.invalid' })
     } finally {
         Stop-ContractMock $mock
     }
@@ -432,9 +432,15 @@ function Invoke-CaseB {
 
     $rule = Select-Operation $log 'createNotificationPluginRule'
     if ($rule.Count -eq 1) {
-        Assert-SetEqual @('name', 'pluginId', 'collectorGroupId') (Get-BodyKeys $rule[0]) `
+        Assert-SetEqual @('name', 'pluginId', 'collectorGroupId', 'properties') (Get-BodyKeys $rule[0]) `
             'createNotificationPluginRule must include collectorGroupId when supplied and omit all unset optional fields'
         Assert-Equal 'cg-7742' (Get-BodyValue $rule[0] 'collectorGroupId') 'createNotificationPluginRule collectorGroupId'
+        $properties = @(Get-BodyValue $rule[0] 'properties')
+        Assert-Equal 1 $properties.Count 'createNotificationPluginRule properties count'
+        if ($properties.Count -eq 1) {
+            Assert-Equal 'emailaddr' (Get-Value $properties[0] 'name') 'rule property name'
+            Assert-Equal 'nobody@example.invalid' (Get-Value $properties[0] 'value') 'rule property value'
+        }
     }
 
     if (Assert-ReportShape $report) {
@@ -523,7 +529,7 @@ function Invoke-CaseD {
             -Connection $session `
             -PluginName 'vcfops-missing-template' `
             -PluginTypeId 'StandardEmailPlugin' `
-            -ConfigValue ([ordered] @{ SMTP_HOST = 'smtp.corp.example.com' }) `
+            -ConfigValue ([ordered] @{ SMTP_HOST = 'smtp.corp.example.com'; SMTP_PORT = '25' }) `
             -RuleName 'vcfops-never-created' `
             -TemplateName 'No Such Notification Template'
     } finally {
@@ -570,20 +576,27 @@ function Invoke-CaseD {
 }
 
 # ---------------------------------------------------------------------------
-# Case E - the other declared rule rejection (404) is also a reportable result
+# Case E - a template-backed email rule succeeds when its required delivery
+#          property is supplied
 # ---------------------------------------------------------------------------
 
 function Invoke-CaseE {
-    $script:Case = 'E/declared-404'
+    $script:Case = 'E/template-backed-success'
     $mock = Start-ContractMock
     try {
         $session = New-Session $mock
         $report = New-VcfOpsNotificationBinding `
             -Connection $session `
-            -PluginName 'vcfops-missing-rule' `
+            -PluginName 'vcfops-explicit-email' `
             -PluginTypeId 'StandardEmailPlugin' `
-            -ConfigValue ([ordered] @{ SMTP_HOST = 'smtp.corp.example.com' }) `
-            -RuleName 'vcfops-no-rule-fixture'
+            -ConfigValue ([ordered] @{ SMTP_HOST = 'smtp.corp.example.com'; SMTP_PORT = '25' }) `
+            -RuleName 'vcfops-explicit-email-rule' `
+            -TemplateName 'Default Email Template' `
+            -Criticality @('WARNING') `
+            -RuleProperty ([ordered] @{
+                emailaddr = 'primary@example.invalid'
+                ccRecipients = 'secondary@example.invalid'
+            })
     } finally {
         Stop-ContractMock $mock
     }
@@ -596,26 +609,43 @@ function Invoke-CaseE {
         'getCurrentVersionOfServer'
         'getAlertPluginTypes'
         'createAlertPlugin'
+        'getNotificationTemplates'
         'createNotificationPluginRule'
     )
 
+    $rule = Select-Operation $log 'createNotificationPluginRule'
+    if ($rule.Count -eq 1) {
+        Assert-SetEqual @('name', 'pluginId', 'templateId', 'criticalities', 'properties') `
+            (Get-BodyKeys $rule[0]) `
+            'the template-backed rule must contain exactly the caller-supplied optional fields'
+        Assert-Equal $script:CriticalTemplateId (Get-BodyValue $rule[0] 'templateId') `
+            'the rule must use the resolved live template id'
+        Assert-Equal 'WARNING' (@(Get-BodyValue $rule[0] 'criticalities') -join ',') `
+            'the rule must preserve the supplied criticality'
+        $properties = @(Get-BodyValue $rule[0] 'properties')
+        Assert-Equal 2 $properties.Count 'the rule must preserve both supplied properties'
+        if ($properties.Count -eq 2) {
+            $pairs = @($properties | ForEach-Object { "$(Get-Value $_ 'name')=$(Get-Value $_ 'value')" }) -join ','
+            Assert-Equal 'emailaddr=primary@example.invalid,ccRecipients=secondary@example.invalid' $pairs `
+                'rule properties must preserve caller order and values'
+        }
+    }
+
     if (Assert-ReportShape $report) {
-        Assert-Equal $false $report.Succeeded 'a declared 404 rule rejection means the binding did not succeed'
+        Assert-Equal $true $report.Succeeded 'the template-backed rule must succeed'
         Assert-Equal $true $report.PluginTypeSupported 'the plugin type was supported'
         Assert-Equal $script:AssignedPluginId $report.PluginId 'the created pluginId must be reported'
-        Assert-Null $report.TemplateId 'template resolution was deliberately skipped'
-        Assert-Null $report.RuleId 'the rejected rule has no id'
-        Assert-Equal $script:AssignedPluginId $report.OrphanedPluginId `
-            'the plugin remains orphaned after the declared 404'
-        Assert-Equal 'createNotificationPluginRule' $report.FailedOperationId 'the failing operationId'
-        Assert-Equal 404 $report.FailureStatusCode 'the declared 404 status must be reported verbatim'
-        Assert-Equal $script:ExpectedMissingRule $report.FailureMessage `
-            'the server-supplied 404 message must be reported verbatim'
+        Assert-Equal $script:CriticalTemplateId $report.TemplateId 'the resolved templateId must be reported'
+        Assert-Equal $script:DigestRuleId $report.RuleId 'the created ruleId must be reported'
+        Assert-Null $report.OrphanedPluginId 'a completed binding leaves no orphaned plugin'
+        Assert-Null $report.FailedOperationId 'nothing failed'
+        Assert-Null $report.FailureStatusCode 'nothing failed'
+        Assert-Null $report.FailureMessage 'nothing failed'
 
         Assert-StepOutcome $report 'VerifyPluginType' 'getAlertPluginTypes' 'Succeeded'
         Assert-StepOutcome $report 'CreatePlugin' 'createAlertPlugin' 'Succeeded'
-        Assert-StepOutcome $report 'ResolveTemplate' 'getNotificationTemplates' 'Skipped'
-        Assert-StepOutcome $report 'CreateRule' 'createNotificationPluginRule' 'Failed'
+        Assert-StepOutcome $report 'ResolveTemplate' 'getNotificationTemplates' 'Succeeded'
+        Assert-StepOutcome $report 'CreateRule' 'createNotificationPluginRule' 'Succeeded'
     }
 }
 
@@ -679,6 +709,7 @@ function Invoke-CaseF {
             PluginTypeId     = [string]
             ConfigValue      = [System.Collections.IDictionary]
             RuleName         = [string]
+            RuleProperty     = [System.Collections.IDictionary]
             PluginDescription = [string]
             TemplateName     = [string]
             CollectorGroupId = [string]

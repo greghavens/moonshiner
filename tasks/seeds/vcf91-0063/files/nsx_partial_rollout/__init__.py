@@ -1,4 +1,4 @@
-"""Public surface for the contract-pinned NSX Policy rollout package."""
+"""Public surface for the focused NSX Policy rollout package."""
 
 from .client import apply_firewall_change
 

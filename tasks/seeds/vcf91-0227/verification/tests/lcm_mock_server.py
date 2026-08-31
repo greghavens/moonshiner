@@ -114,13 +114,7 @@ DEPOT_BASE_URL = "https://depot.broadcom.com/PROD/vcf/9.1.0"
 
 FIXED_TIME = "2026-05-13T08:19:58.000Z"
 
-HEALTH_PAYLOAD = {
-    "status": "HEALTHY",
-    "components": [
-        {"name": "sddc-lcm", "status": "UP"},
-        {"name": "task-scheduler", "status": "UP"},
-    ],
-}
+HEALTH_PAYLOAD = {"up": True}
 
 
 def _message(msg_id, default):

@@ -30,10 +30,10 @@ EXPECTED_QUERY_ORDER = ["name", "adapterKind", "resourceKind", "page", "pageSize
 EXPECTED_BODY_ORDER = ["username", "password", "authSource"]
 
 PROTECTED_SHA256 = {
-    "docs/contract.json": "f3bac58d220af3bda82bd692833a7e671c4727bf7c50708b1e14d091ca566864",
+    "docs/contract.json": "f27ad4037f7305b46dd19a4e7659a02a7b90622993123606916512677fa63535",
     "docs/official_sources.json": "b564e8b1d488b57a812d22adb1d2bc2450dfac99c045500fa19a7bc02c471909",
-    "tests/MockVcfOpsServer.java": "832a1b430adb020603f2cb6512892dac3ea9def65950b0fba0f88bc584c2d23e",
-    "tests/TestMain.java": "b7abc91ae8f98aa880fecc2c4b8828825b12d13b58da3c83ed1d3531f85ae4c9",
+    "tests/MockVcfOpsServer.java": "ff25e9e1dcfa0cad10b7d728ab737abc19e7a332b6ef6725901714b4b3c7d9f7",
+    "tests/TestMain.java": "1136cf6260287b2ccb0ba0b3a3488e37638bce9aa60c44c6071d2de6272f61c7",
 }
 
 SUCCESS_MARKER = "PASS: contract wire shape and complete stable pagination verified"

@@ -32,6 +32,7 @@ SRC = os.path.join(ROOT, "src")
 MOCK = os.path.join(ROOT, "tests", "mock_vcfops.py")
 CONTRACT = os.path.join(ROOT, "docs", "contract.json")
 SOURCES = os.path.join(ROOT, "docs", "official_sources.json")
+CLIENT_SOURCE = os.path.join(SRC, "vcfops_alerts", "client.py")
 
 sys.path.insert(0, SRC)
 from vcfops_alerts.client import TokenExpired, VcfOperationsClient
@@ -425,6 +426,18 @@ def check_provenance():
           "docs/official_sources.json must record exactly %s" % OPERATION_IDS)
 
 
+def check_no_hidden_contract_dependency():
+    try:
+        source = open(CLIENT_SOURCE, encoding="utf-8").read()
+    except OSError as exc:
+        fail("client source must be readable: %s" % exc)
+        return
+    for forbidden in ("docs/contract.json", "CONTRACT_PATH", "load_contract("):
+        check(forbidden not in source,
+              "production client must not read the protected answer key at runtime: %s"
+              % forbidden)
+
+
 # ---------------------------------------------------------------- runs
 
 
@@ -605,6 +618,7 @@ def scenario_e(workdir):
 
 def main():
     check_provenance()
+    check_no_hidden_contract_dependency()
     workdir = tempfile.mkdtemp(prefix="vcfops-verify-")
     try:
         scenario_a(workdir)

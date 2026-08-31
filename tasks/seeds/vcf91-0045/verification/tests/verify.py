@@ -275,7 +275,7 @@ def check_wire_log(log_path: Path, server_info: dict) -> None:
         assert_update(
             entries[offset],
             server_info,
-            force_refresh=None if workflow == 0 else False,
+            force_refresh=None if workflow == 0 else True,
         )
         task_id = server_info["task_ids"][workflow]
         task_target = "/v1/tasks/" + quote(task_id, safe="-._~")

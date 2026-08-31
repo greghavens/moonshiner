@@ -5,8 +5,7 @@ import java.time.Duration;
 import java.util.Objects;
 
 /**
- * Minimal Java 17 client for the VCF 9.1 SDDC Manager operations projected in
- * docs/contract.json.
+ * Minimal Java 17 client for the documented VCF 9.1 SDDC Manager operations.
  */
 public final class VcfSessionClient {
     private final URI baseUri;
@@ -49,7 +48,7 @@ public final class VcfSessionClient {
      */
     public String getCredentials(CredentialQuery query)
             throws IOException, InterruptedException {
-        // TODO: implement the contract-pinned GET and cutover-safe replay.
+        // TODO: implement the focused GET and cutover-safe replay.
         throw new UnsupportedOperationException("Not implemented");
     }
 
@@ -59,7 +58,7 @@ public final class VcfSessionClient {
      * @return the newly published access token
      */
     public String refreshAccessToken() throws IOException, InterruptedException {
-        // TODO: implement the contract-pinned refresh and atomic publication.
+        // TODO: implement the focused refresh and atomic publication.
         throw new UnsupportedOperationException("Not implemented");
     }
 }

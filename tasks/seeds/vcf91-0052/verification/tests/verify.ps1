@@ -239,7 +239,7 @@ try {
         -IpBlockId 'finance block/blue' `
         -DisplayName 'edge pool' `
         -Cidrs @('10.42.0.0/16', '10.43.0.0/16') `
-        -AccessToken 'loopback-token'
+        -Username 'nsx-user' -Password 'nsx-password'
     Assert-Eq 'first result operationId' (
         'CreateOrPatchIpAddressBlock'
     ) $firstResult.OperationId
@@ -251,7 +251,7 @@ try {
         -IpBlockId 'ops-v6' `
         -DisplayName 'Ops v6' `
         -Cidrs @('2001:db8:42::/48') `
-        -AccessToken 'loopback-token' `
+        -Username 'nsx-user' -Password 'nsx-password' `
         -Description 'Reserved for operations' `
         -SubnetExclusive $false
     Assert-Eq 'normal success uses one attempt' 1 $secondResult.Attempts
@@ -289,7 +289,7 @@ try {
             ) $entry.target
             Assert-Eq "request $index has no query" '' $entry.query
             Assert-Eq "request $index authorization" (
-                'Bearer loopback-token'
+                'Basic bnN4LXVzZXI6bnN4LXBhc3N3b3Jk'
             ) $entry.authorization
             Assert-Eq "request $index accept" 'application/json' $entry.accept
             Assert-Eq "request $index content type" (
@@ -306,7 +306,7 @@ try {
         Assert-Eq 'retry body bytes are identical' (
             $entries[0].body_base64
         ) $entries[1].body_base64
-        Assert-Eq 'retry token is identical' (
+        Assert-Eq 'retry authorization is identical' (
             $entries[0].authorization
         ) $entries[1].authorization
         Assert-Eq 'first response was dropped after apply' (
@@ -337,7 +337,7 @@ try {
         -IpBlockId 'retry-503' `
         -DisplayName 'retry-503' `
         -Cidrs @('10.50.0.0/16') `
-        -AccessToken 'loopback-token'
+        -Username 'nsx-user' -Password 'nsx-password'
     Assert-Eq 'documented 503 is retried once' 2 $transientResult.Attempts
     $transientLines = @(Get-Content -LiteralPath $transient.LogFile |
         Where-Object { $_.Trim().Length -gt 0 })
@@ -374,7 +374,7 @@ try {
             -IpBlockId 'do-not-retry' `
             -DisplayName 'do-not-retry' `
             -Cidrs @('10.60.0.0/16') `
-            -AccessToken 'loopback-token' > $null
+            -Username 'nsx-user' -Password 'nsx-password' > $null
     } catch {
         $badRequestThrew = $true
     }

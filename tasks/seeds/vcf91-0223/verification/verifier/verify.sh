@@ -62,7 +62,7 @@ assert contract["security"]["httpScheme"] == "Bearer"
 assert contract["pagination"]["operationId"] == "getComponentNodes"
 assert contract["pagination"]["responseElementsField"] == "nodes"
 assert contract["pagination"]["responseMetadataField"] == "pageMetadata"
-assert contract["pagination"]["firstPageNumber"] == 0
+assert contract["pagination"]["firstPageNumber"] == 1
 assert set(contract["pagination"]["metadataFields"]) == {
     "pageNumber", "pageSize", "totalElements", "totalPages"}
 

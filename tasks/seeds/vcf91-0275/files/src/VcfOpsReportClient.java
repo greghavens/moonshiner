@@ -47,7 +47,11 @@ public final class VcfOpsReportClient {
         public String finalStatus;
         /** How many getReport calls were actually made. */
         public int pollCount;
-        /** The downloaded report body, or null when the terminal status was not COMPLETED. */
+        /**
+         * The downloaded report body, or null when the terminal status was not COMPLETED.
+         * Binary responses use a lossless ISO-8859-1 byte-to-character mapping; callers can
+         * recover the original bytes with {@code downloadBody.getBytes(StandardCharsets.ISO_8859_1)}.
+         */
         public String downloadBody;
     }
 

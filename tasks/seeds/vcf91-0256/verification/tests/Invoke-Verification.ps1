@@ -131,6 +131,14 @@ param(
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
     [string] $AdapterKindKey,
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string] $AdapterCredentialName,
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string] $AdapterCredentialKindKey,
+    [string] $AdapterCredentialId,
+    [System.Collections.Specialized.OrderedDictionary] $AdapterCredentialField,
     [ValidateSet('http', 'https')]
     [string] $Protocol = 'https',
     [ValidateNotNullOrEmpty()]
@@ -544,13 +552,19 @@ if ($precheck.Count -eq 1) {
     Assert-NoEmptyMembers -Record $r -Label 'testConnection'
 
     $keys = @(Get-BodyKeys -Record $r | Sort-Object)
-    Assert-Sequence -Expected @('adapterKindKey', 'name') -Actual $keys `
-        -Message 'a minimal precheck body carries only the two required members, with description, collectorId, monitoringInterval and resourceIdentifiers absent'
+    Assert-Sequence -Expected @('adapterKindKey', 'credential', 'name') -Actual $keys `
+        -Message 'a minimal precheck body carries the adapter identity and required credential, with other optional members absent'
 
     $body = Get-BodyObject -Record $r
     if ($body) {
         Assert-Equal -Expected 'VMWARE' -Actual $body.adapterKindKey -Message 'precheck body sends the requested adapter kind'
         Assert-Equal -Expected 'vc01 Adapter Instance' -Actual $body.name -Message 'precheck body sends the requested instance name'
+        Assert-Sequence -Expected @('adapterKindKey', 'credentialKindKey', 'fields', 'name') `
+            -Actual @($body.credential.PSObject.Properties.Name | Sort-Object) `
+            -Message 'precheck sends the inline credential required by the live service'
+        Assert-Sequence -Expected @('USER', 'PASSWORD') `
+            -Actual @($body.credential.fields | ForEach-Object { $_.name }) `
+            -Message 'inline credential fields preserve caller order'
     }
 }
 
@@ -563,9 +577,17 @@ if ($create.Count -eq 1) {
     Assert-JsonRequest -Record $r -Label 'createAdapterInstance'
     Assert-NoEmptyMembers -Record $r -Label 'createAdapterInstance'
 
-    if ($precheck.Count -eq 1) {
-        Assert-Equal -Expected $precheck[0].body -Actual $r.body `
-            -Message 'the mutating call sends byte-identical payload to the one the precheck validated'
+    $body = Get-BodyObject -Record $r
+    if ($body) {
+        Assert-Equal -Expected 'vc01 Adapter Instance' -Actual $body.name `
+            -Message 'create preserves the prechecked adapter name'
+        Assert-Equal -Expected 'VMWARE' -Actual $body.adapterKindKey `
+            -Message 'create preserves the prechecked adapter kind'
+        Assert-Sequence -Expected @('adapterKindKey', 'credentialKindKey', 'id', 'name') `
+            -Actual @($body.credential.PSObject.Properties.Name | Sort-Object) `
+            -Message 'create replaces inline fields with the persisted credential id'
+        Assert-Equal -Expected '6f455a29-3330-47b6-9128-a608bca9d2c7' -Actual $body.credential.id `
+            -Message 'create uses credentialInstanceId returned by testConnection'
     }
 }
 
@@ -610,7 +632,7 @@ if ($precheck.Count -eq 1) {
 
     $keys = @(Get-BodyKeys -Record $r | Sort-Object)
     Assert-Sequence `
-        -Expected @('adapterKindKey', 'collectorId', 'description', 'monitoringInterval', 'name', 'resourceIdentifiers') `
+        -Expected @('adapterKindKey', 'collectorId', 'credential', 'description', 'monitoringInterval', 'name', 'resourceIdentifiers') `
         -Actual $keys `
         -Message 'every supplied optional member reaches the wire'
 
@@ -647,9 +669,24 @@ if ($create.Count -eq 1) {
     Assert-AuthenticatedRequest -Record $r -Label 'createAdapterInstance'
     Assert-JsonRequest -Record $r -Label 'createAdapterInstance'
     Assert-NoEmptyMembers -Record $r -Label 'createAdapterInstance'
-    if ($precheck.Count -eq 1) {
-        Assert-Equal -Expected $precheck[0].body -Actual $r.body `
-            -Message 'the mutating call sends byte-identical payload to the one the precheck validated'
+    $body = Get-BodyObject -Record $r
+    if ($body) {
+        Assert-Equal -Expected 'vc01 Adapter Instance' -Actual $body.name `
+            -Message 'create preserves the prechecked adapter name'
+        Assert-Equal -Expected 'Primary management vCenter' -Actual $body.description `
+            -Message 'create preserves the prechecked description'
+        Assert-Equal -Expected '1' -Actual $body.collectorId `
+            -Message 'create preserves the prechecked collectorId'
+        Assert-Equal -Expected 0 -Actual $body.monitoringInterval `
+            -Message 'create preserves an explicitly bound zero interval'
+        Assert-Sequence -Expected @('VCURL', 'AUTODISCOVERY', 'PROCESSCHANGEEVENTS') `
+            -Actual @($body.resourceIdentifiers | ForEach-Object { $_.name }) `
+            -Message 'create preserves ordered resource identifiers'
+        Assert-Sequence -Expected @('adapterKindKey', 'credentialKindKey', 'id', 'name') `
+            -Actual @($body.credential.PSObject.Properties.Name | Sort-Object) `
+            -Message 'full create replaces inline fields with the persisted credential id'
+        Assert-Equal -Expected '6f455a29-3330-47b6-9128-a608bca9d2c7' -Actual $body.credential.id `
+            -Message 'full create uses credentialInstanceId returned by testConnection'
     }
 }
 
@@ -667,7 +704,7 @@ if ($null -eq $outcome) {
 
 # =========================================================================
 Write-Host ''
-Write-Host 'Scenario: precheck fails, nothing may be changed'
+Write-Host 'Scenario: precheck fails, no adapter instance may be created'
 $script:Scenario = 'precheck-fail'
 $run = Invoke-Scenario -ScenarioName 'precheck-fail' -MockScenario 'precheck-fail'
 $records = $run.Records
@@ -697,8 +734,8 @@ if ($precheck.Count -eq 1) {
     Assert-JsonRequest -Record $precheck[0] -Label 'testConnection'
     Assert-NoEmptyMembers -Record $precheck[0] -Label 'testConnection'
     $keys = @(Get-BodyKeys -Record $precheck[0] | Sort-Object)
-    Assert-Sequence -Expected @('adapterKindKey', 'name') -Actual $keys `
-        -Message 'a minimal precheck body carries only the two required members'
+    Assert-Sequence -Expected @('adapterKindKey', 'credential', 'name') -Actual $keys `
+        -Message 'a rejected precheck still carried the required inline credential'
 }
 
 $outcome = $run.Outcome
@@ -713,7 +750,7 @@ if ($null -eq $outcome) {
     Assert-Equal -Expected $false -Actual $outcome.precheckPassed -Message 'PrecheckPassed is false'
     Assert-True -Condition ([string]::IsNullOrEmpty([string]$outcome.adapterInstanceId)) `
         -Message 'AdapterInstanceId stays empty because nothing was created'
-    Assert-True -Condition ([string]$outcome.message -match 'certificate presented by the endpoint is not trusted') `
+    Assert-True -Condition ([string]$outcome.message -match 'Internal Server error, cause unknown') `
         -Message 'the diagnostic returned by the precheck is surfaced in Message'
 }
 

@@ -79,6 +79,10 @@ Get-VcfOpsResourceInventory
     [-PropertyValue   <String>]
 ```
 
+`Name` retains the SDK's `String[]` type, but the deployed VCF Operations 9.1
+service supports only one name value. Supplying more than one name is rejected
+before `getResources` is called. The other array filters remain repeatable.
+
 Every filter is optional, and every filter the caller leaves out is a filter the
 server must never see.
 

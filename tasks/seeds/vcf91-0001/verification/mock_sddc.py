@@ -292,7 +292,7 @@ class ContractHandler(BaseHTTPRequestHandler):
                 "Token creation must not carry a bearer token",
                 "fixture-auth-header",
             )
-        return 201, {
+        return 200, {
             "accessToken": ACCESS_TOKEN,
             "refreshToken": {"id": REFRESH_TOKEN_ID},
         }

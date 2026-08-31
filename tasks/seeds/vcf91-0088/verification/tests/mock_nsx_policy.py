@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import threading
@@ -35,16 +36,16 @@ class State:
     def __init__(
             self,
             request_log: Path,
-            initial_token: str,
-            refreshed_token: str,
+            username: str,
+            password: str,
             cursor: str,
             segments: list[dict[str, str]]) -> None:
         self.request_log = request_log
-        self.initial_token = initial_token
-        self.refreshed_token = refreshed_token
+        self.authorization = "Basic " + base64.b64encode(
+            f"{username}:{password}".encode("utf-8")
+        ).decode("ascii")
         self.cursor = cursor
         self.pages = [segments[:2], segments[2:]]
-        self.initial_page_served = False
         self.successful_responses = 0
         self.lock = threading.Lock()
 
@@ -134,8 +135,6 @@ def make_handler(
                         page = 1
 
                     authorization = self.headers.get("Authorization", "")
-                    expected_initial = "Bearer " + state.initial_token
-                    expected_refreshed = "Bearer " + state.refreshed_token
                     with state.lock:
                         if page < 0:
                             status = 400
@@ -143,23 +142,14 @@ def make_handler(
                                 "error_code": 40002,
                                 "error_message": "unexpected focused query",
                             }
-                        elif authorization == expected_initial:
-                            if page == 0 and not state.initial_page_served:
-                                state.initial_page_served = True
-                                status = 200
-                            else:
-                                status = 401
-                                response = {
-                                    "error_code": 40101,
-                                    "error_message": "access token expired",
-                                }
-                        elif authorization == expected_refreshed:
+                        elif authorization == state.authorization:
                             status = 200
                         else:
-                            status = 401
+                            status = 403
                             response = {
-                                "error_code": 40102,
-                                "error_message": "access token rejected",
+                                "error_code": 403,
+                                "error_message": "Authentication failed",
+                                "module_name": "common-services",
                             }
 
                         if status == 200:
@@ -226,8 +216,8 @@ def main() -> None:
     args.log.write_bytes(b"")
     state = State(
         args.log,
-        required_env("NSX_INITIAL_TOKEN"),
-        required_env("NSX_REFRESHED_TOKEN"),
+        required_env("NSX_USERNAME"),
+        required_env("NSX_PASSWORD"),
         required_env("NSX_CURSOR"),
         load_segments(),
     )

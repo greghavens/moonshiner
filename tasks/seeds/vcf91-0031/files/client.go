@@ -365,6 +365,24 @@ type baseCredential struct {
 	Password       *string `json:"password,omitempty"`
 }
 
+type credentialPage struct {
+	Elements []credential `json:"elements"`
+}
+
+type credential struct {
+	CredentialType string                `json:"credentialType"`
+	AccountType    string                `json:"accountType"`
+	Username       string                `json:"username"`
+	Password       string                `json:"password"`
+	Resource       authenticatedResource `json:"resource"`
+}
+
+type authenticatedResource struct {
+	ResourceID string `json:"resourceId"`
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+}
+
 func (m *Manager) submitAndWait(
 	ctx context.Context,
 	target RotationTarget,
@@ -465,22 +483,94 @@ func (m *Manager) waitForTask(
 	panic("unreachable")
 }
 
-func passwordFromTask(
+func resourceNameFromTask(
 	task CredentialsTask,
-	username string,
+	target RotationTarget,
 ) (string, error) {
-	var password string
+	var resourceName string
 	matches := 0
 	for _, subTask := range task.SubTasks {
-		if subTask.Username == username {
-			matches++
-			password = subTask.NewPassword
+		if subTask.Username != target.Username ||
+			strings.TrimSpace(subTask.ResourceName) == "" {
+			continue
 		}
+		if target.ResourceName != nil && subTask.ResourceName != *target.ResourceName {
+			continue
+		}
+		if target.CredentialType != nil &&
+			subTask.CredentialType != *target.CredentialType {
+			continue
+		}
+		matches++
+		resourceName = subTask.ResourceName
 	}
-	if matches != 1 || password == "" {
+	if matches != 1 {
 		return "", &ProtocolError{
 			OperationID: "getCredentialsTask",
-			Reason:      "successful task does not identify exactly one generated password",
+			Reason:      "successful task does not identify exactly one resource credential",
+		}
+	}
+	return resourceName, nil
+}
+
+func (m *Manager) fetchCurrentPassword(
+	ctx context.Context,
+	target RotationTarget,
+	resourceName string,
+) (string, error) {
+	escapeQuery := func(value string) string {
+		return strings.ReplaceAll(url.QueryEscape(value), "+", "%20")
+	}
+	query := []string{
+		"resourceName=" + escapeQuery(resourceName),
+		"resourceType=" + escapeQuery(target.ResourceType),
+	}
+	if target.AccountType != nil {
+		query = append(query, "accountType="+escapeQuery(*target.AccountType))
+	}
+	responseBody, err := m.request(
+		ctx,
+		"getCredentials",
+		http.MethodGet,
+		"/v1/credentials?"+strings.Join(query, "&"),
+		nil,
+		http.StatusOK,
+	)
+	if err != nil {
+		return "", err
+	}
+	var page credentialPage
+	if json.Unmarshal(responseBody, &page) != nil || page.Elements == nil {
+		return "", &ProtocolError{
+			OperationID: "getCredentials",
+			Reason:      "response is not a credential page",
+		}
+	}
+	var password string
+	matches := 0
+	for _, credential := range page.Elements {
+		if credential.Resource.Name != resourceName ||
+			credential.Resource.Type != target.ResourceType ||
+			credential.Username != target.Username {
+			continue
+		}
+		if target.CredentialType != nil &&
+			credential.CredentialType != *target.CredentialType {
+			continue
+		}
+		if target.AccountType != nil &&
+			credential.AccountType != *target.AccountType {
+			continue
+		}
+		if credential.Password != "" {
+			matches++
+			password = credential.Password
+		}
+	}
+	if matches != 1 {
+		return "", &ProtocolError{
+			OperationID: "getCredentials",
+			Reason:      "response does not identify exactly one generated password",
 		}
 	}
 	return password, nil

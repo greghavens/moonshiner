@@ -20,8 +20,8 @@ public final class TestMain {
 
     public static void main(String[] args) throws Exception {
         testProtectedContractProvenance();
-        testPollsToTerminalAndExactWire();
-        testExplicitZerosAndMandatoryPoll();
+        testLiveTerminalAcceptanceAndExactWire();
+        testExplicitZerosAndConditionalPoll();
         testPollIntervalIsHonored();
         testJsonEscapingAndUtf8TaskId();
         testStatusNormalizationAndTerminalClassification();
@@ -30,7 +30,7 @@ public final class TestMain {
         testValidationBeforeWire();
         testInterruptedHttpCall();
         testMockServesOnlyFocusedOperations();
-        System.out.println("PASS: VCF Installer proxy update polling contract");
+        System.out.println("PASS: VCF Installer proxy update task contract");
     }
 
     private static void testProtectedContractProvenance() throws Exception {
@@ -47,7 +47,7 @@ public final class TestMain {
                 "contract source must be the OpenAPI specification");
     }
 
-    private static void testPollsToTerminalAndExactWire() throws Exception {
+    private static void testLiveTerminalAcceptanceAndExactWire() throws Exception {
         try (MockVcfInstaller mock = new MockVcfInstaller()) {
             VcfInstallerClient client = new VcfInstallerClient(mock.baseUrl(), TOKEN);
             VcfInstallerClient.ProxyConfiguration configuration =
@@ -56,17 +56,13 @@ public final class TestMain {
 
             VcfInstallerClient.Task task = client.updateProxyAndWait(configuration, Duration.ZERO);
             eq("proxy/task 17", task.id(), "terminal task ID");
-            eq("Successful", task.status(), "terminal task status");
+            eq("COMPLETED_WITH_SUCCESS", task.status(), "live terminal task status");
 
             List<MockVcfInstaller.RecordedRequest> requests = mock.requests();
-            eq(4, requests.size(), "one submit and three polls");
+            eq(1, requests.size(), "live terminal accepted task requires no lookup");
             String expectedBody = "{\"isEnabled\":true,\"host\":\"proxy.lab.local\",\"port\":3128,"
                     + "\"transferProtocol\":\"HTTPS\",\"isAuthenticated\":false}";
             assertPatch(requests.get(0), expectedBody);
-            for (int i = 1; i < requests.size(); i++) {
-                assertGet(requests.get(i), "/v1/tasks/proxy%2Ftask%2017");
-            }
-
             for (String omitted : List.of("isConfigured", "username", "password")) {
                 check(!expectedBody.contains("\"" + omitted + "\""),
                         "unset optional field must be absent: " + omitted);
@@ -74,10 +70,10 @@ public final class TestMain {
         }
     }
 
-    private static void testExplicitZerosAndMandatoryPoll() throws Exception {
+    private static void testExplicitZerosAndConditionalPoll() throws Exception {
         List<MockVcfInstaller.Reply> replies = List.of(
-                new MockVcfInstaller.Reply(202, MockVcfInstaller.task("task-zero", "Successful")),
-                new MockVcfInstaller.Reply(200, MockVcfInstaller.task("task-zero", "Successful")));
+                new MockVcfInstaller.Reply(
+                        202, MockVcfInstaller.task("task-zero", "COMPLETED_WITH_SUCCESS")));
         try (MockVcfInstaller mock = new MockVcfInstaller(replies)) {
             VcfInstallerClient client = new VcfInstallerClient(mock.baseUrl() + "/", TOKEN);
             VcfInstallerClient.ProxyConfiguration configuration =
@@ -87,11 +83,10 @@ public final class TestMain {
             VcfInstallerClient.Task task = client.updateProxyAndWait(configuration, Duration.ZERO);
             eq("task-zero", task.id(), "explicit-zero task ID");
             List<MockVcfInstaller.RecordedRequest> requests = mock.requests();
-            eq(2, requests.size(), "accepted terminal-looking task must still be polled");
+            eq(1, requests.size(), "accepted live terminal task must be returned directly");
             assertPatch(requests.get(0),
                     "{\"isEnabled\":false,\"host\":\"\",\"port\":0,\"transferProtocol\":\"HTTP\","
                             + "\"username\":\"\",\"password\":\"\",\"isAuthenticated\":false}");
-            assertGet(requests.get(1), "/v1/tasks/task-zero");
         }
 
         List<MockVcfInstaller.Reply> omittedReplies = List.of(

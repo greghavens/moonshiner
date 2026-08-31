@@ -140,6 +140,14 @@ public final class TestMain {
 
             if ("getSupervisorNamespace".equals(matched.name())) {
                 check(captures.equals(List.of(namespace)), "fallback namespace");
+                if ("live_namespace_404".equals(scenario)) {
+                    return response(404,
+                            "{\"error_type\":\"NOT_FOUND\","
+                                    + "\"messages\":[{\"id\":"
+                                    + "\"vcenter.wcp.workload.notfound\","
+                                    + "\"default_message\":"
+                                    + "\"Workload not found.\"}]}");
+                }
                 if ("redirect".equals(scenario)) {
                     return response(307, "");
                 }
@@ -161,6 +169,14 @@ public final class TestMain {
             check(
                     captures.equals(List.of(namespace, cluster)),
                     "fallback Cluster capture");
+            if ("live_admission_422".equals(scenario)) {
+                return response(422,
+                        "{\"apiVersion\":\"v1\",\"kind\":\"Status\","
+                                + "\"status\":\"Failure\","
+                                + "\"reason\":\"Invalid\",\"code\":422,"
+                                + "\"message\":\"Cluster failed strict "
+                                + "server-side admission\"}");
+            }
             if (firstPatchRequest == null) {
                 firstPatchRequest = request;
             } else {
@@ -364,8 +380,8 @@ public final class TestMain {
         String fieldManager = args[7];
         String clusterClass = args[8];
         String version = args[9];
-        String vmClass = args[10];
-        String storageClass = args[11];
+        String workerClass = args[10];
+        String workerName = args[11];
         String uid = args[12];
         String resourceVersion = args[13];
         long generation = Long.parseLong(args[14]);
@@ -439,9 +455,10 @@ public final class TestMain {
                         fieldManager,
                         clusterClass,
                         version,
-                        vmClass,
-                        storageClass,
+                        liveTopologyVariables(),
                         controlPlaneReplicas,
+                        workerClass,
+                        workerName,
                         workers,
                         podCidrs,
                         serviceCidrs,
@@ -464,6 +481,38 @@ public final class TestMain {
                 throw new AssertionError("non-running namespace was accepted");
             } catch (VksClusterApplyClient.NamespaceNotReadyException expected) {
                 check("ERROR".equals(expected.configStatus()), "wrong blocked status");
+                checkSanitized(expected, session, token);
+                System.out.println("OK " + scenario);
+                return;
+            }
+        }
+
+        if ("live_namespace_404".equals(scenario)) {
+            try {
+                client.apply(request);
+                throw new AssertionError("absent live namespace was accepted");
+            } catch (VksClusterApplyClient.ApiException expected) {
+                check(expected.statusCode() == 404,
+                        "wrong live namespace status");
+                check(VksClusterApplyClient.NAMESPACE_OPERATION.equals(
+                                expected.operation()),
+                        "wrong live namespace operation");
+                checkSanitized(expected, session, token);
+                System.out.println("OK " + scenario);
+                return;
+            }
+        }
+
+        if ("live_admission_422".equals(scenario)) {
+            try {
+                client.apply(request);
+                throw new AssertionError("strict admission failure was accepted");
+            } catch (VksClusterApplyClient.ApiException expected) {
+                check(expected.statusCode() == 422,
+                        "wrong admission status");
+                check(VksClusterApplyClient.APPLY_OPERATION.equals(
+                                expected.operation()),
+                        "wrong admission operation");
                 checkSanitized(expected, session, token);
                 System.out.println("OK " + scenario);
                 return;
@@ -504,5 +553,25 @@ public final class TestMain {
         check(probe.responseBody()[0] == 1, "response body was not defensive");
 
         System.out.println("OK " + scenario);
+    }
+
+    private static List<VksClusterApplyClient.TopologyVariable>
+            liveTopologyVariables() {
+        List<String> names = List.of(
+                "datastore", "dnsImageTag", "imageRepository",
+                "infraServerThumbprint", "network", "infraServerURL",
+                "resourcePool", "vmTemplate", "datacenter", "etcdImageTag",
+                "folder", "controlPlaneIpAddr", "credsSecretName",
+                "kubeVipPodManifest");
+        return names.stream()
+                .map(name -> {
+                    java.util.LinkedHashMap<String, Object> value =
+                            new java.util.LinkedHashMap<>();
+                    value.put("liveValidated", Boolean.TRUE);
+                    value.put("name", name);
+                    return new VksClusterApplyClient.TopologyVariable(
+                            name, value);
+                })
+                .toList();
     }
 }

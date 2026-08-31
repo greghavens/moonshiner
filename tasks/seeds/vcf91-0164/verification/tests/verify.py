@@ -45,8 +45,8 @@ KUBERNETES_OPERATION = (
 PROTECTED_SHA256 = {
     "docs/contract.json": "91399945eb2e67645d2d08ce7ced1f893f5f1034dbabb9368a000a9b33594e4c",
     "docs/official_sources.json": "d0b242146c9717605eb3b36a8c5d849be6c2db30ad9df9f2f8ef8da988a1636a",
-    "tests/TestMain.java": "4f644cf66e3c7fb57c617c82c28de94f6f392b240feadd88d4dfb7450b53df61",
-    "tools/contract_mock.py": "07066cfdcdab3143556368bb15f58d4a3792672925a8439b3208a2d3e6c90a82",
+    "tests/TestMain.java": "521c2f3fc937e1590a3a7edb8a7093ec80a186ba60227500e30162219133f45e",
+    "tools/contract_mock.py": "ed704b8704ab5f8ed3ff306bad410359ebce81d649444180166f34c128543518",
 }
 
 
@@ -201,11 +201,13 @@ def expected_operations(scenario: str, max_polls: int) -> list[str]:
     ]
     if scenario == "validation":
         return []
+    if scenario == "live_namespace_404":
+        return ["getSupervisorNamespace"]
     if scenario == "namespace_not_ready":
         return ["getSupervisorNamespace"]
     if scenario == "malformed_cluster":
         return ["getSupervisorNamespace", "listVksClusters"]
-    if scenario == "api_error":
+    if scenario in {"api_error", "live_backup_404"}:
         return prefix
     if scenario == "task_failed":
         return prefix + ["getTask", "getTask"]
@@ -253,7 +255,7 @@ def assert_request_log(
         session,
         "Authorization",
     )
-    if scenario == "namespace_not_ready":
+    if scenario in {"namespace_not_ready", "live_namespace_404"}:
         return
 
     assert_get_wire(
@@ -319,7 +321,7 @@ def assert_request_log(
             header_values(create, "Content-Length") == [],
             "fallback request declared Content-Length",
         )
-    if scenario == "api_error":
+    if scenario in {"api_error", "live_backup_404"}:
         return
 
     for entry in entries[3:]:
@@ -406,6 +408,8 @@ def scenario_parameters(scenario: str) -> tuple[int, int, object, bool]:
     if scenario == "poll_timeout":
         return 0, 3, None, True
     if scenario in {
+        "live_namespace_404",
+        "live_backup_404",
         "namespace_not_ready",
         "inventory_changed",
         "malformed_cluster",
@@ -447,6 +451,8 @@ def run_scenario(
         {"name": f"Alpha-{marker}", "version": f"v1.30.{secrets.randbelow(8)}"},
         {"name": f"beta-{marker}", "version": f"v1.29.{secrets.randbelow(8)}"},
     ]
+    if scenario == "live_backup_404":
+        clusters[0] = {"name": "vcf-msr01", "version": "v1.34.2"}
     config: dict[str, object] = {
         "scenario": scenario,
         "session": f"vc-session-{secrets.token_urlsafe(19)}",
@@ -584,6 +590,8 @@ def main() -> None:
         compile_sources(build_dir)
         use_loopback = loopback_available()
         for scenario in (
+            "live_namespace_404",
+            "live_backup_404",
             "happy",
             "empty_comment",
             "result_value",

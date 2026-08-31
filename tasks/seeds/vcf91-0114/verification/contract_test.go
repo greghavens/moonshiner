@@ -20,9 +20,9 @@ const (
 	sourcePath   = "docs/official_sources.json"
 	commitSHA    = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
 	specPath     = "specifications/vsphere/openapi/automation/vcenter.yaml"
-	testVM       = "vm blue/50%?雪"
-	encodedVM    = "vm%20blue%2F50%25%3F%E9%9B%AA"
-	testToken    = "session-token-vcf91-0114"
+	testVM       = "vm-1050"
+	encodedVM    = "vm-1050"
+	testToken    = "0123456789abcdef0123456789abcdef"
 )
 
 func TestGuardedCPUUpdateTable(t *testing.T) {
@@ -35,7 +35,7 @@ func TestGuardedCPUUpdateTable(t *testing.T) {
 	}{
 		{
 			name:         "powered off passes and mutates",
-			scenario:     contractmock.Scenario{PowerBody: []byte(`{"state":"POWERED_OFF","clean_power_off":false}`)},
+			scenario:     contractmock.Scenario{PowerBody: []byte(`{"state":"POWERED_OFF","clean_power_off":true}`)},
 			wantRequests: 2,
 			wantEffects:  1,
 		},
@@ -163,6 +163,39 @@ func TestGuardedCPUUpdateTable(t *testing.T) {
 				t.Fatalf("mutation effects = %d, want %d", got, test.wantEffects)
 			}
 		})
+	}
+}
+
+func TestVMIdentifierIsOneEscapedPathSegment(t *testing.T) {
+	logPath := t.TempDir() + "/requests.jsonl"
+	server, err := contractmock.New(
+		contractPath,
+		logPath,
+		contractmock.Scenario{PowerState: "POWERED_ON"},
+	)
+	if err != nil {
+		t.Fatalf("start contract mock: %v", err)
+	}
+	defer server.Close()
+	client, err := guard.NewClient(guard.Config{
+		BaseURL: server.URL(), SessionToken: testToken,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	_, err = client.SetCPUCountIfPoweredOff(
+		context.Background(), "vm blue/50%?雪", 2,
+	)
+	var precheck *guard.PrecheckError
+	if !errors.As(err, &precheck) {
+		t.Fatalf("error = %T %v, want *PrecheckError", err, err)
+	}
+	records, err := contractmock.ReadLog(logPath)
+	if err != nil || len(records) != 1 {
+		t.Fatalf("requests = %#v, error = %v", records, err)
+	}
+	if records[0].RequestURI != "/api/vcenter/vm/vm%20blue%2F50%25%3F%E9%9B%AA/power" {
+		t.Fatalf("escaped request URI = %q", records[0].RequestURI)
 	}
 }
 

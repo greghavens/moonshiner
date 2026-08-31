@@ -21,7 +21,7 @@ function Get-VcfVcenterPrivilegeInventory {
         [Parameter(Mandatory)]
         $Session,
 
-        [ValidateRange(1, [long]::MaxValue)]
+        [ValidateRange(1, 1000)]
         [long] $PageSize = 200
     )
 

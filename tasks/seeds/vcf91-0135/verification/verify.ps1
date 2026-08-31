@@ -55,9 +55,10 @@ $oldUser = 'svc-vks'
 $oldPassword = 'dummy-old-41f6'
 $newUser = 'svc-vks'
 $newPassword = 'dummy-new-92ab'
-$oldSession = 'session-old-1f6d4a'
-$newSession = 'session-new-8c0e27'
+$oldSession = '0123456789abcdef0123456789abcdef'
+$newSession = 'fedcba9876543210fedcba9876543210'
 $supervisor = 'domain-c8:supervisor-7ca91'
+$missingSupervisor = 'supervisor-live-validation-missing'
 
 function Get-RequestLog {
     if (-not (Test-Path -LiteralPath $logFile -PathType Leaf)) { return @() }
@@ -215,6 +216,33 @@ try {
     # Authenticate the replacement, atomically publish it, and make new API calls.
     $newCredential = New-DummyCredential -Username $newUser -Password $newPassword
     Update-VksSupervisorCredential -Client $client -Credential $newCredential
+
+    $liveSettingsGetError = $null
+    try {
+        Get-VksKubeApiServerSettings -Client $client -Supervisor $missingSupervisor > $null
+    } catch {
+        $liveSettingsGetError = $_
+    }
+    Assert-True 'live missing-Supervisor settings GET reports HTTP 404' `
+        ("$liveSettingsGetError" -like '*HTTP 404*')
+
+    $liveSettingsPatchError = $null
+    try {
+        Set-VksKubeApiServerSettings -Client $client -Supervisor $missingSupervisor `
+            -CertificateDnsNamesToAdd @('api.blue.example.test', 'api.green.example.test') `
+            -CertificateDnsNamesToRemove @('api.legacy.example.test') `
+            -NamespaceApiFairnessEnabled $false
+    } catch {
+        $liveSettingsPatchError = $_
+    }
+    Assert-True 'live missing-Supervisor settings PATCH reports HTTP 404' `
+        ("$liveSettingsPatchError" -like '*HTTP 404*')
+
+    $contractNamespaces = @(Get-VksSupervisorNamespaces -Client $client)
+    Assert-Eq 'contract namespace coverage preserves two results' 2 $contractNamespaces.Count
+    Assert-Eq 'contract first namespace identifier is preserved' 'payments-dev' $contractNamespaces[0].namespace
+    Assert-Eq 'contract second namespace identifier is preserved' 'orders-prod' $contractNamespaces[1].namespace
+
     $settings = Get-VksKubeApiServerSettings -Client $client -Supervisor $supervisor
     Assert-Eq 'settings certificate DNS name' 'api.platform.example.test' `
         (@($settings.certificate_dns_names) -join ',')
@@ -250,9 +278,7 @@ try {
     if ($worker.Streams.Error.Count -gt 0) {
         throw "namespace worker failed: $($worker.Streams.Error[0])"
     }
-    Assert-Eq 'v2 namespace list preserves two results' 2 $namespaceOutput.Count
-    Assert-Eq 'first namespace identifier is preserved' 'payments-dev' $namespaceOutput[0].namespace
-    Assert-Eq 'second namespace identifier is preserved' 'orders-prod' $namespaceOutput[1].namespace
+    Assert-Eq 'exact live namespace list is empty' 0 $namespaceOutput.Count
 
     Wait-Until -Condition {
         @((Get-RequestLog) | Where-Object {
@@ -297,8 +323,9 @@ try {
     $namespaceGets = @($log | Where-Object {
         $_.method -ceq 'GET' -and $_.path -ceq '/api/vcenter/namespaces/instances/v2'
     })
-    Assert-Eq 'namespace list sent exactly once (no replay)' 1 $namespaceGets.Count
+    Assert-Eq 'one live and one contract namespace list were sent' 2 $namespaceGets.Count
     Assert-Eq 'in-flight namespace request kept old session' $oldSession $namespaceGets[0].session
+    Assert-Eq 'contract namespace request used replacement session' $newSession $namespaceGets[1].session
     Assert-Eq 'namespace list has no query' '' $namespaceGets[0].query
     Assert-Eq 'namespace list has no body' '' $namespaceGets[0].body
     Assert-Eq 'namespace list has no content type' '' "$($namespaceGets[0].content_type)"
@@ -306,6 +333,19 @@ try {
 
     $encodedSupervisor = [uri]::EscapeDataString($supervisor)
     $settingsPath = "/api/vcenter/namespace-management/supervisors/$encodedSupervisor/workloads/kube-api-server-settings"
+    $encodedMissingSupervisor = [uri]::EscapeDataString($missingSupervisor)
+    $missingSettingsPath = "/api/vcenter/namespace-management/supervisors/$encodedMissingSupervisor/workloads/kube-api-server-settings"
+    $missingSettingsGets = @($log | Where-Object {
+        $_.method -ceq 'GET' -and $_.path -ceq $missingSettingsPath
+    })
+    Assert-Eq 'exact live missing-Supervisor settings GET count' 1 $missingSettingsGets.Count
+    $missingSettingsPatches = @($log | Where-Object {
+        $_.method -ceq 'PATCH' -and $_.path -ceq $missingSettingsPath
+    })
+    Assert-Eq 'exact live missing-Supervisor settings PATCH count' 1 $missingSettingsPatches.Count
+    Assert-Eq 'live settings PATCH preserves the exact combined body' `
+        '{"certificate_dns_names_to_add_list":["api.blue.example.test","api.green.example.test"],"certificate_dns_names_to_remove_list":["api.legacy.example.test"],"namespace_api_fairness_enabled":false}' `
+        $missingSettingsPatches[0].body
     $settingsGets = @($log | Where-Object {
         $_.method -ceq 'GET' -and $_.path -ceq $settingsPath
     })
@@ -366,7 +406,9 @@ try {
         'DELETE /api/session',
         'GET /api/vcenter/namespaces/instances/v2',
         "GET $settingsPath",
-        "PATCH $settingsPath"
+        "PATCH $settingsPath",
+        "GET $missingSettingsPath",
+        "PATCH $missingSettingsPath"
     )
     $actualShapes = @($log | ForEach-Object { "$($_.method) $($_.path)" } | Sort-Object -Unique)
     Assert-Eq 'mock observed only contract-named operation shapes' `

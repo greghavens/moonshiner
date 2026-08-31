@@ -27,6 +27,11 @@ type NamespaceSpec struct {
 	Supervisor string
 }
 
+type TopologyVariable struct {
+	Name  string
+	Value any
+}
+
 type ClusterSpec struct {
 	Name                 string
 	Class                string
@@ -35,8 +40,7 @@ type ClusterSpec struct {
 	WorkerClass          string
 	WorkerName           string
 	WorkerReplicas       int
-	VMClass              string
-	StorageClass         string
+	TopologyVariables    []TopologyVariable
 }
 
 type Result struct {

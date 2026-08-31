@@ -187,7 +187,7 @@ def no_empty_json(value: Any, path: str = "$") -> None:
 
 
 def verify_log(
-    records: list[dict[str, Any]], config: dict[str, str]
+    records: list[dict[str, Any]], config: dict[str, Any]
 ) -> None:
     namespace_path = (
         "/api/vcenter/namespaces/instances/v2/" + config["namespace"]
@@ -205,6 +205,8 @@ def verify_log(
         + "/clusters"
     )
     expected = [
+        ("namespace.getV2", "GET", namespace_path),
+        ("namespace.createV2", "POST", namespace_collection),
         ("namespace.getV2", "GET", namespace_path),
         ("namespace.createV2", "POST", namespace_collection),
         ("namespace.getV2", "GET", namespace_path),
@@ -269,11 +271,14 @@ def verify_log(
         "supervisor": config["supervisor"],
     }
     require(
-        records[1]["body"] == expected_namespace_body,
+        records[1]["body"] == expected_namespace_body
+        and records[3]["body"] == expected_namespace_body,
         "namespace body must contain only required fields when options are unset",
     )
     require(
         records[1]["body_raw"]
+        == json.dumps(expected_namespace_body, separators=(",", ":"))
+        and records[3]["body_raw"]
         == json.dumps(expected_namespace_body, separators=(",", ":")),
         "namespace JSON bytes have the wrong property order or encoding",
     )
@@ -286,23 +291,37 @@ def verify_log(
         },
         "spec": {
             "topology": {
-                "class": config["cluster_class"],
+                "classRef": {"name": config["cluster_class"]},
                 "version": config["kubernetes_version"],
+                "controlPlane": {"replicas": config["control_plane_replicas"]},
+                "workers": {
+                    "machineDeployments": [
+                        {
+                            "class": config["worker_class"],
+                            "name": config["worker_name"],
+                            "replicas": config["worker_replicas"],
+                        }
+                    ]
+                },
+                "variables": [
+                    {"name": name, "value": config["topology_variables"][name]}
+                    for name in config["topology_variable_order"]
+                ],
             }
         },
     }
     require(
-        records[4]["body"] == expected_cluster_body,
+        records[6]["body"] == expected_cluster_body,
         "Cluster body has the wrong exact shape",
     )
     require(
-        records[4]["body_raw"]
+        records[6]["body_raw"]
         == json.dumps(expected_cluster_body, separators=(",", ":")),
         "Cluster JSON bytes have the wrong property order or encoding",
     )
     require(
-        sum(record["operation"] == "namespace.createV2" for record in records) == 1,
-        "namespace create was duplicated",
+        sum(record["operation"] == "namespace.createV2" for record in records) == 2,
+        "expected one live no-Supervisor attempt and one contract recovery attempt",
     )
     require(
         sum(
@@ -316,15 +335,38 @@ def verify_log(
 def main() -> int:
     validate_contract()
     validate_prerequisites()
-    suffix = secrets.token_hex(5)
+    topology_variable_order = [
+        "datastore",
+        "dnsImageTag",
+        "imageRepository",
+        "infraServerThumbprint",
+        "network",
+        "infraServerURL",
+        "resourcePool",
+        "vmTemplate",
+        "datacenter",
+        "etcdImageTag",
+        "folder",
+        "controlPlaneIpAddr",
+        "credsSecretName",
+        "kubeVipPodManifest",
+    ]
     config = {
-        "vcenter_session_id": "vc-" + secrets.token_urlsafe(18),
+        "vcenter_session_id": secrets.token_hex(16),
         "kubernetes_bearer_token": "k8s-" + secrets.token_urlsafe(20),
-        "supervisor": "supervisor-" + suffix,
-        "namespace": "team-" + suffix,
-        "cluster_name": "payments-" + suffix,
-        "kubernetes_version": "v1.33.1+vmware.1-fips-vkr.2",
-        "cluster_class": "builtin-generic-v3",
+        "supervisor": "supervisor-live-validation-missing",
+        "namespace": "moonshiner-live-0132",
+        "cluster_name": "vcf-msr01",
+        "kubernetes_version": "v1.34.2",
+        "cluster_class": "vsphere-9.1.2668",
+        "worker_class": "vsphere-9.1.2668-worker",
+        "worker_name": "workers",
+        "control_plane_replicas": 3,
+        "worker_replicas": 3,
+        "topology_variable_order": topology_variable_order,
+        "topology_variables": {
+            name: f"live-shaped-{name}" for name in topology_variable_order
+        },
     }
 
     with tempfile.TemporaryDirectory(prefix="vcf91-0132-") as temp_name:

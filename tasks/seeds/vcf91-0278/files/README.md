@@ -124,14 +124,4 @@ Constraints:
 bash harness/run_tests.sh
 ```
 
-This starts the loopback mock (bound to `127.0.0.1`, on a free port), compiles
-the client with the harness, runs the harness against the mock and then prints
-the mock's request log so you can see exactly what went over the wire.
-
-The mock is pinned to `docs/contract.json`: it routes only the operations your
-contract names, at the method and path your contract records, and it validates
-request bodies against the field sets your contract records. If the contract is
-wrong the mock will not behave like VCF Operations. Its error responses carry a
-`message` explaining the rejection — read them.
-
-`harness/` is fixed; do not edit anything in it.
+Do not modify the supplied harness.

@@ -679,7 +679,7 @@ def t_patch_omits(mock, session) -> None:
 
 
 def t_patch_keeps_false(mock, session) -> None:
-    session.partial_update_credential(
+    updated = session.partial_update_credential(
         credential_id=CRED_ID,
         name="vc-collector-principal",
         adapter_kind_key="VMWARE",
@@ -694,6 +694,11 @@ def t_patch_keeps_false(mock, session) -> None:
     )
     eq(body["editable"], False,
        "editable=False is set, not unset, and must be sent as JSON false")
+    eq(
+        updated["editable"],
+        True,
+        "the deployed service keeps the persisted server-controlled editable value",
+    )
     require(
         "fields" not in body,
         "unset optional field 'fields' must be omitted, not sent as [] or null",

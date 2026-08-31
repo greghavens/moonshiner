@@ -9,12 +9,6 @@ public final class NsxPolicyClient {
     public record Segment(String id, String displayName) {
     }
 
-    public interface AccessTokenProvider {
-        String initialAccessToken() throws IOException;
-
-        String refreshAccessToken(String expiredToken) throws IOException;
-    }
-
     public static final class NsxPolicyException extends IOException {
         private final int statusCode;
         private final String responseBody;
@@ -36,7 +30,8 @@ public final class NsxPolicyClient {
 
     public NsxPolicyClient(
             String managerBaseUrl,
-            AccessTokenProvider tokenProvider,
+            String username,
+            String password,
             Duration requestTimeout) {
         throw new UnsupportedOperationException("TODO");
     }

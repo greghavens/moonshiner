@@ -78,6 +78,12 @@ try {
         'pinned specification blob'
     Assert-Equal (@($Sources.operationIds) -join ',') `
         ($ExpectedOperationIds -join ',') 'official operationIds'
+    Assert-Equal $Sources.runtimeValidation.memoryUpdatePropertyConflict.`
+        pinnedSchemaProperty 'size_mib' `
+        'pinned memory property conflict record'
+    Assert-Equal $Sources.runtimeValidation.memoryUpdatePropertyConflict.`
+        deployedVcf91Property 'size_MiB' `
+        'deployed memory wire property record'
     Assert-Equal @($Sources.operations).Count 3 `
         'official operation record count'
     for ($Index = 0; $Index -lt 3; $Index++) {
@@ -139,7 +145,13 @@ try {
             properties.PSObject.Properties.Name
     )
     Assert-Equal ($MemoryProperties -join ',') `
-        'size_mib,hot_add_enabled' 'memory update property projection'
+        'size_MiB,hot_add_enabled' 'memory update property projection'
+    Assert-Equal $Contract.schemas.'Vcenter.Vm.Hardware.Memory.UpdateSpec'.`
+        runtimeWireOverride.pinnedSchemaProperty 'size_mib' `
+        'contract records pinned schema conflict'
+    Assert-Equal $Contract.schemas.'Vcenter.Vm.Hardware.Memory.UpdateSpec'.`
+        runtimeWireOverride.deployedVcf91Property 'size_MiB' `
+        'contract records deployed memory wire key'
     Assert-Equal @(
         $Contract.schemas.'Vcenter.Vm.Hardware.Memory.UpdateSpec'.required
     ).Count 0 'memory update has no required properties'
@@ -148,12 +160,8 @@ try {
     ) 'error_type,messages' 'standard error required fields'
 
     $Manifest = Import-PowerShellDataFile -LiteralPath $ManifestPath
-    Assert-Equal @($Manifest.RequiredModules).Count 1 `
+    Assert-Equal @($Manifest.RequiredModules).Count 0 `
         'manifest prerequisite count'
-    Assert-Equal $Manifest.RequiredModules[0].ModuleName `
-        'VMware.Sdk.Vcf.SddcManager' 'VCF PowerCLI module prerequisite'
-    Assert-Equal ([version] $Manifest.RequiredModules[0].ModuleVersion) `
-        ([version] '13.5.0.25380678') 'VCF PowerCLI module version'
     Assert-Equal (($Manifest.FunctionsToExport) -join ',') `
         'New-VcfVcenterResizeClient,Set-VcfVmResizeAndStart' `
         'manifest exports'
@@ -179,9 +187,8 @@ try {
     Assert-Equal @($ParseErrors).Count 0 'module parses without errors'
     $SourceText = Get-Content -Raw -LiteralPath $ModulePath
     foreach ($RequiredText in @(
-        'VMware.Sdk.OpenApi.Cmdlets.IServerConnection',
-        '.GetClient()',
         'vmware-api-session-id',
+        'DangerousAcceptAnyServerCertificateValidator',
         'EscapeDataString',
         'Net.Http.HttpRequestMessage'
     )) {
@@ -193,7 +200,9 @@ try {
         'Invoke-WebRequest',
         'Start-Process',
         'curl',
-        'Connect-VIServer'
+        'Connect-VIServer',
+        'VMware.Sdk.OpenApi.Cmdlets.IServerConnection',
+        '.GetClient()'
     )) {
         Assert-True (-not $SourceText.Contains($ForbiddenText)) `
             "implementation must not use $ForbiddenText"
@@ -209,9 +218,8 @@ try {
         'New-VcfVcenterResizeClient,Set-VcfVmResizeAndStart' `
         'runtime exports'
     $NewCommand = Get-Command New-VcfVcenterResizeClient
-    Assert-Equal $NewCommand.Parameters.Connection.ParameterType.FullName `
-        'VMware.Sdk.OpenApi.Cmdlets.IServerConnection' `
-        'authenticated VCF PowerCLI connection type'
+    Assert-True (-not $NewCommand.Parameters.ContainsKey('Connection')) `
+        'direct HTTP client has no unusable PowerCLI connection form'
     $SetCommand = Get-Command Set-VcfVmResizeAndStart
     Assert-Equal $SetCommand.Parameters.CpuCount.ParameterType.FullName `
         'System.Int64' 'CPU count parameter type'
@@ -219,8 +227,9 @@ try {
         'System.Int64' 'memory parameter type'
 
     $RunId = [guid]::NewGuid().ToString('N')
-    $SessionToken = 'session-' + $RunId
-    $Vm = 'vm ' + $RunId.Substring(0, 10) + '/blue+snow-' + [char] 0x96EA
+    $SessionToken = $RunId
+    $Vm = 'vm-1030'
+    $MissingVm = 'vm ' + $RunId.Substring(0, 10) + '/blue+snow-' + [char] 0x96EA
     $CpuCount = [long] (
         4 + ([Convert]::ToInt32($RunId.Substring(10, 2), 16) % 12)
     )
@@ -230,12 +239,11 @@ try {
             [Convert]::ToInt32($RunId.Substring(12, 2), 16) % 64
         ) * 128
     )
-    $PowerErrorMessage = (
-        'runtime power capacity unavailable ' + $RunId.Substring(14, 12)
-    )
+    $PowerErrorMessage = "Virtual machine '$Vm' was not found."
     $Scenario = [ordered]@{
         session_token = $SessionToken
         vm = $Vm
+        missing_vm = $MissingVm
         cpu_count = $CpuCount
         memory_mib = $MemoryMiB
         power_error_message = $PowerErrorMessage
@@ -294,7 +302,7 @@ try {
     Assert-Equal $Steps.Count 3 'report includes every attempted step'
     $ExpectedNames = @('Cpu', 'Memory', 'PowerStart')
     $ExpectedStates = @('SUCCEEDED', 'SUCCEEDED', 'FAILED')
-    $ExpectedStatuses = @(204, 204, 503)
+    $ExpectedStatuses = @(204, 204, 404)
     for ($Index = 0; $Index -lt 3; $Index++) {
         Assert-Equal $Steps[$Index].Name $ExpectedNames[$Index] `
             "report step $Index name"
@@ -311,18 +319,37 @@ try {
         Assert-Equal $Steps[$Index].Message $null `
             "successful step $Index has no error message"
     }
-    Assert-Equal $Steps[2].ErrorType 'SERVICE_UNAVAILABLE' `
+    Assert-Equal $Steps[2].ErrorType 'NOT_FOUND' `
         'failed step preserves vAPI error_type'
     Assert-Equal $Steps[2].Message $PowerErrorMessage `
         'failed step preserves first default_message'
+
+    $MissingReport = Set-VcfVmResizeAndStart `
+        -Client $Client `
+        -Vm $MissingVm `
+        -CpuCount $CpuCount `
+        -MemoryMiB $MemoryMiB
+    Assert-Equal $MissingReport.Vm $MissingVm 'missing VM report resource'
+    Assert-Equal $MissingReport.OverallState 'FAILED' `
+        'missing VM report overall state'
+    Assert-Equal ([int] $MissingReport.CompletedStepCount) 0 `
+        'missing VM report completes no mutation'
+    Assert-Equal $MissingReport.FailedOperationId `
+        'Vcenter.Vm.Hardware.Cpu_update' `
+        'missing VM stops on the first operation'
+    $MissingSteps = @($MissingReport.Steps)
+    Assert-Equal $MissingSteps.Count 1 `
+        'missing VM invokes no later operation'
+    Assert-Equal ([int] $MissingSteps[0].HttpStatus) 404 `
+        'missing VM preserves HTTP 404'
 
     Start-Sleep -Milliseconds 150
     $LogLines = @(
         Get-Content -LiteralPath $LogPath |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     )
-    Assert-Equal $LogLines.Count 3 `
-        'one request per operation with no retry or rollback'
+    Assert-Equal $LogLines.Count 4 `
+        'main workflow plus one missing-VM request with no retry or rollback'
     $Requests = @($LogLines | ForEach-Object { $_ | ConvertFrom-Json })
     $EncodedVm = [uri]::EscapeDataString($Vm)
     $ExpectedTargets = @(
@@ -336,7 +363,7 @@ try {
         '}'
     )
     $MemoryBody = (
-        '{"size_mib":' +
+        '{"size_MiB":' +
         $MemoryMiB.ToString([Globalization.CultureInfo]::InvariantCulture) +
         '}'
     )
@@ -389,6 +416,36 @@ try {
         'power action has no request body'
     Assert-Equal $Requests[2].contentType $null `
         'power action has no content type'
+    Assert-Equal $Requests[2].response.error_type 'NOT_FOUND' `
+        'power failure uses the live error type'
+    Assert-Equal @($Requests[2].response.messages).Count 2 `
+        'power failure preserves the live two-message envelope'
+    Assert-Equal $Requests[2].response.messages[0].id `
+        'com.vmware.api.vcenter.vm.not_found' `
+        'power failure first message identifier'
+    Assert-Equal $Requests[2].response.messages[1].id `
+        'vmsg.ManagedObjectNotFound.summary' `
+        'power failure second message identifier'
+
+    $MissingRequest = $Requests[3]
+    $MissingTarget = (
+        '/api/vcenter/vm/' + [uri]::EscapeDataString($MissingVm) +
+        '/hardware/cpu'
+    )
+    Assert-Equal $MissingRequest.operationId `
+        'Vcenter.Vm.Hardware.Cpu_update' `
+        'missing VM request operationId'
+    Assert-Equal $MissingRequest.method 'PATCH' 'missing VM request method'
+    Assert-Equal $MissingRequest.rawTarget $MissingTarget `
+        'missing VM exact encoded target'
+    Assert-Equal ([int] $MissingRequest.status) 404 `
+        'missing VM response status'
+    Assert-Equal $MissingRequest.response.error_type 'NOT_FOUND' `
+        'missing VM response type'
+    Assert-Equal $MissingRequest.bodyHex (
+        [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($CpuBody)).`
+            ToLowerInvariant()
+    ) 'missing VM CPU body bytes'
     foreach ($Omitted in @(
         'cores_per_socket',
         'hot_add_enabled',

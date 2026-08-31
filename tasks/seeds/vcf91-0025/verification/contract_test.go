@@ -222,8 +222,8 @@ func readJSON(t *testing.T, path string, out any) {
 
 func TestUpdateBackupConfigurationExactWireAndPolling(t *testing.T) {
 	mock, server := newContractMock(t, mockPlan{Polls: []pollReply{
-		{TaskStatus: "IN_PROGRESS"},
-		{TaskStatus: "SUCCESSFUL"},
+		{TaskStatus: "In Progress"},
+		{TaskStatus: "Successful"},
 	}})
 	var paceMu sync.Mutex
 	var paceCalls []int
@@ -238,7 +238,7 @@ func TestUpdateBackupConfigurationExactWireAndPolling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdateBackupConfiguration: %v", err)
 	}
-	if task.ID != taskID || task.Status != "SUCCESSFUL" {
+	if task.ID != taskID || task.Status != "Successful" {
 		t.Fatalf("unexpected terminal task: %+v", task)
 	}
 

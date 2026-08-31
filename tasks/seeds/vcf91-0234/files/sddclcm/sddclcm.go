@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-// ErrMissingCorrelationID is returned when UpgradeSpec.CorrelationID is empty.
+// ErrMissingCorrelationID is returned unless CorrelationID is a bare UUID.
 // The client refuses to submit, because a submission without a stable
 // correlation id cannot be retried safely.
 var ErrMissingCorrelationID = errors.New("sddclcm: UpgradeSpec.CorrelationID is required")
@@ -79,7 +79,7 @@ type LcmPlatformSpec struct {
 }
 
 // UpgradeSpec is the ComponentUpgradeSpec request payload. LcmPlatform is
-// optional; CorrelationID is required by this client.
+// optional; CorrelationID must be a bare UUID.
 type UpgradeSpec struct {
 	ComponentSpec ComponentDesiredSpec
 	LcmPlatform   *LcmPlatformSpec

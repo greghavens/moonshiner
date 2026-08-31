@@ -47,10 +47,10 @@ public final class VcfFailureDiagnosticsClient {
         }
     }
 
-    private static final int MAX_COMPRESSED_BYTES = 2 * 1024 * 1024;
-    private static final int MAX_ARCHIVE_ENTRIES = 64;
-    private static final int MAX_FILE_BYTES = 128 * 1024;
-    private static final int MAX_EXPANDED_BYTES = 512 * 1024;
+    private static final int MAX_COMPRESSED_BYTES = 32 * 1024 * 1024;
+    private static final int MAX_ARCHIVE_ENTRIES = 128;
+    private static final int MAX_FILE_BYTES = 32 * 1024 * 1024;
+    private static final int MAX_EXPANDED_BYTES = 32 * 1024 * 1024;
 
     private final URI baseUri;
     private final String accessToken;
@@ -116,7 +116,7 @@ public final class VcfFailureDiagnosticsClient {
             byte[] archive,
             String taskId,
             Set<String> referenceTokens,
-            Set<String> eventIds)
+            String eventId)
             throws IOException {
         throw new UnsupportedOperationException("TODO");
     }

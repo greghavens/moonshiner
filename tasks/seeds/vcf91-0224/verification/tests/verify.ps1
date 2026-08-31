@@ -76,24 +76,25 @@ function Get-Log {
 }
 
 # The transport state deliberately uses a one-item task page. A pre-existing
-# unrelated task places the first submitted task on page 1 during the retry,
+# unrelated task places the first submitted task on page 2 during the retry,
 # proving that a solution cannot stop after the default page.
 $token       = 'mock-sddc-lcm-token'
 $componentId = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
-$keyA        = 'bundle-key-alpha'
-$keyB        = 'bundle-key-bravo'
+$keyA        = 'a1111111-1111-4111-8111-111111111111'
+$keyB        = 'b2222222-2222-4222-8222-222222222222'
 
 $global:VcfSddcLcmVerifierContract = $contract
 $global:VcfSddcLcmVerifierToken = $token
 $global:VcfSddcLcmVerifierRequests = [System.Collections.Generic.List[object]]::new()
 $global:VcfSddcLcmVerifierTasks = [ordered]@{}
 $global:VcfSddcLcmVerifierBundles = [ordered]@{}
+$global:VcfSddcLcmVerifierTaskComponents = [ordered]@{}
 $global:VcfSddcLcmVerifierSequence = 0
 
 $decoyId = 'd0000000-0000-4000-8000-000000000000'
 $global:VcfSddcLcmVerifierTasks[$decoyId] = [ordered]@{
-    id = $decoyId; status = 'SUCCEEDED'; resourceId = $componentId
-    resourceType = 'COMPONENT'; correlationId = 'unrelated-correlation-id'
+    id = $decoyId; name = 'CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW'; status = 'SUCCEEDED'
+    correlationId = 'c3333333-3333-4333-8333-333333333333'
     createTime = '2026-01-15T09:00:00.000Z'
 }
 
@@ -175,14 +176,13 @@ function global:Invoke-RestMethod {
     switch ($matchedOperation.operationId) {
         'getTasks' {
             $items = @($global:VcfSddcLcmVerifierTasks.Values | Where-Object {
-                (-not $query['resourceId'] -or $_['resourceId'] -eq $query['resourceId']) -and
-                (-not $query['resourceType'] -or $_['resourceType'] -eq $query['resourceType'])
+                (-not $query['name'] -or $_['name'] -eq $query['name'])
             })
-            $pageNumber = if ($query.Contains('pageNumber')) { [int]$query['pageNumber'] } else { 0 }
-            $totalPages = [Math]::Max(1, $items.Count)
+            $pageNumber = if ($query.Contains('pageNumber')) { [int]$query['pageNumber'] } else { 1 }
+            $totalPages = $items.Count
             $elements = @()
-            if ($pageNumber -ge 0 -and $pageNumber -lt $items.Count) {
-                $elements = @([pscustomobject]$items[$pageNumber])
+            if ($pageNumber -ge 1 -and $pageNumber -le $items.Count) {
+                $elements = @([pscustomobject]$items[$pageNumber - 1])
             }
             return [pscustomobject]@{
                 elements = $elements
@@ -197,12 +197,12 @@ function global:Invoke-RestMethod {
             $global:VcfSddcLcmVerifierSequence++
             $taskId = 'a0000000-0000-4000-8000-{0}' -f $global:VcfSddcLcmVerifierSequence.ToString('000000000000')
             $task = [ordered]@{
-                id = $taskId; status = 'RUNNING'
-                resourceId = $routeValues['componentId']; resourceType = 'COMPONENT'
+                id = $taskId; name = 'CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW'; status = 'RUNNING'
                 correlationId = $Headers['X-Correlation-Id']
                 createTime = '2026-01-15T09:00:01.000Z'
             }
             $global:VcfSddcLcmVerifierTasks[$taskId] = $task
+            $global:VcfSddcLcmVerifierTaskComponents[$taskId] = $routeValues['componentId']
             return [pscustomobject]$task
         }
 
@@ -221,7 +221,7 @@ function global:Invoke-RestMethod {
                     id = $bundleId; name = 'support-bundle.tgz'; size = 10485760
                     createdTimestamp = '2026-01-15T09:00:02.000Z'
                     url = "https://mock.invalid/downloads/$bundleId.tgz"
-                    componentId = $task['resourceId']
+                    componentId = $global:VcfSddcLcmVerifierTaskComponents[$taskId]
                 }
             }
             return [pscustomobject]$task
@@ -321,16 +321,14 @@ try {
         -Expected 'application/json' -Actual "$(Get-Header $post 'Content-Type')"
 
     $q = ConvertFrom-RawQuery $lists[0].rawQuery
-    Assert-That -Name 'A: initial getTasks sends exactly resourceId and resourceType' `
-        -Condition (@($q.Keys).Count -eq 2 -and $q.Contains('resourceId') -and $q.Contains('resourceType')) `
-        -Expected 'resourceId, resourceType' -Actual (@($q.Keys) -join ', ')
-    Assert-That -Name 'A: getTasks resourceId is the component id' `
-        -Condition ($q['resourceId'] -eq $componentId) -Expected $componentId -Actual "$($q['resourceId'])"
+    Assert-That -Name 'A: initial getTasks sends exactly the live task-name filter' `
+        -Condition (@($q.Keys).Count -eq 1 -and $q['name'] -eq 'CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW') `
+        -Expected 'name=CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW' -Actual $lists[0].rawQuery
     Assert-That -Name 'A: getTasks sends no empty-valued query parameters' `
         -Condition ($lists[0].rawQuery -notmatch '=(&|$)') -Actual "$($lists[0].rawQuery)"
 
     # =====================================================================
-    # B. Retry: the matching task is now on page 1
+    # B. Retry: the matching task is now on page 2
     # =====================================================================
     Write-Host "`n[B] retry with the same correlation id on a later page" -ForegroundColor Cyan
     $beforeRetry = $global:VcfSddcLcmVerifierRequests.Count
@@ -343,10 +341,10 @@ try {
 
     Assert-That -Name 'B: searched both task pages before adopting' `
         -Condition ($retryLists.Count -eq 2) -Expected '2 getTasks requests' -Actual "$($retryLists.Count)"
-    $pageOneQuery = ConvertFrom-RawQuery $retryLists[-1].rawQuery
-    Assert-That -Name 'B: requested pageNumber=1 only when the later page was needed' `
-        -Condition ($pageOneQuery['pageNumber'] -eq '1' -and @($pageOneQuery.Keys).Count -eq 3) `
-        -Expected 'resourceId, resourceType, pageNumber=1' -Actual "$($retryLists[-1].rawQuery)"
+    $pageTwoQuery = ConvertFrom-RawQuery $retryLists[-1].rawQuery
+    Assert-That -Name 'B: requested pageNumber=2 only when the later page was needed' `
+        -Condition ($pageTwoQuery['pageNumber'] -eq '2' -and $pageTwoQuery['name'] -eq 'CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW' -and @($pageTwoQuery.Keys).Count -eq 2) `
+        -Expected 'name=CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW, pageNumber=2' -Actual "$($retryLists[-1].rawQuery)"
     Assert-That -Name 'B: still exactly one POST after the retry (no duplicate bundle)' `
         -Condition ($posts.Count -eq 1) -Expected '1' -Actual "$($posts.Count)"
     Assert-That -Name 'B: reports the task as adopted (Reused = true)' `
@@ -413,10 +411,10 @@ try {
 
     $badTaskQueries = @($log | Where-Object operationId -eq 'getTasks' | Where-Object {
         $query = ConvertFrom-RawQuery $_.rawQuery
-        -not $query.Contains('resourceId') -or -not $query.Contains('resourceType') -or
-        @($query.Keys | Where-Object { $_ -notin 'resourceId','resourceType','pageNumber' }).Count -gt 0
+        $query['name'] -ne 'CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW' -or
+        @($query.Keys | Where-Object { $_ -notin 'name','pageNumber' }).Count -gt 0
     })
-    Assert-That -Name 'D: getTasks uses only component filters and required pageNumber' `
+    Assert-That -Name 'D: getTasks uses only the live task-name filter and required pageNumber' `
         -Condition ($badTaskQueries.Count -eq 0) -Expected '0' -Actual "$($badTaskQueries.Count)"
 
     $getWithEntity = @($log | Where-Object { $_.method -eq 'GET' -and ($_.hasBody -or (Get-Header $_ 'Content-Type')) })

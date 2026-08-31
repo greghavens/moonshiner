@@ -168,12 +168,12 @@ class ContractMock(AbstractContextManager["ContractMock"]):
                         state = states[task_id]
                         info: dict[str, Any] = {
                             "description": {
-                                "id": "com.vmware.vcenter.vm.clone",
-                                "default_message": "Clone virtual machine",
-                                "args": [task_id],
+                                "id": "Description",
+                                "default_message": "",
+                                "args": [],
                             },
-                            "service": "com.vmware.vcenter.vm",
-                            "operation": "clone",
+                            "service": "7978ee81-a66c-4c37-8653-c577c0161e9d",
+                            "operation": "com.vmware.vcenter.vm.clone",
                             "status": state,
                             "cancelable": False,
                         }

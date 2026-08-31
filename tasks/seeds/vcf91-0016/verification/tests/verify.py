@@ -22,7 +22,7 @@ MOCK_PATH = Path(__file__).resolve().parent / "mock_sddc_manager.py"
 SRC_PATH = ROOT / "src"
 EXPECTED_COMMIT = "c3f3b52c845dd967cabbc21680e893292077d5ba"
 EXPECTED_SPEC_PATH = "specifications/sddc-manager/sddc-manager-openapi.json"
-EXPECTED_OPERATION_ID = "updateDepotSettings"
+EXPECTED_OPERATION_ID = "updateServicesConfig"
 EXPECTED_SPEC_URL = (
     "https://raw.githubusercontent.com/vmware/vcf-api-specs/"
     f"{EXPECTED_COMMIT}/{EXPECTED_SPEC_PATH}"
@@ -63,11 +63,11 @@ def verify_provenance() -> tuple[bytes, dict[str, Any]]:
     )
     require(
         set(operations) == {EXPECTED_OPERATION_ID},
-        "contract must contain only the named updateDepotSettings operation",
+        "contract must contain only the named updateServicesConfig operation",
     )
     method, path, operation = operations[EXPECTED_OPERATION_ID]
-    require(method == "PUT", "updateDepotSettings must be PUT")
-    require(path == "/v1/system/settings/depot", "updateDepotSettings path drifted")
+    require(method == "PUT", "updateServicesConfig must be PUT")
+    require(path == "/v1/services-config", "updateServicesConfig path drifted")
     request_schema = (
         operation.get("requestBody", {})
         .get("content", {})
@@ -75,8 +75,8 @@ def verify_provenance() -> tuple[bytes, dict[str, Any]]:
         .get("schema", {})
     )
     require(
-        request_schema == {"$ref": "#/components/schemas/DepotSettings"},
-        "updateDepotSettings request schema drifted",
+        request_schema == {"$ref": "#/components/schemas/ServicesConfig"},
+        "updateServicesConfig request schema drifted",
     )
 
     require(
@@ -192,21 +192,39 @@ def run_retry_scenario(
 ) -> None:
     seed = hashlib.sha256(contract_bytes + SOURCES_PATH.read_bytes()).hexdigest()
     access_token = "access-" + seed[:20]
-    download_token = seed[20:48]
-    expected_body = {"vmwareAccount": {"downloadToken": download_token}}
-    optional_download_token = seed[8:36]
-    optional_values = {
-        "username": "svc-" + seed[48:56],
-        "password": "pwd-" + seed[56:64],
-        "download_activation_code": "activation-" + seed[:12],
+    service = {
+        "name": "VCF Depot",
+        "type": "VCF_DEPOT",
+        "key": "depot-" + seed[20:32],
+        "nodes": [
+            {
+                "name": "VCF Depot",
+                "addresses": [
+                    {"type": "Fqdn", "value": f"depot-{seed[32:40]}.example.test"}
+                ],
+            }
+        ],
+    }
+    expected_body = {"services": [service]}
+    optional_service = {
+        "name": "VCF Depot",
+        "type": "VCF_DEPOT",
+        "key": "depot-" + seed[8:20],
+        "version": "9.1.0",
+        "nodes": [
+            {
+                "name": "VCF Depot",
+                "addresses": [
+                    {"type": "Fqdn", "value": f"depot-{seed[40:48]}.example.test"}
+                ],
+                "port": "443",
+                "baseUrl": "/depot-service/content-gateway",
+                "certificates": ["runtime-certificate-" + seed[48:56]],
+            }
+        ],
     }
     expected_optional_body = {
-        "vmwareAccount": {
-            "downloadToken": optional_download_token,
-            "username": optional_values["username"],
-            "password": optional_values["password"],
-            "downloadActivationCode": optional_values["download_activation_code"],
-        }
+        "services": [optional_service]
     }
 
     with tempfile.TemporaryDirectory(prefix="vcf91-0016-") as temp_name:
@@ -238,24 +256,19 @@ def run_retry_scenario(
                 max_attempts=2,
             )
             try:
-                client.update_depot_settings("")
+                client.update_services_config([])
             except ValueError:
                 pass
             else:
-                raise VerificationFailure("empty download_token must raise ValueError")
-            for name in optional_values:
-                try:
-                    client.update_depot_settings(download_token, **{name: ""})
-                except ValueError:
-                    pass
-                else:
-                    raise VerificationFailure(
-                        f"empty optional argument {name} must raise ValueError"
-                    )
-            result = client.update_depot_settings(download_token)
-            optional_result = client.update_depot_settings(
-                optional_download_token, **optional_values
-            )
+                raise VerificationFailure("empty services must raise ValueError")
+            try:
+                client.update_services_config(["not-an-object"])
+            except ValueError:
+                pass
+            else:
+                raise VerificationFailure("every service must be a JSON object")
+            result = client.update_services_config([service])
+            optional_result = client.update_services_config([optional_service])
         finally:
             process.terminate()
             try:
@@ -264,7 +277,7 @@ def run_retry_scenario(
                 process.kill()
                 process.wait(timeout=3)
 
-        require(result == expected_body, "202 response body was not returned intact")
+        require(result == expected_body, "200 response body was not returned intact")
         require(
             optional_result == expected_optional_body,
             "supplied optional fields were not returned intact",
@@ -286,7 +299,7 @@ def run_retry_scenario(
             )
             require(entry.get("method") == "PUT", "wire method must be PUT")
             require(
-                entry.get("target") == "/v1/system/settings/depot",
+                entry.get("target") == "/v1/services-config",
                 "wire target must have the exact path and no query",
             )
             headers = header_map(entry.get("headers"))
@@ -322,14 +335,17 @@ def run_retry_scenario(
             )
             if sequence <= 2:
                 require(
-                    set(decoded_body) == {"vmwareAccount"}
-                    and set(decoded_body["vmwareAccount"]) == {"downloadToken"},
+                    set(decoded_body) == {"services"}
+                    and set(decoded_body["services"][0])
+                    == {"name", "type", "key", "nodes"}
+                    and set(decoded_body["services"][0]["nodes"][0])
+                    == {"name", "addresses"},
                     "unset optional fields must be omitted, not serialized empty",
                 )
 
         require(raw_bodies[0] == raw_bodies[1], "retry must replay identical body bytes")
         require(
-            [entry.get("response_status") for entry in entries] == [500, 202, 202],
+            [entry.get("response_status") for entry in entries] == [500, 200, 200],
             "mock did not exercise transient retry followed by a normal update",
         )
         require(
@@ -357,7 +373,7 @@ def main() -> int:
             traceback.print_exc()
         return 1
     print(
-        "PASS: updateDepotSettings used the exact wire contract, omitted unset "
+        "PASS: updateServicesConfig used the exact wire contract, omitted unset "
         "fields, and applied one effect across the identical PUT retry"
     )
     return 0

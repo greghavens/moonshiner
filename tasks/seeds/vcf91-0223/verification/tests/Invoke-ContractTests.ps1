@@ -233,9 +233,9 @@ try {
         'case 1 -- nodes are ordered by name then id, ordinal ascending'
     Assert-NodeShape $nodes 'case 1'
     Assert-Targets $entries @(
-        "GET /v1/components/$fleetOpsId/nodes?pageNumber=0"
         "GET /v1/components/$fleetOpsId/nodes?pageNumber=1"
         "GET /v1/components/$fleetOpsId/nodes?pageNumber=2"
+        "GET /v1/components/$fleetOpsId/nodes?pageNumber=3"
     ) 'case 1'
     Assert-CommonWireShape $entries 'case 1'
 
@@ -250,10 +250,10 @@ try {
         'case 2 -- ordering is independent of page size'
     Assert-Targets $entries @(
         'GET /v1/components?scope=FLEET'
-        "GET /v1/components/$fleetOpsId/nodes?pageNumber=0&pageSize=2"
         "GET /v1/components/$fleetOpsId/nodes?pageNumber=1&pageSize=2"
         "GET /v1/components/$fleetOpsId/nodes?pageNumber=2&pageSize=2"
         "GET /v1/components/$fleetOpsId/nodes?pageNumber=3&pageSize=2"
+        "GET /v1/components/$fleetOpsId/nodes?pageNumber=4&pageSize=2"
     ) 'case 2'
     Assert-CommonWireShape $entries 'case 2'
 
@@ -282,9 +282,9 @@ try {
     Assert-SequenceEqual $expectedFilteredNodes @($nodes | ForEach-Object { $_.id }) `
         'case 4 -- the filtered collection keeps the required order'
     Assert-Targets $entries @(
-        "GET /v1/components/$fleetOpsId/nodes?pageNumber=0&nodeTypes=control-plane,worker"
         "GET /v1/components/$fleetOpsId/nodes?pageNumber=1&nodeTypes=control-plane,worker"
         "GET /v1/components/$fleetOpsId/nodes?pageNumber=2&nodeTypes=control-plane,worker"
+        "GET /v1/components/$fleetOpsId/nodes?pageNumber=3&nodeTypes=control-plane,worker"
     ) 'case 4'
     Assert-CommonWireShape $entries 'case 4'
 
@@ -296,7 +296,7 @@ try {
 
     Assert-Equal 0 $nodes.Count 'case 5 -- an empty collection is not an error'
     Assert-Targets $entries @(
-        "GET /v1/components/$fleetOpsId/nodes?pageNumber=0&pageSize=5&nodeTypes=absent-type"
+        "GET /v1/components/$fleetOpsId/nodes?pageNumber=1&pageSize=5&nodeTypes=absent-type"
     ) 'case 5'
     Assert-CommonWireShape $entries 'case 5'
 
@@ -312,7 +312,7 @@ try {
     $entries = Get-NewContractRequests
 
     Assert-True $threw 'case 6 -- a 404 from the service is a terminating error'
-    Assert-Targets $entries @("GET /v1/components/$missingId/nodes?pageNumber=0") 'case 6'
+    Assert-Targets $entries @("GET /v1/components/$missingId/nodes?pageNumber=1") 'case 6'
     Assert-Equal 404 $entries[0].status 'case 6 -- the fixture answered 404'
     Assert-True ($entries[0].PSObject.Properties.Name -notcontains 'violation') `
         'case 6 -- the 404 is a contract response, not a contract violation'
@@ -327,7 +327,7 @@ try {
     Assert-Equal 'vc-01' $nodes[0].name 'case 7 -- the right component was resolved'
     Assert-Targets $entries @(
         'GET /v1/components'
-        "GET /v1/components/$instanceVcId/nodes?pageNumber=0"
+        "GET /v1/components/$instanceVcId/nodes?pageNumber=1"
     ) 'case 7'
     Assert-CommonWireShape $entries 'case 7'
 
@@ -363,7 +363,7 @@ try {
     Assert-True $threw 'case 9 -- mismatched page metadata is a terminating error'
     Assert-Equal 0 $emitted.Count 'case 9 -- mismatched metadata emits no partial result'
     Assert-Targets $entries @(
-        "GET /v1/components/$badMetadataId/nodes?pageNumber=0"
+        "GET /v1/components/$badMetadataId/nodes?pageNumber=1"
     ) 'case 9 -- mismatched metadata does not advance pagination'
     Assert-Equal 200 $entries[0].status 'case 9 -- the malformed metadata arrived in a 2xx response'
     Assert-CommonWireShape $entries 'case 9'
@@ -384,8 +384,8 @@ try {
     Assert-True $threw 'case 10 -- a non-2xx response on a later page is a terminating error'
     Assert-Equal 0 $emitted.Count 'case 10 -- a later HTTP failure emits no partial result'
     Assert-Targets $entries @(
-        "GET /v1/components/$lateFailureId/nodes?pageNumber=0&pageSize=1"
         "GET /v1/components/$lateFailureId/nodes?pageNumber=1&pageSize=1"
+        "GET /v1/components/$lateFailureId/nodes?pageNumber=2&pageSize=1"
     ) 'case 10 -- pagination stops on the failing page'
     Assert-SequenceEqual @('200', '500') @($entries | ForEach-Object { [string]$_.status }) `
         'case 10 -- the fixture returned one successful page and then HTTP 500'

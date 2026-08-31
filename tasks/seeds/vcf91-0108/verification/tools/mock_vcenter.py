@@ -61,8 +61,8 @@ def string_list(value: object, name: str, length: int | None = None) -> list[str
 
 
 def records(value: object, kind: str) -> list[dict]:
-    if not isinstance(value, list) or len(value) < 3:
-        raise ValueError(f"{kind} records must contain at least three items")
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{kind} records must contain at least one item")
     required = (
         ("datacenter", "name")
         if kind == "datacenter"

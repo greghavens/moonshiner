@@ -206,10 +206,10 @@ def make_handler(contract, fixture, recorder):
                 found = [v for k, v in pairs if k == name]
                 return found[-1] if found else default
 
-            raw_number = last("pageNumber", "0")
+            raw_number = last("pageNumber", "1")
             raw_size = last("pageSize", str(MAX_PAGE_SIZE))
             try:
-                page_number = int(raw_number) if raw_number != "" else 0
+                page_number = int(raw_number) if raw_number != "" else 1
                 page_size = int(raw_size) if raw_size != "" else MAX_PAGE_SIZE
             except ValueError:
                 self._error(400, "BAD_REQUEST", "pageNumber and pageSize must be integers", entry)
@@ -218,14 +218,14 @@ def make_handler(contract, fixture, recorder):
                 self._error(400, "BAD_REQUEST",
                             "pageSize must be between 1 and %d" % MAX_PAGE_SIZE, entry)
                 return
-            if page_number < 0:
-                self._error(400, "BAD_REQUEST", "pageNumber must not be negative", entry)
+            if page_number < 1:
+                self._error(400, "BAD_REQUEST", "pageNumber must be at least 1", entry)
                 return
 
             total = len(tasks)
             total_pages = (total + page_size - 1) // page_size if total else 0
             reported_total = fixture.get("reportedTotalElements", total)
-            start = page_number * page_size
+            start = (page_number - 1) * page_size
             elements = tasks[start:start + page_size]
             self._respond(
                 200,

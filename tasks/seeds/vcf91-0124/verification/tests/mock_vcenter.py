@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contract-pinned loopback vCenter used only by the protected verifier."""
+"""Loopback vCenter for the focused EVC verifier."""
 
 from __future__ import annotations
 
@@ -147,7 +147,11 @@ class ContractState:
                 kind = "reject"
             else:
                 return 409, compact({"error_type": "fixture.too_many_checks"})
-            task_id = f"{self.task_prefix}/{kind} task?#\u03a9"
+            task_id = {
+                "set": f"task-5001:{self.task_prefix}",
+                "clear": f"task:clear/{self.task_prefix} +coverage",
+                "reject": f"task-4271:{self.task_prefix}",
+            }[kind]
             raw_task = quote(task_id, safe="-._~")
             self.tasks[raw_task] = {
                 "id": task_id,
@@ -175,12 +179,12 @@ class ContractState:
             info: dict[str, Any] = {
                 "cancelable": False,
                 "description": {
-                    "id": "fixture.evc.check",
-                    "default_message": "fixture EVC precheck",
+                    "id": "Description",
+                    "default_message": "",
                     "args": [],
                 },
-                "operation": "Vcenter.Cluster.EvcMode_checkSet$Task",
-                "service": "com.vmware.vcenter.cluster.evc_mode",
+                "operation": "com.vmware.vcenter.cluster.evc_mode.check_set",
+                "service": self.task_prefix,
                 "status": status,
             }
             if status == "SUCCEEDED":
@@ -188,16 +192,16 @@ class ContractState:
                     info["result"] = [
                         {
                             "error": {
-                                "error_type": "com.vmware.vapi.std.errors.invalid_argument",
+                                "error_type": "ERROR",
                                 "messages": [
                                     {
-                                        "id": "fixture.evc.unsupported",
-                                        "default_message": "host rejects requested EVC mode",
+                                        "id": "com.vmware.vcenter.cluster.evc_mode.host_unsupported",
+                                        "default_message": "Host host-12 lacks features required by EVC mode amd-zen.",
                                         "args": [],
                                     }
                                 ],
                             },
-                            "host_system": "host-runtime",
+                            "host_system": "host-12",
                         }
                     ]
                 else:
@@ -211,7 +215,9 @@ class ContractState:
                 return 409, compact({"error_type": "fixture.precheck_required"})
             task = self.tasks_by_cluster(cluster)
             mutation_id = (
-                f"{self.task_prefix}/mutation-{task['kind']} accepted"
+                f"task-5002:{self.task_prefix}"
+                if task["kind"] == "set"
+                else f"task:mutation-clear/{self.task_prefix} +coverage"
             )
         return 202, compact(mutation_id)
 

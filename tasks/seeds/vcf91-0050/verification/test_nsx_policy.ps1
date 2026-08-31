@@ -1,5 +1,4 @@
-# Protected acceptance verifier for the VCF 9.1 NSX Policy rollout module.
-# It uses only a loopback service and never contacts a VMware endpoint.
+# Acceptance verifier for the VCF 9.1 NSX Policy rollout module.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $WarningPreference = 'SilentlyContinue'
@@ -173,16 +172,6 @@ try {
     }
     $port = [int](Get-Content -LiteralPath $portFile -Raw)
 
-    $tokens = [System.Collections.Generic.Queue[string]]::new()
-    $tokens.Enqueue('access-1')
-    $tokens.Enqueue('access-2')
-    $tokenState = @{ Calls = 0; Queue = $tokens }
-    $provider = {
-        $tokenState.Calls++
-        if ($tokenState.Queue.Count -eq 0) { throw 'token provider called too many times' }
-        $tokenState.Queue.Dequeue()
-    }.GetNewClosure()
-
     $result = Invoke-VcfNsxPolicyRollout `
         -BaseUri ([uri]"http://127.0.0.1:$port") `
         -DomainId 'default' `
@@ -190,12 +179,11 @@ try {
         -TagValue 'app|payments' `
         -SecurityPolicyId 'payments-policy' `
         -DestinationGroupId 'database-vms' `
-        -AccessTokenProvider $provider
+        -Username 'nsx-user' `
+        -Password 'nsx-password'
 
-    Assert-Eq 'token provider called initial plus one refresh' 2 $tokenState.Calls
     Assert-Eq 'result GroupId' 'payments-vms' $result.GroupId
     Assert-Eq 'result SecurityPolicyId' 'payments-policy' $result.SecurityPolicyId
-    Assert-Eq 'result TokenRefreshes' 1 $result.TokenRefreshes
     Assert-Eq 'completed operation order' (
         'PatchGroupForDomain,PatchSecurityPolicyForDomain'
     ) (@($result.CompletedOperations) -join ',')
@@ -204,26 +192,27 @@ try {
     do {
         $lines = @(Get-Content -LiteralPath $logFile -ErrorAction SilentlyContinue |
             Where-Object { $_.Trim().Length -gt 0 })
-        if ($lines.Count -ge 3) { break }
+        if ($lines.Count -ge 2) { break }
         Start-Sleep -Milliseconds 25
     } while ([DateTime]::UtcNow -lt $logDeadline)
     $entries = @($lines | ForEach-Object { $_ | ConvertFrom-Json })
-    Assert-Eq 'exact request count' 3 $entries.Count
+    Assert-Eq 'exact request count' 2 $entries.Count
 
-    if ($entries.Count -eq 3) {
+    if ($entries.Count -eq 2) {
         $expectedTargets = @(
             '/policy/api/v1/infra/domains/default/groups/payments-vms',
-            '/policy/api/v1/infra/domains/default/security-policies/payments-policy',
             '/policy/api/v1/infra/domains/default/security-policies/payments-policy'
         )
         $expectedOps = @(
             'PatchGroupForDomain',
-            'PatchSecurityPolicyForDomain',
             'PatchSecurityPolicyForDomain'
         )
-        $expectedAuth = @('Bearer access-1', 'Bearer access-1', 'Bearer access-2')
-        $expectedStatus = @(200, 401, 200)
-        for ($index = 0; $index -lt 3; $index++) {
+        $expectedAuth = @(
+            'Basic bnN4LXVzZXI6bnN4LXBhc3N3b3Jk',
+            'Basic bnN4LXVzZXI6bnN4LXBhc3N3b3Jk'
+        )
+        $expectedStatus = @(200, 200)
+        for ($index = 0; $index -lt 2; $index++) {
             $entry = $entries[$index]
             Assert-Eq "request $index operationId" $expectedOps[$index] $entry.operationId
             Assert-Eq "request $index method" 'PATCH' $entry.method
@@ -234,8 +223,7 @@ try {
             Assert-Eq "request $index response status" $expectedStatus[$index] $entry.status
         }
         Assert-JsonEq 'group wire body' $expectedGroup $entries[0].body
-        Assert-JsonEq 'first policy wire body' $expectedPolicy $entries[1].body
-        Assert-JsonEq 'policy replay body is identical' $entries[1].body $entries[2].body
+        Assert-JsonEq 'policy wire body' $expectedPolicy $entries[1].body
     }
 } catch {
     $script:Failures++

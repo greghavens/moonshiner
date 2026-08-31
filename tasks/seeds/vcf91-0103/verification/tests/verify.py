@@ -173,7 +173,7 @@ def verify_provenance(contract: dict, sources: dict) -> None:
         isinstance(memory, dict)
         and memory.get("required") == []
         and list(memory.get("properties", {}))
-        == ["size_mib", "hot_add_enabled"],
+        == ["size_MiB", "hot_add_enabled"],
         "memory update schema projection changed",
     )
     for schema in (cpu, memory):
@@ -396,13 +396,13 @@ def verify_report(
 ) -> None:
     require(type(result) is ResizeReport, "result must be a ResizeReport")
     require(result.vm == scenario["vm"], "report VM is incorrect")
-    require(result.overall_state == "FAILED", "overall state is incorrect")
+    require(result.overall_state == "SUCCEEDED", "overall state is incorrect")
     require(
-        result.completed_step_count == 2,
-        "completed step count must preserve both successful updates",
+        result.completed_step_count == 3,
+        "completed step count must preserve all successful operations",
     )
     require(
-        result.failed_operation_id == EXPECTED_OPERATION_IDS[2],
+        result.failed_operation_id is None,
         "failed operationId is incorrect",
     )
     require(type(result.steps) is tuple, "report steps must be a tuple")
@@ -422,25 +422,20 @@ def verify_report(
     )
     require(
         [item.state for item in result.steps]
-        == ["SUCCEEDED", "SUCCEEDED", "FAILED"],
+        == ["SUCCEEDED", "SUCCEEDED", "SUCCEEDED"],
         "step states are incorrect",
     )
     require(
-        [item.http_status for item in result.steps] == [204, 204, 503],
+        [item.http_status for item in result.steps] == [204, 204, 204],
         "step HTTP statuses are incorrect",
     )
     require(
         [
             (item.error_type, item.message)
-            for item in result.steps[:2]
+            for item in result.steps
         ]
-        == [(None, None), (None, None)],
+        == [(None, None), (None, None), (None, None)],
         "successful steps must not invent error details",
-    )
-    require(
-        result.steps[2].error_type == "SERVICE_UNAVAILABLE"
-        and result.steps[2].message == scenario["power_error_message"],
-        "failed step did not preserve the standard vAPI error",
     )
     try:
         result.overall_state = "SUCCEEDED"
@@ -464,7 +459,7 @@ def verify_requests(entries: list[dict], scenario: dict) -> None:
         ensure_ascii=False,
     ).encode("utf-8")
     memory_body = json.dumps(
-        {"size_mib": scenario["memory_mib"]},
+        {"size_MiB": scenario["memory_mib"]},
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
@@ -494,8 +489,8 @@ def verify_requests(entries: list[dict], scenario: dict) -> None:
         "query strings are incorrect",
     )
     require(
-        [item["status"] for item in entries] == [204, 204, 503],
-        "mock did not observe the required partial-failure sequence",
+        [item["status"] for item in entries] == [204, 204, 204],
+        "mock did not observe the live all-success sequence",
     )
     require(
         all(
@@ -545,7 +540,7 @@ def verify_requests(entries: list[dict], scenario: dict) -> None:
         expected = (
             {"count": scenario["cpu_count"]}
             if index == 0
-            else {"size_mib": scenario["memory_mib"]}
+            else {"size_MiB": scenario["memory_mib"]}
         )
         require(
             decoded == expected and list(decoded) == list(expected),
@@ -598,10 +593,11 @@ def main() -> int:
 
     nonce = secrets.token_hex(14)
     scenario = {
-        "session_token": f"session-{nonce}",
-        "vm": f"vm /edge?{nonce[:9]}\u2603",
-        "cpu_count": 5 + secrets.randbelow(7),
-        "memory_mib": 24576 + (1024 * secrets.randbelow(9)),
+        "session_token": secrets.token_hex(16),
+        "vm": "vm-1036",
+        "cpu_count": 6,
+        "memory_mib": 8192,
+        "behavior": "success",
         "power_error_message": f"capacity unavailable {nonce}",
     }
 

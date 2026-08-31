@@ -1,4 +1,4 @@
-"""Implement the contract-pinned vCenter CPU update client here."""
+"""Implement the focused vCenter CPU update client here."""
 
 from __future__ import annotations
 

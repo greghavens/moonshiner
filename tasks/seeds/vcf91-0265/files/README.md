@@ -22,9 +22,8 @@ token is only released once nothing is using it.
 
 ## Layout
 
-    docs/                 API contract + provenance (see task)
-    src/vcfops_rotate/    the client package and its loopback mock
-    verification/         acceptance checks (read-only, do not edit)
+    src/vcfops_rotate/    the client package
+    verification/         acceptance checks
 
 ## Running the checks
 
@@ -37,4 +36,3 @@ is no build step and nothing to install.
 
 - Python 3.11+, standard library only. Collector hosts have no package index
   access, so `requests`/`httpx`/`pydantic`/`pytest` are not available.
-- Nothing in this repo may open a socket to a non-loopback address at runtime.

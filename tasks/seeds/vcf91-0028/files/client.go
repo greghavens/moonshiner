@@ -8,7 +8,7 @@ import (
 )
 
 // ErrNotImplemented is returned by the initial scaffold.
-var ErrNotImplemented = errors.New("SDDC Manager depot deletion is not implemented")
+var ErrNotImplemented = errors.New("SDDC Manager depot service deletion is not implemented")
 
 // Config configures a depot deletion client.
 type Config struct {
@@ -17,11 +17,6 @@ type Config struct {
 	HTTPClient  *http.Client
 	MaxAttempts int
 	BeforeRetry func(context.Context, int) error
-}
-
-// DeleteDepotOptions contains the optional deleteDepotSettings query field.
-type DeleteDepotOptions struct {
-	DepotType *string
 }
 
 // Result describes how many DELETE submissions were needed.
@@ -53,7 +48,7 @@ func (e *TransportError) Error() string {
 	return "SDDC Manager transport request failed"
 }
 
-// Client deletes SDDC Manager depot settings.
+// Client deletes an SDDC Manager depot service configuration.
 type Client struct{}
 
 // NewClient validates config without performing network I/O.
@@ -61,10 +56,10 @@ func NewClient(config Config) (*Client, error) {
 	return nil, ErrNotImplemented
 }
 
-// DeleteDepotSettings safely retries the idempotent deleteDepotSettings call.
-func (c *Client) DeleteDepotSettings(
+// DeleteDepotServiceConfig safely retries deleteServiceConfigByKey.
+func (c *Client) DeleteDepotServiceConfig(
 	ctx context.Context,
-	options DeleteDepotOptions,
+	serviceKey string,
 ) (Result, error) {
 	return Result{}, ErrNotImplemented
 }

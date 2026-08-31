@@ -169,12 +169,10 @@ public final class MockSddcLcm {
         String id = String.format("11111111-2222-4333-8444-%012d", ++taskSeq);
         Map<String, String> t = new LinkedHashMap<>();
         t.put("id", id);
-        t.put("name", "component_support_bundle_generate");
+        t.put("name", "CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW");
         t.put("status", status);
-        t.put("type", "support-bundle-generate");
         t.put("createdBy", "lcm-pipeline");
-        t.put("resourceId", componentId);
-        t.put("resourceType", "COMPONENT");
+        t.put("componentId", componentId); // internal mock state; omitted from responses
         t.put("createTime", "2026-08-03T09:1" + (taskSeq % 10) + ":00.000Z");
         t.put("correlationId", correlationId);
         t.put("defaultMessage", defaultMessage == null
@@ -296,19 +294,18 @@ public final class MockSddcLcm {
             return;
         }
         Map<String, String> q = parseQuery(entry.rawQuery);
-        String bad = rejectUnexpected(q.keySet(), Set.of("resourceId", "resourceType", "pageNumber"));
+        String bad = rejectUnexpected(q.keySet(), Set.of("name", "pageNumber"));
         if (bad != null) {
             respondError(ex, entry, 400, "LCM_INVALID_QUERY_PARAM", bad);
             return;
         }
-        String resourceId = q.get("resourceId");
-        String resourceType = q.get("resourceType");
-        if (resourceId == null || resourceType == null) {
+        String taskName = q.get("name");
+        if (!"CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW".equals(taskName)) {
             respondError(ex, entry, 400, "LCM_INVALID_QUERY_PARAM",
-                    "getTasks requires resourceId and resourceType per the pinned contract.");
+                    "getTasks requires the deployed support-bundle workflow name.");
             return;
         }
-        int page = 0;
+        int page = 1;
         if (q.containsKey("pageNumber")) {
             try {
                 page = Integer.parseInt(q.get("pageNumber"));
@@ -317,22 +314,22 @@ public final class MockSddcLcm {
                         "pageNumber must be an integer, got " + q.get("pageNumber") + ".");
                 return;
             }
-            if (page < 0) {
+            if (page < 1) {
                 respondError(ex, entry, 400, "LCM_INVALID_QUERY_PARAM",
-                        "pageNumber must be zero-based and non-negative, got " + page + ".");
+                        "pageNumber must be one-based and positive, got " + page + ".");
                 return;
             }
         }
 
         List<Map<String, String>> matched = new ArrayList<>();
         for (Map<String, String> t : tasks.values()) {
-            if (resourceId.equals(t.get("resourceId")) && resourceType.equals(t.get("resourceType"))) {
+            if (taskName.equals(t.get("name"))) {
                 matched.add(t);
             }
         }
         int total = matched.size();
         int totalPages = total == 0 ? 0 : (total + pageSize - 1) / pageSize;
-        int from = Math.min(page * pageSize, total);
+        int from = Math.min((page - 1) * pageSize, total);
         int to = Math.min(from + pageSize, total);
 
         StringBuilder sb = new StringBuilder("{\"elements\":[");
@@ -402,8 +399,14 @@ public final class MockSddcLcm {
             return;
         }
 
-        supportBundlePosts++;
         String correlationId = entry.header("x-correlation-id");
+        if (correlationId == null || !correlationId.matches(
+                "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")) {
+            respondError(ex, entry, 500, "VCF_LCM_500_INTERNAL_SERVER_ERROR",
+                    "X-Correlation-Id must be a bare UUID.");
+            return;
+        }
+        supportBundlePosts++;
         String taskId = storeTask(componentId, correlationId, "PENDING", null);
         respond(ex, entry, postSuccessStatus, taskJson(tasks.get(taskId)));
     }
@@ -416,12 +419,9 @@ public final class MockSddcLcm {
                 + ",\"description\":{\"id\":\"com.broadcom.lcm.ops.supportbundle.generate\""
                 + ",\"defaultMessage\":" + str(t.get("defaultMessage"))
                 + ",\"localizedMessage\":" + str(t.get("defaultMessage"))
-                + ",\"args\":{\"componentId\":" + str(t.get("resourceId")) + "}}"
+                + ",\"args\":{\"componentId\":" + str(t.get("componentId")) + "}}"
                 + ",\"status\":" + str(t.get("status"))
-                + ",\"type\":" + str(t.get("type"))
                 + ",\"createdBy\":" + str(t.get("createdBy"))
-                + ",\"resourceId\":" + str(t.get("resourceId"))
-                + ",\"resourceType\":" + str(t.get("resourceType"))
                 + ",\"createTime\":" + str(t.get("createTime"))
                 + ",\"correlationId\":" + str(t.get("correlationId"))
                 + ",\"retriable\":false,\"cancellable\":true}";

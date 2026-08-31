@@ -1,4 +1,3 @@
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -7,43 +6,6 @@ import java.util.Comparator;
 import java.util.List;
 
 public final class TestMain {
-    private static final class TrackingTokenProvider
-            implements NsxPolicyClient.AccessTokenProvider {
-        private final String initial;
-        private final String refreshed;
-        private int initialCalls;
-        private int refreshCalls;
-
-        TrackingTokenProvider(String initial, String refreshed) {
-            this.initial = initial;
-            this.refreshed = refreshed;
-        }
-
-        @Override
-        public synchronized String initialAccessToken() {
-            initialCalls++;
-            return initial;
-        }
-
-        @Override
-        public synchronized String refreshAccessToken(String expiredToken)
-                throws IOException {
-            if (!initial.equals(expiredToken)) {
-                throw new IOException("refresh received the wrong expired token");
-            }
-            refreshCalls++;
-            return refreshed;
-        }
-
-        synchronized int initialCalls() {
-            return initialCalls;
-        }
-
-        synchronized int refreshCalls() {
-            return refreshCalls;
-        }
-    }
-
     private static String env(String name) {
         String value = System.getenv(name);
         if (value == null || value.isEmpty()) {
@@ -81,22 +43,17 @@ public final class TestMain {
         }
     }
 
-    private static void assertConstructorValidation(
-            String baseUrl,
-            TrackingTokenProvider provider) {
-        int initialBefore = provider.initialCalls();
+    private static void assertConstructorValidation(String baseUrl) {
         try {
             new NsxPolicyClient(
                     baseUrl + "/already-a-path",
-                    provider,
+                    env("NSX_USERNAME"),
+                    env("NSX_PASSWORD"),
                     Duration.ofSeconds(2));
             throw new AssertionError("non-origin base URL was accepted");
         } catch (IllegalArgumentException expected) {
             // Expected.
         }
-        check(
-                provider.initialCalls() == initialBefore,
-                "constructor called the token provider");
     }
 
     private static void assertReadableLog(Path requestLog) throws Exception {
@@ -107,10 +64,10 @@ public final class TestMain {
                     line.contains("\"operationId\":\"ListAllInfraSegments\""),
                     "request log omitted the contract operationId");
         }
-        long unauthorized = lines.stream()
-                .filter(line -> line.contains("\"response_status\":401"))
+        long forbidden = lines.stream()
+                .filter(line -> line.contains("\"response_status\":403"))
                 .count();
-        check(unauthorized == 1, "expected exactly one expiry challenge");
+        check(forbidden == 1, "expected one live-shaped auth failure");
     }
 
     public static void main(String[] args) throws Exception {
@@ -118,35 +75,39 @@ public final class TestMain {
         String baseUrl = args[0];
         Path requestLog = Path.of(args[1]);
 
-        TrackingTokenProvider provider = new TrackingTokenProvider(
-                env("NSX_INITIAL_TOKEN"),
-                env("NSX_REFRESHED_TOKEN"));
-        assertConstructorValidation(baseUrl, provider);
+        assertConstructorValidation(baseUrl);
+
+        NsxPolicyClient rejected = new NsxPolicyClient(
+                baseUrl,
+                env("NSX_USERNAME"),
+                env("NSX_PASSWORD") + "-wrong",
+                Duration.ofSeconds(4));
+        try {
+            rejected.listAllSegments();
+            throw new AssertionError("invalid Basic credentials were accepted");
+        } catch (NsxPolicyClient.NsxPolicyException expected) {
+            check(expected.statusCode() == 403, "auth failure status");
+            check(
+                    expected.responseBody().contains("\"error_code\":403")
+                            && expected.responseBody().contains(
+                                    "\"module_name\":\"common-services\""),
+                    "auth failure envelope");
+        }
 
         NsxPolicyClient client = new NsxPolicyClient(
                 baseUrl,
-                provider,
+                env("NSX_USERNAME"),
+                env("NSX_PASSWORD"),
                 Duration.ofSeconds(4));
-        check(
-                provider.initialCalls() == 0 && provider.refreshCalls() == 0,
-                "client construction was not lazy");
 
         List<NsxPolicyClient.Segment> expected = expectedSegments();
         List<NsxPolicyClient.Segment> first = client.listAllSegments();
         check(first.equals(expected), "first inventory is not globally sorted");
         assertImmutable(first);
-        check(provider.initialCalls() == 1, "initial token call count");
-        check(provider.refreshCalls() == 1, "refresh token call count");
 
         List<NsxPolicyClient.Segment> second = client.listAllSegments();
         check(second.equals(expected), "second inventory is not globally sorted");
         assertImmutable(second);
-        check(
-                provider.initialCalls() == 1,
-                "initial token was acquired more than once");
-        check(
-                provider.refreshCalls() == 1,
-                "refreshed token was not reused");
 
         assertReadableLog(requestLog);
         System.out.println("TEST_MAIN_OK");

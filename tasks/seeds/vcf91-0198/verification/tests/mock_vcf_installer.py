@@ -126,7 +126,7 @@ class ContractHandler(BaseHTTPRequestHandler):
         operation_id = route["operationId"]
         if operation_id == "createToken":
             self._respond(
-                201,
+                200,
                 {
                     "accessToken": "access-before-expiry",
                     "refreshToken": {"id": "refresh-for-run"},

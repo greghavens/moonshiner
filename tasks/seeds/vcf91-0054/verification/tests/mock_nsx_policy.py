@@ -163,8 +163,16 @@ class Handler(BaseHTTPRequestHandler):
         group: dict[str, object] = {
             "_revision": scenario["current_revision"],
             "display_name": scenario["current_display_name"],
+            "description": scenario["current_description"],
             "id": scenario["group_id"],
             "resource_type": "Group",
+            "expression": [
+                {
+                    "ip_addresses": ["198.18.54.10"],
+                    "resource_type": "IPAddressExpression",
+                }
+            ],
+            "tags": [{"scope": "fixture", "tag": "preserve"}],
         }
         return group
 
@@ -213,9 +221,9 @@ class Handler(BaseHTTPRequestHandler):
 
         scenario["current_display_name"] = request["display_name"]
         scenario["current_revision"] = int(scenario["current_revision"]) + 1
-        response = self.current_group()
         if "description" in request:
-            response["description"] = request["description"]
+            scenario["current_description"] = request["description"]
+        response = self.current_group()
         self.send_json(200, response)
 
     def reject_unserved_method(self) -> None:

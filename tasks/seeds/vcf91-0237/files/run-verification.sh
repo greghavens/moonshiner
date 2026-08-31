@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Protected verification entry point.
+# Runs the task's checks.
 #
-# Compiles the SDDC LCM client together with the contract-pinned harness and
+# Compiles the SDDC LCM client together with the focused harness and
 # runs every scenario. No network access is required or performed: the harness
-# only ever talks to its own loopback fixture.
+# Runs the task's checks.
 set -euo pipefail
 
 cd "$(dirname "$0")"

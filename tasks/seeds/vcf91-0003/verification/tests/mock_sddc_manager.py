@@ -273,7 +273,7 @@ class ContractHandler(BaseHTTPRequestHandler):
                 [],
             )
         return (
-            201,
+            200,
             {
                 "accessToken": self.server.state.access_token,
                 "refreshToken": {"id": self.server.state.refresh_token},

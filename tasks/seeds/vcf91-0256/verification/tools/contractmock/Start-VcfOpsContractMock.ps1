@@ -39,7 +39,7 @@ foreach ($op in $contract.operations) {
 $AUTH_TOKEN     = 'a4d63c0e-2f18-4d0a-9b56-70c1c1e4a2f7'
 $CREATED_ID     = '725cbdae-812e-4e98-9972-53c58f51661b'
 $PRECHECK_ID    = 'c1f0a2be-6d84-4f1b-8f4c-2b7a0f5d9e33'
-$PRECHECK_ERROR = 'Cannot establish a connection to the data source. The certificate presented by the endpoint is not trusted.'
+$PRECHECK_ERROR = 'Internal Server error, cause unknown.'
 
 function New-AdapterInstanceBody {
     param([string] $Id, [string] $Name, [string] $AdapterKindKey)
@@ -159,9 +159,9 @@ try {
                 $status = 200
                 $payload = [ordered]@{
                     token     = $AUTH_TOKEN
-                    validity  = 1893456000000
-                    expiresAt = 'Tuesday, January 1, 2030 12:00:00 AM UTC'
-                    roles     = @('ADMIN')
+                    validity  = 1788098400000
+                    expiresAt = 'Sunday, August 30, 2026 at 12:00:00 PM Coordinated Universal Time'
+                    roles     = @()
                 }
             }
             'getCurrentVersionOfServer' {
@@ -172,19 +172,30 @@ try {
                     minor                      = 1
                     minorMinor                 = 0
                     patch                      = 0
-                    buildNumber                = 24000000
-                    releasedDate               = 1772568000000
-                    humanlyReadableReleaseDate = 'Tuesday, March 3, 2026 at 12:00:00 PM UTC'
+                    buildNumber                = 25541561
+                    description                = $null
+                    releasedDate               = 1772539200000
+                    humanlyReadableReleaseDate = 'Tuesday, March 3, 2026 at 12:00:00 PM Coordinated Universal Time'
                 }
             }
             'testConnection' {
                 $names = Get-RequestNames -Body $body
-                if ($Scenario -eq 'precheck-fail') {
+                $parsed = $body | ConvertFrom-Json
+                if ($null -eq $parsed.credential) {
                     $status = 400
                     $payload = [ordered]@{
-                        message        = $PRECHECK_ERROR
+                        type           = 'Error'
+                        message        = 'Field or property "Credential" in type "AdapterInstanceCreationRequestDto" is required.'
                         httpStatusCode = 400
-                        apiErrorCode   = 1400
+                        apiErrorCode   = 1502
+                    }
+                } elseif ($Scenario -eq 'precheck-fail') {
+                    $status = 500
+                    $payload = [ordered]@{
+                        type           = 'Error'
+                        message        = $PRECHECK_ERROR
+                        httpStatusCode = 500
+                        apiErrorCode   = 500
                     }
                 } else {
                     $status = 201
@@ -193,8 +204,21 @@ try {
             }
             'createAdapterInstance' {
                 $names = Get-RequestNames -Body $body
-                $status = 201
-                $payload = New-AdapterInstanceBody -Id $CREATED_ID -Name $names[0] -AdapterKindKey $names[1]
+                $parsed = $body | ConvertFrom-Json
+                if ($null -eq $parsed.credential -or
+                    [string]$parsed.credential.id -ne '6f455a29-3330-47b6-9128-a608bca9d2c7' -or
+                    $parsed.credential.PSObject.Properties.Name -contains 'fields') {
+                    $status = 422
+                    $payload = [ordered]@{
+                        type           = 'Error'
+                        message        = 'CredentialInstance already exists or was not identified by id'
+                        httpStatusCode = 422
+                        apiErrorCode   = 422
+                    }
+                } else {
+                    $status = 201
+                    $payload = New-AdapterInstanceBody -Id $CREATED_ID -Name $names[0] -AdapterKindKey $names[1]
+                }
             }
             'releaseToken' {
                 $status = 200

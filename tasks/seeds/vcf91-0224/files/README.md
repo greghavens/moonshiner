@@ -24,19 +24,21 @@ SDDC Manager or VCF Installer are not SDDC LCM credentials.
 ### `Start-VcfSddcLcmSupportBundle`
 
 ```powershell
-Start-VcfSddcLcmSupportBundle -Session $s -ComponentId <uuid> -CorrelationId <string>
+Start-VcfSddcLcmSupportBundle -Session $s -ComponentId <uuid> -CorrelationId <uuid>
                               [-LookBackWindow <int>] [-Wait]
                               [-TimeoutSeconds <int>] [-PollIntervalSeconds <int>]
 ```
 
 Required behaviour:
 
-1. **Check before submitting.** Call `getTasks` filtered to the component and
-   look through every result page for a task already tagged with
-   `-CorrelationId`. Send only the filters you actually mean — the operation
-   declares fifteen optional query parameters and the ones you are not using
-   must not appear on the wire at all. The initial request omits `pageNumber`;
-   add it only when another page is required.
+1. **Check before submitting.** Call `getTasks` with
+   `name=CREATE_COMPONENT_SUPPORT_BUNDLE_WORKFLOW` and look through every
+   result page for a task already tagged with `-CorrelationId`. The deployed
+   service omits `resourceId` and `resourceType` from these task summaries, so
+   those filters cannot find the submitted task. Send only the task-name filter
+   and required page number — unused optional query parameters must not appear
+   on the wire. The initial request omits `pageNumber` and returns page 1; add
+   page 2 and later only when another page is required.
 2. **Adopt, don't duplicate.** If such a task exists, return it and do **not**
    `POST`. Report this via `Reused = $true`.
 3. **Otherwise submit** `generateComponentSupportBundle`, tagging the request

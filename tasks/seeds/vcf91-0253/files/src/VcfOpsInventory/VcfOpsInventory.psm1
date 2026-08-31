@@ -22,7 +22,8 @@ function Get-VcfOpsResourceInventory {
         Resources requested per page.
 
     .PARAMETER Name
-        Restrict the snapshot to these resource names.
+        Restrict the snapshot to one resource name. The API models this as an
+        array but the deployed service supports at most one value.
 
     .PARAMETER AdapterKind
         Restrict the snapshot to these adapter kind keys.

@@ -44,10 +44,11 @@ def _is_empty(value: object) -> bool:
 class ContractViolation(Exception):
     """Raised when a request does not match the contract; becomes a 4xx."""
 
-    def __init__(self, status: int, message: str) -> None:
+    def __init__(self, status: int, message: str, payload: dict | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.message = message
+        self.payload = payload
 
 
 class OperationsState:
@@ -143,6 +144,32 @@ def _validate_custom_group(body: object, *, expect_id: bool) -> dict:
             400, f"membershipDefinition has fields not in the schema: {membership_unknown}"
         )
     _require_no_empty_optionals(membership, "membershipDefinition.", membership_allowed)
+    included = membership.get("includedResources")
+    rules = membership.get("rules")
+    if not (isinstance(included, list) and included) and not (
+        isinstance(rules, list) and rules
+    ):
+        message = "Invalid request... #2 violations found."
+        raise ContractViolation(
+            400,
+            message,
+            {
+                "type": "Error",
+                "message": message,
+                "validationFailures": [
+                    {
+                        "failureMessage": "Define member criteria or objects to include.",
+                        "violationPath": "membershipDefinition.definition",
+                    },
+                    {
+                        "failureMessage": "Define member criteria or objects to include.",
+                        "violationPath": "membershipDefinition.validMembershipDefinition",
+                    },
+                ],
+                "httpStatusCode": 400,
+                "apiErrorCode": 400,
+            },
+        )
 
     return body
 
@@ -210,7 +237,7 @@ class _Handler(BaseHTTPRequestHandler):
             record["operation_id"] = operation_id
             status, payload = self._dispatch(operation_id, split.query, record["body"], record)
         except ContractViolation as exc:
-            status, payload = exc.status, {"message": exc.message}
+            status, payload = exc.status, exc.payload or {"message": exc.message}
         except Exception as exc:  # pragma: no cover - defensive
             status, payload = 500, {"message": f"mock failure: {exc!r}"}
 
@@ -319,12 +346,24 @@ class _Handler(BaseHTTPRequestHandler):
             for existing in state.groups.values():
                 if OperationsState.identity(existing) == identity:
                     raise ContractViolation(
-                        409,
-                        "a custom group with resourceKey "
-                        f"{identity} already exists (id={existing['id']})",
+                        500,
+                        "Internal Server error, cause unknown.",
+                        {
+                            "type": "Error",
+                            "message": "Internal Server error, cause unknown.",
+                            "moreInformation": [],
+                            "httpStatusCode": 500,
+                            "apiErrorCode": 500,
+                        },
                     )
             stored = json.loads(json.dumps(group))
             stored["id"] = state.next_group_id()
+            stored["resourceKey"].setdefault("resourceIdentifiers", [])
+            stored["membershipDefinition"].setdefault("excludedResources", [])
+            stored["membershipDefinition"].setdefault("custom-group-properties", [])
+            stored["membershipDefinition"].setdefault("rules", [])
+            stored.setdefault("autoResolveMembership", False)
+            stored.setdefault("policy", None)
             state.groups[stored["id"]] = stored
         return 201, json.loads(json.dumps(stored))
 
@@ -339,10 +378,29 @@ class _Handler(BaseHTTPRequestHandler):
                 raise ContractViolation(404, f"no custom group with id {group_id}")
             for other_id, existing in state.groups.items():
                 if other_id != group_id and OperationsState.identity(existing) == identity:
+                    message = (
+                        f'Object "{identity[2]}" with identifier "{group_id}" cannot be modified '
+                        f'because "Custom group update failed: Resource with key '
+                        f"'{{resName={identity[2]}, resKind={identity[1]}, adKind={identity[0]}}}' "
+                        'already exists.".'
+                    )
                     raise ContractViolation(
-                        409, f"resourceKey {identity} already belongs to custom group {other_id}"
+                        400,
+                        message,
+                        {
+                            "type": "Error",
+                            "message": message,
+                            "httpStatusCode": 400,
+                            "apiErrorCode": 1506,
+                        },
                     )
             stored = json.loads(json.dumps(group))
+            stored["resourceKey"].setdefault("resourceIdentifiers", [])
+            stored["membershipDefinition"].setdefault("excludedResources", [])
+            stored["membershipDefinition"].setdefault("custom-group-properties", [])
+            stored["membershipDefinition"].setdefault("rules", [])
+            stored.setdefault("autoResolveMembership", False)
+            stored.setdefault("policy", None)
             state.groups[group_id] = stored
         return 200, json.loads(json.dumps(stored))
 

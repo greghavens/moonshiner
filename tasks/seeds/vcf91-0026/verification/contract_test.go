@@ -19,7 +19,7 @@ import (
 const (
 	expectedCommit = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
 	expectedSpec   = "specifications/sddc-manager/sddc-manager-openapi.json"
-	contractSHA256 = "a8924d45cefd3254345707b346b795d1817012609c76eae47e0b8f1546b44812"
+	contractSHA256 = "463a9a2d069264fc988341cabcaf69a617903e76f652125084d4327fc08f9d2e"
 	sourcesSHA256  = "39a94a0f2493322133c0bcdcf3a58445df3431d5f8a50876332128f7c7551688"
 )
 
@@ -198,14 +198,14 @@ func TestListDomainsRefreshesOnlyInterruptedPageAndMatchesWire(t *testing.T) {
 			operationID:   "getDomains",
 			method:        http.MethodGet,
 			path:          "/v1/domains",
-			rawQuery:      "pageNumber=0&pageSize=2",
+			rawQuery:      "pageNumber=1&pageSize=2",
 			authorization: "Bearer " + secrets.AccessToken,
 		},
 		{
 			operationID:   "getDomains",
 			method:        http.MethodGet,
 			path:          "/v1/domains",
-			rawQuery:      "pageNumber=1&pageSize=2",
+			rawQuery:      "pageNumber=2&pageSize=2",
 			authorization: "Bearer " + secrets.AccessToken,
 		},
 		{
@@ -219,14 +219,14 @@ func TestListDomainsRefreshesOnlyInterruptedPageAndMatchesWire(t *testing.T) {
 			operationID:   "getDomains",
 			method:        http.MethodGet,
 			path:          "/v1/domains",
-			rawQuery:      "pageNumber=1&pageSize=2",
+			rawQuery:      "pageNumber=2&pageSize=2",
 			authorization: "Bearer " + secrets.NewAccessToken,
 		},
 		{
 			operationID:   "getDomains",
 			method:        http.MethodGet,
 			path:          "/v1/domains",
-			rawQuery:      "pageNumber=2&pageSize=2",
+			rawQuery:      "pageNumber=3&pageSize=2",
 			authorization: "Bearer " + secrets.NewAccessToken,
 		},
 	}
@@ -397,10 +397,10 @@ func TestExactSuccessStatusesAndOneRefreshBound(t *testing.T) {
 		{
 			name: "createToken other 2xx",
 			plan: contractmock.Plan{
-				Domains: fixtureDomains, CreateStatus: http.StatusOK,
+				Domains: fixtureDomains, CreateStatus: http.StatusCreated,
 			},
 			wantOperation: "createToken",
-			wantStatus:    http.StatusOK,
+			wantStatus:    http.StatusCreated,
 			wantRequests:  1,
 		},
 		{
@@ -483,7 +483,7 @@ func TestMalformedPagesReturnProtocolErrorWithoutPartialData(t *testing.T) {
 		{
 			name: "missing metadata",
 			mutate: func(pageNumber int, payload map[string]any) {
-				if pageNumber == 0 {
+				if pageNumber == 1 {
 					delete(payload, "pageMetadata")
 				}
 			},
@@ -491,7 +491,7 @@ func TestMalformedPagesReturnProtocolErrorWithoutPartialData(t *testing.T) {
 		{
 			name: "wrong page number",
 			mutate: func(pageNumber int, payload map[string]any) {
-				if pageNumber == 0 {
+				if pageNumber == 1 {
 					payload["pageMetadata"].(map[string]any)["pageNumber"] = 7
 				}
 			},
@@ -499,7 +499,7 @@ func TestMalformedPagesReturnProtocolErrorWithoutPartialData(t *testing.T) {
 		{
 			name: "short non-final page",
 			mutate: func(pageNumber int, payload map[string]any) {
-				if pageNumber == 0 {
+				if pageNumber == 1 {
 					payload["elements"] = payload["elements"].([]map[string]any)[:1]
 					payload["pageMetadata"].(map[string]any)["pageSize"] = 1
 				}
@@ -508,7 +508,7 @@ func TestMalformedPagesReturnProtocolErrorWithoutPartialData(t *testing.T) {
 		{
 			name: "non-object element",
 			mutate: func(pageNumber int, payload map[string]any) {
-				if pageNumber == 0 {
+				if pageNumber == 1 {
 					payload["elements"] = []any{
 						map[string]any{"id": "valid"},
 						"not-an-object",
@@ -519,7 +519,7 @@ func TestMalformedPagesReturnProtocolErrorWithoutPartialData(t *testing.T) {
 		{
 			name: "totals change after refresh",
 			mutate: func(pageNumber int, payload map[string]any) {
-				if pageNumber == 1 {
+				if pageNumber == 2 {
 					metadata := payload["pageMetadata"].(map[string]any)
 					metadata["totalElements"] = 6
 					metadata["totalPages"] = 3

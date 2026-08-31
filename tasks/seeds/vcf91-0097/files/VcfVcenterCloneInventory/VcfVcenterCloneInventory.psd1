@@ -7,12 +7,7 @@
     Copyright = '(c) Platform Engineering'
     Description = 'Polls an asynchronous vCenter clone before returning stable VM inventory.'
     PowerShellVersion = '7.4'
-    RequiredModules = @(
-        @{
-            ModuleName = 'VMware.Sdk.Vcf.SddcManager'
-            ModuleVersion = '13.5.0.25380678'
-        }
-    )
+    RequiredModules = @()
     FunctionsToExport = @(
         'New-VcfVcenterCloneInventoryClient'
         'Invoke-VcfVcenterCloneInventory'

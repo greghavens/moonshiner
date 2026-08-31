@@ -46,6 +46,9 @@ class ContractMock(AbstractContextManager["ContractMock"]):
         task_states: list[str],
         task_result: Any,
         task_error: Any = None,
+        namespace_not_found: bool = False,
+        supervisor_not_found: bool = False,
+        task_not_found: bool = False,
     ) -> None:
         contract = json.loads(contract_path.read_text(encoding="utf-8"))
         operations = {
@@ -60,8 +63,6 @@ class ContractMock(AbstractContextManager["ContractMock"]):
         }
         if set(operations) != expected_names:
             raise ValueError("focused contract operation set does not match mock")
-        if len(clusters) != 3:
-            raise ValueError("the order-flip fixture requires three clusters")
         if not task_states:
             raise ValueError("task_states must not be empty")
 
@@ -97,11 +98,17 @@ class ContractMock(AbstractContextManager["ContractMock"]):
             (dict(cluster) for cluster in clusters),
             key=lambda item: item["name"],
         )
-        self._cluster_base_order = [canonical[1], canonical[0], canonical[2]]
+        if len(canonical) == 3:
+            self._cluster_base_order = [canonical[1], canonical[0], canonical[2]]
+        else:
+            self._cluster_base_order = canonical
         self._task_id = task_id
         self._task_states = list(task_states)
         self._task_result = task_result
         self._task_error = task_error
+        self._namespace_not_found = namespace_not_found
+        self._supervisor_not_found = supervisor_not_found
+        self._task_not_found = task_not_found
         self._poll_index = 0
         self._collection_count = 0
         self._collection_orders: list[list[str]] = []
@@ -198,16 +205,29 @@ class ContractMock(AbstractContextManager["ContractMock"]):
         ):
             contract_name = "getSupervisorNamespace"
             operation_id = GET_NAMESPACE_OPERATION
-            status = int(next(iter(get_namespace["responses"])))
-            payload = {
-                "access_list": [],
-                "config_status": "RUNNING",
-                "description": "runtime namespace fixture",
-                "messages": [],
-                "stats": {},
-                "storage_specs": [],
-                "supervisor": self._supervisor,
-            }
+            if self._namespace_not_found:
+                status = 404
+                payload = {
+                    "error_type": "NOT_FOUND",
+                    "messages": [
+                        {
+                            "args": [],
+                            "default_message": "Namespace was not found.",
+                            "id": "vcenter.wcp.workload.notfound",
+                        }
+                    ],
+                }
+            else:
+                status = int(next(iter(get_namespace["responses"])))
+                payload = {
+                    "access_list": [],
+                    "config_status": "RUNNING",
+                    "description": "runtime namespace fixture",
+                    "messages": [],
+                    "stats": {},
+                    "storage_specs": [],
+                    "supervisor": self._supervisor,
+                }
         elif (
             handler.command == list_clusters["method"]
             and self._matches(
@@ -233,7 +253,19 @@ class ContractMock(AbstractContextManager["ContractMock"]):
             contract_name = "createSupervisorBackup"
             operation_id = CREATE_BACKUP_OPERATION
             with self._lock:
-                if self._submitted:
+                if self._supervisor_not_found:
+                    status = 404
+                    payload = {
+                        "error_type": "NOT_FOUND",
+                        "messages": [
+                            {
+                                "args": [],
+                                "default_message": "Supervisor was not found.",
+                                "id": "vcenter.wcp.supervisor.notfound",
+                            }
+                        ],
+                    }
+                elif self._submitted:
                     status = 409
                     payload = {"error": "backup submitted more than once"}
                 else:
@@ -253,7 +285,19 @@ class ContractMock(AbstractContextManager["ContractMock"]):
                 ]
                 if submitted:
                     self._poll_index += 1
-            if submitted:
+            if submitted and self._task_not_found:
+                status = 404
+                payload = {
+                    "error_type": "NOT_FOUND",
+                    "messages": [
+                        {
+                            "args": [],
+                            "default_message": "Task was not found.",
+                            "id": "com.vmware.cis.tasksSvc.monf",
+                        }
+                    ],
+                }
+            elif submitted:
                 status = int(next(iter(get_task["responses"])))
                 payload = {
                     "cancelable": False,
@@ -290,7 +334,9 @@ class ContractMock(AbstractContextManager["ContractMock"]):
     def _cluster_list_payload(self) -> dict[str, Any]:
         with self._lock:
             self._collection_count += 1
-            if self._collection_count % 2:
+            if len(self._cluster_base_order) < 2:
+                ordered = list(self._cluster_base_order)
+            elif self._collection_count % 2:
                 ordered = list(self._cluster_base_order)
             else:
                 ordered = list(reversed(self._cluster_base_order))

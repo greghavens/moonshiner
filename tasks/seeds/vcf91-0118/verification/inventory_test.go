@@ -16,11 +16,13 @@ import (
 func TestNewClientRejectsInvalidConfig(t *testing.T) {
 	valid := func() vcenter.Config {
 		return vcenter.Config{
-			BaseURL:          "https://vcenter.example.test",
-			AccessToken:      "access",
-			SubjectToken:     "subject",
-			SubjectTokenType: "urn:ietf:params:oauth:token-type:jwt",
-			HTTPClient:       http.DefaultClient,
+			BaseURL:            "https://vcenter.example.test",
+			AccessToken:        "access",
+			SubjectToken:       "subject",
+			SubjectTokenType:   "SAML2",
+			Audience:           "vcenter.example.test",
+			RequestedTokenType: "JWT_ID",
+			HTTPClient:         http.DefaultClient,
 		}
 	}
 
@@ -32,6 +34,8 @@ func TestNewClientRejectsInvalidConfig(t *testing.T) {
 		{name: "access token", mutate: func(c *vcenter.Config) { c.AccessToken = "" }},
 		{name: "subject token", mutate: func(c *vcenter.Config) { c.SubjectToken = "" }},
 		{name: "subject token type", mutate: func(c *vcenter.Config) { c.SubjectTokenType = "" }},
+		{name: "audience", mutate: func(c *vcenter.Config) { c.Audience = "" }},
+		{name: "requested token type", mutate: func(c *vcenter.Config) { c.RequestedTokenType = "" }},
 		{name: "relative URL", mutate: func(c *vcenter.Config) { c.BaseURL = "/vcenter" }},
 		{name: "unsupported URL scheme", mutate: func(c *vcenter.Config) { c.BaseURL = "ftp://vcenter.example.test" }},
 		{name: "URL with api path", mutate: func(c *vcenter.Config) { c.BaseURL = "https://vcenter.example.test/api" }},
@@ -46,6 +50,20 @@ func TestNewClientRejectsInvalidConfig(t *testing.T) {
 				t.Fatal("NewClient returned nil error")
 			}
 		})
+	}
+}
+
+func TestHostSortingBeyondLiveSingleHostContractCoverage(t *testing.T) {
+	server := contractmock.New(contractmock.WithAdditionalHostForSortingCoverage())
+	defer server.Close()
+	client := newClient(t, server)
+
+	got, err := client.Inventory(context.Background())
+	if err != nil {
+		t.Fatalf("Inventory: %v", err)
+	}
+	if len(got.Hosts) != 2 || got.Hosts[0].ID != "host-01" || got.Hosts[1].ID != "host-12" {
+		t.Fatalf("Hosts = %#v, want contract-only host followed by live-shaped host", got.Hosts)
 	}
 }
 
@@ -210,7 +228,7 @@ func assertFirstRunLog(t *testing.T, got []contractmock.Request) {
 		{contractmock.OperationVMList, contractmock.InitialAccessToken},
 		{contractmock.OperationHostList, contractmock.InitialAccessToken},
 		{contractmock.OperationTokenIssue, ""},
-		{contractmock.OperationHostList, "access-2"},
+		{contractmock.OperationHostList, contractmock.RotatedAccessToken},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("first-run request count = %d, want %d: %#v", len(got), len(want), got)
@@ -230,6 +248,8 @@ func assertFirstRunLog(t *testing.T, got []contractmock.Request) {
 		t.Errorf("refresh Accept = %q, want application/json", refresh.Accept)
 	}
 	if refresh.Form.Get("grant_type") != "urn:ietf:params:oauth:grant-type:token-exchange" ||
+		refresh.Form.Get("audience") != contractmock.Audience ||
+		refresh.Form.Get("requested_token_type") != contractmock.RequestedTokenType ||
 		refresh.Form.Get("subject_token") != contractmock.SubjectToken ||
 		refresh.Form.Get("subject_token_type") != contractmock.SubjectTokenType {
 		t.Errorf("refresh form does not match pinned token exchange: %v", refresh.Form)
@@ -250,11 +270,13 @@ func assertFirstRunLog(t *testing.T, got []contractmock.Request) {
 func newClient(t *testing.T, server *contractmock.Server) *vcenter.Client {
 	t.Helper()
 	client, err := vcenter.NewClient(vcenter.Config{
-		BaseURL:          server.URL(),
-		AccessToken:      contractmock.InitialAccessToken,
-		SubjectToken:     contractmock.SubjectToken,
-		SubjectTokenType: contractmock.SubjectTokenType,
-		HTTPClient:       server.Client(),
+		BaseURL:            server.URL(),
+		AccessToken:        contractmock.InitialAccessToken,
+		SubjectToken:       contractmock.SubjectToken,
+		SubjectTokenType:   contractmock.SubjectTokenType,
+		Audience:           contractmock.Audience,
+		RequestedTokenType: contractmock.RequestedTokenType,
+		HTTPClient:         server.Client(),
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -263,19 +285,26 @@ func newClient(t *testing.T, server *contractmock.Server) *vcenter.Client {
 }
 
 func expectedInventory() vcenter.Inventory {
-	cpu4, cpu8 := int64(4), int64(8)
-	mem8, mem16 := int64(8192), int64(16384)
-	on, off := "POWERED_ON", "POWERED_OFF"
-	uuidA := "11111111-1111-1111-1111-111111111111"
-	uuidZ := "99999999-9999-9999-9999-999999999999"
+	on := "POWERED_ON"
+	uuid := "312680c6-8a28-4302-90c6-319869516823"
 	return vcenter.Inventory{
 		VMs: []vcenter.VM{
-			{ID: "vm-101", Name: "build-runner", PowerState: "POWERED_ON", CPUCount: &cpu4, MemorySizeMiB: &mem8},
-			{ID: "vm-909", Name: "release-db", PowerState: "POWERED_OFF", CPUCount: &cpu8, MemorySizeMiB: &mem16},
+			{ID: "vm-19", Name: "sddcm01", PowerState: "POWERED_ON", CPUCount: int64Ptr(4), MemorySizeMiB: int64Ptr(16384)},
+			{ID: "vm-20", Name: "vc01", PowerState: "POWERED_ON", CPUCount: int64Ptr(4), MemorySizeMiB: int64Ptr(21504)},
+			{ID: "vm-28", Name: "nsx01a", PowerState: "POWERED_ON", CPUCount: int64Ptr(6), MemorySizeMiB: int64Ptr(24576)},
+			{ID: "vm-33", Name: "vcf-msr01-nxpxf", PowerState: "POWERED_ON", CPUCount: int64Ptr(4), MemorySizeMiB: int64Ptr(10240)},
+			{ID: "vm-34", Name: "vcf-msr01-5ghdn", PowerState: "POWERED_ON", CPUCount: int64Ptr(8), MemorySizeMiB: int64Ptr(24576)},
+			{ID: "vm-35", Name: "vcf-msr01-x6j88", PowerState: "POWERED_ON", CPUCount: int64Ptr(8), MemorySizeMiB: int64Ptr(24576)},
+			{ID: "vm-36", Name: "vcf-msr01-6zpgq", PowerState: "POWERED_ON", CPUCount: int64Ptr(8), MemorySizeMiB: int64Ptr(24576)},
+			{ID: "vm-37", Name: "vcf01", PowerState: "POWERED_ON", CPUCount: int64Ptr(4), MemorySizeMiB: int64Ptr(16384)},
+			{ID: "vm-38", Name: "vcf-proxy01", PowerState: "POWERED_ON", CPUCount: int64Ptr(4), MemorySizeMiB: int64Ptr(16384)},
+			{ID: "vm-39", Name: "vcf-lic01", PowerState: "POWERED_ON", CPUCount: int64Ptr(2), MemorySizeMiB: int64Ptr(4096)},
+			{ID: "vm-43", Name: "vcf-asr01-szwjz", PowerState: "POWERED_ON", CPUCount: int64Ptr(8), MemorySizeMiB: int64Ptr(98304)},
 		},
-		Hosts: []vcenter.Host{
-			{ID: "host-120", Name: "esx-a.example.test", ConnectionState: "CONNECTED", PowerState: &on, HostUUID: &uuidA},
-			{ID: "host-880", Name: "esx-z.example.test", ConnectionState: "DISCONNECTED", PowerState: &off, HostUUID: &uuidZ},
-		},
+		Hosts: []vcenter.Host{{
+			ID: "host-12", Name: "esx01.vcf.lab", ConnectionState: "CONNECTED", PowerState: &on, HostUUID: &uuid,
+		}},
 	}
 }
+
+func int64Ptr(value int64) *int64 { return &value }

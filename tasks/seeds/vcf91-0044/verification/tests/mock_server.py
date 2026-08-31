@@ -42,32 +42,40 @@ def load_contract(path: Path) -> None:
 
 
 def make_archive(values: dict[str, str]) -> bytes:
-    records = [
+    log_data = json.dumps(
         {
-            "taskId": values["task_id"],
-            "referenceToken": "wrong-reference",
-            "eventId": values["event_id"],
-            "cause": "uncorrelated reference token",
+            "content": {
+                "workflows": [
+                    {
+                        "id": "wrong-task",
+                        "errors": [
+                            {
+                                "referenceToken": values["reference_token"],
+                                "errorCode": "WRONG_TASK",
+                                "message": "a shared token is insufficient",
+                            }
+                        ],
+                    },
+                    {
+                        "id": values["task_id"],
+                        "errors": [
+                            {
+                                "referenceToken": "wrong-reference",
+                                "errorCode": "WRONG_REFERENCE",
+                                "message": "an unrelated error is insufficient",
+                            },
+                            {
+                                "referenceToken": values["reference_token"],
+                                "errorCode": "VCF_OPERATION_FAILED",
+                                "message": values["cause"],
+                            },
+                        ],
+                    },
+                ]
+            }
         },
-        {
-            "taskId": values["task_id"],
-            "referenceToken": values["reference_token"],
-            "eventId": "unrelated-event",
-            "cause": "uncorrelated resource event",
-        },
-        {
-            "taskId": values["task_id"],
-            "referenceToken": values["reference_token"],
-            "eventId": values["event_id"],
-            "cause": values["cause"],
-        },
-    ]
-    log_data = (
-        "\n".join(
-            json.dumps(record, separators=(",", ":"), ensure_ascii=False)
-            for record in records
-        )
-        + "\n"
+        separators=(",", ":"),
+        ensure_ascii=False,
     ).encode("utf-8")
 
     output = io.BytesIO()

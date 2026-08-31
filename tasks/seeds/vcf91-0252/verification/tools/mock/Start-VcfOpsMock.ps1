@@ -152,7 +152,12 @@ try {
         }
         elseif ($route.RequiresAuth -and $auth -ne ('OpsToken ' + $state.ActiveToken)) {
             $status = 401
-            $payload = @{ message = 'the supplied token is not valid' }
+            $payload = [ordered]@{
+                type = 'Error'
+                message = 'The provided token for auth scheme "OpsToken" is either invalid or has expired.'
+                httpStatusCode = 401
+                apiErrorCode = 1512
+            }
             $note = 'rejected-stale-token'
         }
         else {
@@ -162,7 +167,12 @@ try {
                 # gets 401 on a request it had every reason to believe was authorized.
                 $state.ActiveToken = $null
                 $status = 401
-                $payload = @{ message = 'the supplied token has expired' }
+                $payload = [ordered]@{
+                    type = 'Error'
+                    message = 'The provided token for auth scheme "OpsToken" is either invalid or has expired.'
+                    httpStatusCode = 401
+                    apiErrorCode = 1512
+                }
                 $note = 'token-expired'
             }
             else {
@@ -172,7 +182,8 @@ try {
                             major = 9; minor = 1; patch = 0; minorMinor = 0
                             buildNumber = [int]$fixture.buildNumber
                             releaseName = [string]$fixture.releaseName
-                            description = 'VMware Cloud Foundation Operations'
+                            description = $null
+                            releasedDate = 1772539200000
                             humanlyReadableReleaseDate = [string]$fixture.releaseDate
                         }
                     }
@@ -214,14 +225,18 @@ try {
                                     type                = $_.type
                                     subType             = $_.subType
                                     startTimeUTC        = [int64]$_.startTimeUTC
+                                    cancelTimeUTC       = 0
                                     updateTimeUTC       = [int64]$_.updateTimeUTC
+                                    suspendUntilTimeUTC = 0
                                     alertDefinitionId   = $_.alertDefinitionId
                                     alertDefinitionName = $_.alertDefinitionName
+                                    links               = @()
                                 }
                             })
                             pageInfo = [ordered]@{
                                 page = $page; pageSize = $size; totalCount = $total
                             }
+                            links = @()
                         }
                     }
                     'modifyAlerts' {
@@ -261,10 +276,17 @@ try {
                                             type          = $_.type
                                             subType       = $_.subType
                                             startTimeUTC  = [int64]$_.startTimeUTC
+                                            cancelTimeUTC = 0
                                             updateTimeUTC = [int64]$_.updateTimeUTC
+                                            suspendUntilTimeUTC = 1893456000000
+                                            ownerId       = '3902116a-1472-425f-b977-546ab9b9f90c'
+                                            alertDefinitionId = $_.alertDefinitionId
+                                            alertDefinitionName = $_.alertDefinitionName
+                                            links         = @()
                                         }
                                     })
-                                    pageInfo = [ordered]@{ page = 0; pageSize = $ids.Count; totalCount = $touched.Count }
+                                    pageInfo = [ordered]@{ page = 0; pageSize = 1000; totalCount = $touched.Count }
+                                    links = @()
                                 }
                             }
                         }

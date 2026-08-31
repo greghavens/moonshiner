@@ -114,12 +114,8 @@ try {
     ).Count 0 'all update fields are optional in the specification'
 
     $Manifest = Import-PowerShellDataFile -LiteralPath $ManifestPath
-    Assert-Equal @($Manifest.RequiredModules).Count 1 `
+    Assert-Equal @($Manifest.RequiredModules).Count 0 `
         'manifest prerequisite count'
-    Assert-Equal $Manifest.RequiredModules[0].ModuleName `
-        'VMware.Sdk.Vcf.SddcManager' 'VCF PowerCLI module prerequisite'
-    Assert-Equal ([version] $Manifest.RequiredModules[0].ModuleVersion) `
-        ([version] '13.5.0.25380678') 'VCF PowerCLI module version'
     Assert-Equal (($Manifest.FunctionsToExport) -join ',') `
         'New-VcfVcenterCpuClient,Set-VcfVmCpuCount' `
         'manifest exports'
@@ -140,9 +136,8 @@ try {
     Assert-Equal @($ParseErrors).Count 0 'module parses without errors'
     $SourceText = Get-Content -Raw -LiteralPath $ModulePath
     foreach ($RequiredText in @(
-        'VMware.Sdk.OpenApi.Cmdlets.IServerConnection',
-        '.GetClient()',
         'vmware-api-session-id',
+        'DangerousAcceptAnyServerCertificateValidator',
         'HttpRequestMessage',
         'EscapeDataString'
     )) {
@@ -154,7 +149,9 @@ try {
         'Invoke-WebRequest',
         'Start-Process',
         'curl',
-        'Connect-VIServer'
+        'Connect-VIServer',
+        'VMware.Sdk.OpenApi.Cmdlets.IServerConnection',
+        '.GetClient()'
     )) {
         Assert-True (-not $SourceText.Contains($ForbiddenText)) `
             "implementation must not use $ForbiddenText"
@@ -170,9 +167,8 @@ try {
         'New-VcfVcenterCpuClient,Set-VcfVmCpuCount' `
         'runtime exports'
     $NewCommand = Get-Command New-VcfVcenterCpuClient
-    Assert-Equal $NewCommand.Parameters.Connection.ParameterType.FullName `
-        'VMware.Sdk.OpenApi.Cmdlets.IServerConnection' `
-        'authenticated VCF PowerCLI connection type'
+    Assert-True (-not $NewCommand.Parameters.ContainsKey('Connection')) `
+        'direct HTTP client has no unusable PowerCLI connection form'
     $SetCommand = Get-Command Set-VcfVmCpuCount
     Assert-Equal $SetCommand.Parameters.Vm.ParameterType.FullName `
         'System.String' 'VM parameter type'
@@ -180,8 +176,9 @@ try {
         'System.Int64' 'CPU-count parameter type'
 
     $RunId = [guid]::NewGuid().ToString('N')
-    $SessionToken = 'session-' + $RunId
-    $Vm = 'vm retry+' + $RunId.Substring(0, 12)
+    $SessionToken = $RunId
+    $Vm = 'vm-1024'
+    $MissingVm = 'vm retry+' + $RunId.Substring(0, 12)
     $InitialCount = [long] 2
     $DesiredCount = [long] 6
     $SuccessfulCount = [long] 8
@@ -233,6 +230,21 @@ try {
         -SessionToken $SessionToken
     Assert-True (-not (Test-Path -LiteralPath $LogPath)) `
         'client creation performs no API request'
+
+    $MissingError = $null
+    try {
+        $null = Set-VcfVmCpuCount `
+            -Client $Client `
+            -Vm $MissingVm `
+            -Count $DesiredCount
+    }
+    catch {
+        $MissingError = $_.Exception
+    }
+    Assert-True ($null -ne $MissingError) `
+        'a non-inventory VM identifier must fail'
+    Assert-True $MissingError.Message.Contains('404') `
+        'missing VM failure identifies HTTP 404'
 
     $FirstError = $null
     try {
@@ -299,15 +311,29 @@ try {
         Get-Content -LiteralPath $LogPath |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     )
-    Assert-Equal $LogLines.Count 6 `
-        'wire sequence has one PATCH per distinct desired count'
+    Assert-Equal $LogLines.Count 7 `
+        'wire sequence includes one missing-VM GET and one PATCH per desired count'
     $Requests = @($LogLines | ForEach-Object { $_ | ConvertFrom-Json })
     $EncodedVm = [uri]::EscapeDataString($Vm)
     $ExpectedTarget = (
         '/api/vcenter/vm/' + $EncodedVm + '/hardware/cpu'
     )
-    $ExpectedMethods = @('GET', 'PATCH', 'GET', 'GET', 'PATCH', 'GET')
+    $MissingTarget = (
+        '/api/vcenter/vm/' + [uri]::EscapeDataString($MissingVm) +
+        '/hardware/cpu'
+    )
+    $ExpectedTargets = @(
+        $MissingTarget,
+        $ExpectedTarget,
+        $ExpectedTarget,
+        $ExpectedTarget,
+        $ExpectedTarget,
+        $ExpectedTarget,
+        $ExpectedTarget
+    )
+    $ExpectedMethods = @('GET', 'GET', 'PATCH', 'GET', 'GET', 'PATCH', 'GET')
     $ExpectedOperationIds = @(
+        'Vcenter.Vm.Hardware.Cpu_get',
         'Vcenter.Vm.Hardware.Cpu_get',
         'Vcenter.Vm.Hardware.Cpu_update',
         'Vcenter.Vm.Hardware.Cpu_get',
@@ -315,7 +341,7 @@ try {
         'Vcenter.Vm.Hardware.Cpu_update',
         'Vcenter.Vm.Hardware.Cpu_get'
     )
-    $ExpectedStatuses = @(200, 503, 200, 200, 204, 200)
+    $ExpectedStatuses = @(404, 200, 503, 200, 200, 204, 200)
 
     for ($Index = 0; $Index -lt $Requests.Count; $Index++) {
         $Request = $Requests[$Index]
@@ -323,7 +349,7 @@ try {
             "request $Index operationId"
         Assert-Equal $Request.method $ExpectedMethods[$Index] `
             "request $Index method"
-        Assert-Equal $Request.rawTarget $ExpectedTarget `
+        Assert-Equal $Request.rawTarget $ExpectedTargets[$Index] `
             "request $Index exact encoded target"
         Assert-Equal $Request.rawQuery '' `
             "request $Index omits the query string"
@@ -337,7 +363,7 @@ try {
             "request $Index response status"
     }
 
-    foreach ($Index in @(0, 2, 3, 5)) {
+    foreach ($Index in @(0, 1, 3, 4, 6)) {
         $Request = $Requests[$Index]
         Assert-Equal $Request.contentType $null `
             "GET request $Index omits content type"
@@ -349,7 +375,7 @@ try {
             "GET request $Index has no JSON body"
     }
 
-    $PatchIndexes = @(1, 4)
+    $PatchIndexes = @(2, 5)
     $PatchCounts = @($DesiredCount, $SuccessfulCount)
     for ($PatchNumber = 0; $PatchNumber -lt 2; $PatchNumber++) {
         $PatchRequest = $Requests[$PatchIndexes[$PatchNumber]]

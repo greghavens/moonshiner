@@ -1,5 +1,4 @@
-// Package mockvcenter provides a loopback HTTP fixture for the reduced VCF 9.1
-// vCenter contract in docs/contract.json.
+// Package mockvcenter provides focused HTTP responses for VCF 9.1 operations.
 package mockvcenter
 
 import (
@@ -22,7 +21,7 @@ const (
 	GetTaskOperationID   = "Cis.Tasks_get"
 )
 
-// Status is a Cis.Task.Status value from the pinned contract.
+// Status is a Cis.Task.Status value.
 type Status string
 
 const (
@@ -167,7 +166,7 @@ func (s *Server) serveHTTP(response http.ResponseWriter, request *http.Request) 
 		request.URL.Path == "/api/cis/tasks/"+url.PathEscape(s.scenario.TaskID):
 		s.getTask(response, request)
 	default:
-		writeError(response, http.StatusNotFound, "operation is outside the pinned contract")
+		writeError(response, http.StatusNotFound, "operation is unavailable")
 	}
 }
 
@@ -213,6 +212,22 @@ func (s *Server) clone(response http.ResponseWriter, request *http.Request, body
 			return
 		}
 	}
+	if raw, ok := document["guest_customization_spec"]; ok {
+		var customization struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(raw, &customization) == nil && customization.Name == "missing-vcf-customization" {
+			writeJSON(response, http.StatusNotFound, map[string]any{
+				"error_type": "NOT_FOUND",
+				"messages": []map[string]any{{
+					"id":              "com.vmware.api.vcenter.vm.guest_customization_not_found",
+					"default_message": "Guest customization spec with identifier 'missing-vcf-customization' does not exist.",
+					"args":            []string{"missing-vcf-customization"},
+				}},
+			})
+			return
+		}
+	}
 
 	writeJSON(response, http.StatusAccepted, s.scenario.TaskID)
 }
@@ -234,12 +249,12 @@ func (s *Server) getTask(response http.ResponseWriter, request *http.Request) {
 
 	info := map[string]any{
 		"description": map[string]any{
-			"id":              "com.vmware.vcenter.vm.clone",
-			"default_message": "Clone virtual machine",
+			"id":              "Description",
+			"default_message": "",
 			"args":            []string{},
 		},
-		"service":    "com.vmware.vcenter.VM",
-		"operation":  "clone",
+		"service":    "7978ee81-a66c-4c37-8653-c577c0161e9d",
+		"operation":  "com.vmware.vcenter.vm.clone",
 		"status":     status,
 		"cancelable": false,
 	}

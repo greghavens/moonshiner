@@ -412,7 +412,7 @@ def check_case(case, mock, filters, tasks, details, failed_stage_by_id, token, r
              % (case, e["seq"], e["target"]))
 
     total = len(tasks)
-    # Even an empty collection consumes page zero: that first response is how the client learns
+    # Even an empty collection consumes page one: that first response is how the client learns
     # from pageMetadata that totalElements and totalPages are both zero.
     pages = max(1, (total + MAX_PAGE_SIZE - 1) // MAX_PAGE_SIZE)
 
@@ -420,7 +420,7 @@ def check_case(case, mock, filters, tasks, details, failed_stage_by_id, token, r
         fail("%s: made %d getTasks request(s); the collection spans exactly %d page(s) at "
              "pageSize=%d, so every page must be fetched and no page beyond the last"
              % (case, len(lists), pages, MAX_PAGE_SIZE))
-    for i, e in enumerate(lists[:pages]):
+    for i, e in enumerate(lists[:pages], start=1):
         want = "/v1/tasks?" + expected_query(filters, i, MAX_PAGE_SIZE)
         if e["target"] != want:
             fail("%s: getTasks request #%d target was\n    %s\nexpected\n    %s"
@@ -624,7 +624,7 @@ def main():
             check_case(name, mock, filters, tasks, fixture["details"],
                        failed_stage_by_id, token, report_text)
 
-    list_target = "/v1/tasks?pageNumber=0&pageSize=50"
+    list_target = "/v1/tasks?pageNumber=1&pageSize=50"
 
     # A response whose metadata count disagrees with its elements must be rejected.
     count_fixture = {

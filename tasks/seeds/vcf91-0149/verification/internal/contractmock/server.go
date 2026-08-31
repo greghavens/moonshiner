@@ -41,11 +41,13 @@ type Page struct {
 type Scenario struct {
 	Namespace               string
 	SessionID               string
+	KubernetesToken         string
 	PageLimit               int64
 	Pages                   []Page
 	MasterHostOverride      string
 	CorruptUnrelatedSummary bool
 	DuplicateNamespace      bool
+	BlankDiscovery          bool
 	FailOperation           string
 	FailStatus              int
 }
@@ -103,7 +105,7 @@ type contractOperation struct {
 // New reads contractPath, derives the only allowed routes, and starts a real
 // HTTP server on an ephemeral 127.0.0.1 port.
 func New(contractPath string, scenario Scenario) (*Server, error) {
-	if scenario.Namespace == "" || scenario.SessionID == "" || scenario.PageLimit <= 0 || len(scenario.Pages) == 0 {
+	if scenario.Namespace == "" || scenario.SessionID == "" || scenario.KubernetesToken == "" || scenario.PageLimit <= 0 || len(scenario.Pages) == 0 {
 		return nil, errors.New("contractmock: incomplete scenario")
 	}
 	if scenario.FailOperation != "" && scenario.FailStatus < 400 {
@@ -253,6 +255,16 @@ func (s *Server) serveNamespaces(w http.ResponseWriter, r *http.Request, body []
 		})
 		return
 	}
+	if s.scenario.BlankDiscovery {
+		writeJSON(w, http.StatusOK, []map[string]any{
+			{
+				"control_plane_api_server_port": 6443,
+				"master_host":                   "",
+				"namespace":                     "",
+			},
+		})
+		return
+	}
 
 	masterHost := s.authority
 	if s.scenario.MasterHostOverride != "" {
@@ -311,7 +323,7 @@ func (s *Server) serveClusters(w http.ResponseWriter, r *http.Request, body []by
 		len(body) != 0 ||
 		r.ContentLength != 0 ||
 		!exactHeader(r.Header, "Accept", "application/json") ||
-		!exactHeader(r.Header, "Authorization", "Bearer "+s.scenario.SessionID) ||
+		!exactHeader(r.Header, "Authorization", "Bearer "+s.scenario.KubernetesToken) ||
 		r.Header.Values("vmware-api-session-id") != nil ||
 		r.Header.Values("Content-Type") != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "cluster_request_wire_mismatch"})
@@ -320,7 +332,7 @@ func (s *Server) serveClusters(w http.ResponseWriter, r *http.Request, body []by
 	if s.scenario.FailOperation == OperationClusterList {
 		writeJSON(w, s.scenario.FailStatus, map[string]any{
 			"kind":    "Status",
-			"message": s.scenario.SessionID,
+			"message": s.scenario.KubernetesToken,
 		})
 		return
 	}

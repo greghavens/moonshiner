@@ -1,769 +1,380 @@
 #!/usr/bin/env python3
-"""Deterministic protected verifier for vcf91-0206."""
+"""Protected acceptance verifier for vcf91-0016."""
 
 from __future__ import annotations
 
 import ast
-import importlib
+import hashlib
 import json
-import secrets
 import subprocess
 import sys
 import tempfile
 import time
-import tomllib
+import traceback
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-CLIENT_PATH = SRC / "vcf_installer" / "client.py"
-INIT_PATH = SRC / "vcf_installer" / "__init__.py"
-PROJECT_PATH = ROOT / "pyproject.toml"
 CONTRACT_PATH = ROOT / "docs" / "contract.json"
 SOURCES_PATH = ROOT / "docs" / "official_sources.json"
-MOCK_PATH = ROOT / ".protected" / "mock_server.py"
-
-COMMIT = "c3f3b52c845dd967cabbc21680e893292077d5ba"
-SPEC_PATH = "specifications/vcf-installer/vcf-installer-openapi.json"
-OPERATION_IDS = ["updateDepotSettings"]
-TOP_LEVEL_PROPERTIES = ["vmwareAccount", "offlineAccount", "depotConfiguration"]
-ACCOUNT_PROPERTIES = [
-    "username",
-    "password",
-    "status",
-    "message",
-    "downloadToken",
-    "downloadActivationCode",
-]
-UNSET_TOP_LEVEL = ["offlineAccount", "depotConfiguration"]
-UNSET_ACCOUNT = [
-    "username",
-    "password",
-    "status",
-    "message",
-    "downloadActivationCode",
-]
+MOCK_PATH = Path(__file__).resolve().parent / "mock_sddc_manager.py"
+SRC_PATH = ROOT / "src"
+EXPECTED_COMMIT = "c3f3b52c845dd967cabbc21680e893292077d5ba"
+EXPECTED_SPEC_PATH = "specifications/sddc-manager/sddc-manager-openapi.json"
+EXPECTED_OPERATION_ID = "updateServicesConfig"
+EXPECTED_SPEC_URL = (
+    "https://raw.githubusercontent.com/vmware/vcf-api-specs/"
+    f"{EXPECTED_COMMIT}/{EXPECTED_SPEC_PATH}"
+)
 
 
-class VerificationError(AssertionError):
-    pass
+class VerificationFailure(AssertionError):
+    """Acceptance contract failure."""
 
 
 def require(condition: bool, message: str) -> None:
     if not condition:
-        raise VerificationError(message)
+        raise VerificationFailure(message)
 
 
-def load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+def operation_index(contract: dict[str, Any]) -> dict[str, tuple[str, str, dict[str, Any]]]:
+    found: dict[str, tuple[str, str, dict[str, Any]]] = {}
+    for path, path_item in contract.get("paths", {}).items():
+        for method, operation in path_item.items():
+            if not isinstance(operation, dict) or "operationId" not in operation:
+                continue
+            operation_id = operation["operationId"]
+            require(operation_id not in found, f"duplicate operationId in contract: {operation_id}")
+            found[operation_id] = (method.upper(), path, operation)
+    return found
 
 
-def verify_contract() -> None:
-    contract = load_json(CONTRACT_PATH)
-    sources = load_json(SOURCES_PATH)
-    source = contract.get("source", {})
-    require(
-        contract.get("contractFormat") == "focused-openapi-projection-v1",
-        "contract format changed",
-    )
-    require(source.get("repository") == "vmware/vcf-api-specs", "repository changed")
-    require(source.get("repositoryCommitSha") == COMMIT, "contract commit changed")
-    require(source.get("specPath") == SPEC_PATH, "contract spec path changed")
-    require(source.get("license") == "Apache-2.0", "contract license changed")
-    require(source.get("openapi") == "3.0.1", "OpenAPI version changed")
-    require(source.get("apiVersion") == "9.1.0.0", "VCF API version changed")
+def verify_provenance() -> tuple[bytes, dict[str, Any]]:
+    contract_bytes = CONTRACT_PATH.read_bytes()
+    contract = json.loads(contract_bytes)
+    sources = json.loads(SOURCES_PATH.read_text(encoding="utf-8"))
+    operations = operation_index(contract)
 
-    operations = contract.get("operations", [])
+    require(contract.get("openapi") == "3.0.1", "contract must retain OpenAPI 3.0.1")
     require(
-        [item.get("operationId") for item in operations] == OPERATION_IDS,
-        "contract must name exactly updateDepotSettings",
+        contract.get("info", {}).get("version") == "9.1.0.0",
+        "contract must identify SDDC Manager 9.1.0.0",
     )
     require(
-        [(item.get("method"), item.get("path")) for item in operations]
-        == [("PUT", "/v1/system/settings/depot")],
-        "contract route changed",
+        set(operations) == {EXPECTED_OPERATION_ID},
+        "contract must contain only the named updateServicesConfig operation",
     )
-    operation = operations[0]
-    require(operation.get("parameters") == [], "updateDepotSettings has no parameters")
-    require(
-        operation.get("requestBody")
-        == {
-            "required": True,
-            "contentType": "application/json",
-            "schema": "DepotSettings",
-        },
-        "request body projection changed",
+    method, path, operation = operations[EXPECTED_OPERATION_ID]
+    require(method == "PUT", "updateServicesConfig must be PUT")
+    require(path == "/v1/services-config", "updateServicesConfig path drifted")
+    request_schema = (
+        operation.get("requestBody", {})
+        .get("content", {})
+        .get("application/json", {})
+        .get("schema", {})
     )
     require(
-        operation.get("responses")
-        == {
-            "202": {
-                "description": "Accepted",
-                "contentType": "application/json",
-                "schema": "DepotSettings",
-            },
-            "400": {
-                "description": "Bad Request",
-                "contentType": "application/json",
-                "schema": "Error",
-            },
-            "500": {
-                "description": "Internal Server Error",
-                "contentType": "application/json",
-                "schema": "Error",
-            },
-        },
-        "response projection changed",
+        request_schema == {"$ref": "#/components/schemas/ServicesConfig"},
+        "updateServicesConfig request schema drifted",
     )
 
-    schemas = contract.get("schemas", {})
-    account = schemas.get("DepotAccount", {})
-    require(account.get("type") == "object", "DepotAccount type changed")
-    require(account.get("required") == [], "DepotAccount fields are optional in the spec")
     require(
-        list(account.get("properties", {})) == ACCOUNT_PROPERTIES,
-        "DepotAccount properties changed",
+        sources.get("source_type") == "OpenAPI specification",
+        "official source must be the specification",
     )
     require(
-        account["properties"].get("downloadToken")
-        == {"type": "string", "maxLength": 32},
-        "downloadToken projection changed",
-    )
-    settings = schemas.get("DepotSettings", {})
-    require(settings.get("type") == "object", "DepotSettings type changed")
-    require(settings.get("required") == [], "DepotSettings properties are optional")
-    require(
-        list(settings.get("properties", {})) == TOP_LEVEL_PROPERTIES,
-        "DepotSettings properties changed",
-    )
-    configuration = schemas.get("DepotConfiguration", {})
-    require(
-        configuration.get("required") == ["isOfflineDepot"],
-        "DepotConfiguration required fields changed",
+        sources.get("repository") == "https://github.com/vmware/vcf-api-specs",
+        "official repository drifted",
     )
     require(
-        configuration.get("properties", {}).get("port")
-        == {"type": "integer", "format": "int32"},
-        "DepotConfiguration port projection changed",
+        sources.get("repository_commit_sha") == EXPECTED_COMMIT,
+        "official source commit drifted",
     )
-    require(sources.get("repository") == "vmware/vcf-api-specs", "source repository changed")
-    require(sources.get("repositoryCommitSha") == COMMIT, "source commit changed")
-    require(sources.get("specPath") == SPEC_PATH, "source spec path changed")
-    require(sources.get("license") == "Apache-2.0", "source license changed")
-    require(sources.get("operationIds") == OPERATION_IDS, "source operationIds changed")
+    require(sources.get("spec_path") == EXPECTED_SPEC_PATH, "official spec path drifted")
+    require(sources.get("spec_url") == EXPECTED_SPEC_URL, "pinned spec URL drifted")
+    require(sources.get("repository_license") == "Apache-2.0", "source license drifted")
+    recorded_operations = sources.get("operations")
+    require(isinstance(recorded_operations, list), "official operations must be a list")
     require(
-        COMMIT in sources.get("specUrl", "")
-        and sources["specUrl"].endswith(SPEC_PATH),
-        "official spec URL must be immutable",
-    )
-    require(
-        [
-            (
-                item.get("operationId"),
-                item.get("method"),
-                item.get("path"),
-                item.get("specJsonPointer"),
-                item.get("repositoryCommitSha"),
-                item.get("specPath"),
-            )
-            for item in sources.get("operations", [])
-        ]
+        recorded_operations
         == [
-            (
-                "updateDepotSettings",
-                "PUT",
-                "/v1/system/settings/depot",
-                "/paths/~1v1~1system~1settings~1depot/put/operationId",
-                COMMIT,
-                SPEC_PATH,
-            )
+            {
+                "operationId": EXPECTED_OPERATION_ID,
+                "method": method,
+                "path": path,
+            }
         ],
-        "each operation must repeat its exact pinned source",
+        "official_sources.json must record every selected operationId",
     )
-    require(
-        sources.get("derivation", {}).get("documentationPageUsedAsContractSource")
-        is False,
-        "a documentation page must not be the contract source",
-    )
+    return contract_bytes, contract
 
 
-def imported_roots(tree: ast.AST) -> set[str]:
-    roots: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            roots.update(alias.name.split(".", 1)[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            roots.add(node.module.split(".", 1)[0])
-    return roots
+def verify_stdlib_only() -> None:
+    allowed_local = {"vcf_depot"}
+    for source_path in sorted((SRC_PATH / "vcf_depot").glob("*.py")):
+        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+        for node in ast.walk(tree):
+            roots: list[str] = []
+            if isinstance(node, ast.Import):
+                roots = [alias.name.split(".", 1)[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    continue
+                if node.module:
+                    roots = [node.module.split(".", 1)[0]]
+            for root in roots:
+                require(
+                    root in sys.stdlib_module_names or root in allowed_local,
+                    f"non-stdlib import {root!r} in {source_path.relative_to(ROOT)}",
+                )
 
 
-def verify_package_shape() -> None:
-    require(CLIENT_PATH.is_file(), "src/vcf_installer/client.py is missing")
-    require(INIT_PATH.is_file(), "protected package initializer is missing")
-    project = tomllib.loads(PROJECT_PATH.read_text(encoding="utf-8"))
-    require(project.get("project", {}).get("dependencies") == [], "dependencies must be empty")
-    require(
-        project.get("tool", {}).get("moonshiner", {}).get("stdlib-only") is True,
-        "package must remain stdlib-only",
-    )
-
-    source = CLIENT_PATH.read_text(encoding="utf-8")
-    try:
-        tree = ast.parse(source, filename=str(CLIENT_PATH))
-    except SyntaxError as error:
-        raise VerificationError(f"client.py is not valid Python: {error.msg}") from None
-    roots = imported_roots(tree)
-    third_party = roots - set(sys.stdlib_module_names) - {"__future__"}
-    require(
-        not third_party,
-        "client imports non-stdlib modules: " + ", ".join(sorted(third_party)),
-    )
-    require("subprocess" not in roots, "client must not invoke external programs")
-    require(
-        "notimplementederror" not in source.casefold(),
-        "client workflow is still a stub",
-    )
-
-    vendored = [
-        path
-        for path in ROOT.rglob("*")
-        if path.is_file()
-        and path.suffix.casefold()
-        in {".whl", ".egg", ".zip", ".so", ".dll", ".dylib", ".pyc"}
-    ]
-    require(not vendored, "the package must not vendor dependencies or binary artifacts")
-
-
-def wait_for_ready(ready_path: Path, process: subprocess.Popen[str]) -> int:
-    deadline = time.monotonic() + 8.0
+def wait_for_mock(process: subprocess.Popen[bytes], ready_file: Path) -> str:
+    deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
-        if process.poll() is not None:
-            stdout, stderr = process.communicate()
-            raise VerificationError(
-                "mock exited before readiness: " + (stderr or stdout or "no diagnostics")
+        if ready_file.exists():
+            ready = json.loads(ready_file.read_text(encoding="utf-8"))
+            base_url = ready.get("base_url")
+            require(
+                isinstance(base_url, str) and base_url.startswith("http://127.0.0.1:"),
+                "mock did not bind to IPv4 loopback",
             )
-        if ready_path.is_file():
-            try:
-                ready = load_json(ready_path)
-                require(ready.get("host") == "127.0.0.1", "mock is not loopback-only")
-                require(ready.get("operationIds") == OPERATION_IDS, "mock operation set changed")
-                port = ready.get("port")
-                if isinstance(port, int) and 0 < port < 65536:
-                    return port
-            except (json.JSONDecodeError, OSError):
-                pass
+            return base_url
+        if process.poll() is not None:
+            raise VerificationFailure(f"mock exited early with status {process.returncode}")
         time.sleep(0.02)
-    raise VerificationError("mock did not become ready")
+    raise VerificationFailure("mock did not become ready")
 
 
-def stop_process(process: subprocess.Popen[str]) -> None:
-    if process.poll() is None:
-        process.terminate()
+def header_map(items: Any) -> dict[str, list[str]]:
+    require(isinstance(items, list), "request log headers are malformed")
+    result: dict[str, list[str]] = {}
+    for item in items:
+        require(
+            isinstance(item, list)
+            and len(item) == 2
+            and all(isinstance(part, str) for part in item),
+            "request log contains a malformed header",
+        )
+        result.setdefault(item[0].lower(), []).append(item[1])
+    return result
+
+
+def verify_constructor_contract(client_type: type[Any], error_type: type[BaseException]) -> None:
+    bad_constructors = [
+        ("", "access-token", 1.0, 2),
+        ("http://127.0.0.1", "", 1.0, 2),
+        ("http://127.0.0.1", "access-token", 0.0, 2),
+        ("http://127.0.0.1", "access-token", 1.0, 0),
+    ]
+    for base_url, access_token, timeout, max_attempts in bad_constructors:
         try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=3)
+            client_type(
+                base_url,
+                access_token,
+                timeout=timeout,
+                max_attempts=max_attempts,
+            )
+        except ValueError:
+            pass
+        else:
+            raise VerificationFailure("invalid constructor input must raise ValueError")
+    require(
+        issubclass(error_type, RuntimeError),
+        "SddcManagerError must remain a RuntimeError",
+    )
 
 
-def run_mock_calls(
-    calls_builder: Callable[[dict[str, str]], list[dict[str, Any]]],
-    scenario_builder: Callable[[dict[str, str]], dict[str, Any]] | None = None,
-) -> tuple[
-    list[dict[str, Any]],
-    dict[str, str],
-    list[tuple[object | None, Exception | None]],
-    Any,
-]:
-    runtime = {
-        "accessToken": "access-" + secrets.token_urlsafe(24),
-        "downloadToken": "døwnload-" + secrets.token_hex(10),
-        "activationCode": "activation-Δ-" + secrets.token_hex(12),
+def run_retry_scenario(
+    contract_bytes: bytes,
+    client_type: type[Any],
+) -> None:
+    seed = hashlib.sha256(contract_bytes + SOURCES_PATH.read_bytes()).hexdigest()
+    access_token = "access-" + seed[:20]
+    service = {
+        "name": "VCF Depot",
+        "type": "VCF_DEPOT",
+        "key": "depot-" + seed[20:32],
+        "nodes": [
+            {
+                "name": "VCF Depot",
+                "addresses": [
+                    {"type": "Fqdn", "value": f"depot-{seed[32:40]}.example.test"}
+                ],
+            }
+        ],
     }
-    scenario: dict[str, Any] = {"accessToken": runtime["accessToken"]}
-    if scenario_builder is not None:
-        scenario.update(scenario_builder(runtime))
-    calls = calls_builder(runtime)
-    with tempfile.TemporaryDirectory(prefix="vcf-installer-verify-") as temporary:
-        temp = Path(temporary)
-        scenario_path = temp / "scenario.json"
+    expected_body = {"services": [service]}
+    optional_service = {
+        "name": "VCF Depot",
+        "type": "VCF_DEPOT",
+        "key": "depot-" + seed[8:20],
+        "version": "9.1.0",
+        "nodes": [
+            {
+                "name": "VCF Depot",
+                "addresses": [
+                    {"type": "Fqdn", "value": f"depot-{seed[40:48]}.example.test"}
+                ],
+                "port": "443",
+                "baseUrl": "/depot-service/content-gateway",
+                "certificates": ["runtime-certificate-" + seed[48:56]],
+            }
+        ],
+    }
+    expected_optional_body = {
+        "services": [optional_service]
+    }
+
+    with tempfile.TemporaryDirectory(prefix="vcf91-0016-") as temp_name:
+        temp = Path(temp_name)
         request_log = temp / "requests.jsonl"
-        ready_path = temp / "ready.json"
-        scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        ready_file = temp / "ready.json"
         process = subprocess.Popen(
             [
                 sys.executable,
-                "-B",
                 str(MOCK_PATH),
                 "--contract",
                 str(CONTRACT_PATH),
-                "--scenario",
-                str(scenario_path),
                 "--request-log",
                 str(request_log),
-                "--ready",
-                str(ready_path),
+                "--ready-file",
+                str(ready_file),
             ],
             cwd=ROOT,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         try:
-            port = wait_for_ready(ready_path, process)
-            if str(SRC) not in sys.path:
-                sys.path.insert(0, str(SRC))
-            module = importlib.import_module("vcf_installer")
-            client = module.VcfInstallerClient(
-                f"http://127.0.0.1:{port}",
-                runtime["accessToken"],
-                timeout=3.0,
+            base_url = wait_for_mock(process, ready_file)
+            client = client_type(
+                base_url + "/",
+                access_token,
+                timeout=2.0,
+                max_attempts=2,
             )
-            outcomes: list[tuple[object | None, Exception | None]] = []
-            for arguments in calls:
-                try:
-                    result = client.update_depot_settings(**arguments)
-                except Exception as error:
-                    outcomes.append((None, error))
-                else:
-                    outcomes.append((result, None))
-        except Exception as error:
-            if isinstance(error, VerificationError):
-                raise
-            raise VerificationError(f"could not exercise client: {type(error).__name__}") from None
+            try:
+                client.update_services_config([])
+            except ValueError:
+                pass
+            else:
+                raise VerificationFailure("empty services must raise ValueError")
+            try:
+                client.update_services_config(["not-an-object"])
+            except ValueError:
+                pass
+            else:
+                raise VerificationFailure("every service must be a JSON object")
+            result = client.update_services_config([service])
+            optional_result = client.update_services_config([optional_service])
         finally:
-            stop_process(process)
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
 
-        lines = request_log.read_text(encoding="utf-8").splitlines()
-        requests = [json.loads(line) for line in lines if line.strip()]
-    return requests, runtime, outcomes, module
-
-
-def require_success(
-    outcome: tuple[object | None, Exception | None],
-    expected: dict[str, object],
-) -> None:
-    result, error = outcome
-    require(error is None, f"client unexpectedly failed: {type(error).__name__}")
-    require(isinstance(result, dict), "update_depot_settings must return a dictionary")
-    require(result == expected, "successful response was not returned exactly")
-    require(result is not expected, "response must be a freshly decoded dictionary")
-
-
-def require_client_error(
-    outcome: tuple[object | None, Exception | None],
-    module: Any,
-    secrets_to_hide: list[str],
-) -> None:
-    result, error = outcome
-    require(result is None, "a failing call returned a value")
-    require(
-        isinstance(error, module.VcfInstallerError),
-        "failures must raise VcfInstallerError",
-    )
-    message = str(error)
-    require(
-        all(secret not in message for secret in secrets_to_hide),
-        "a credential was exposed in an error",
-    )
-
-
-def verify_exact_requests(
-    requests: list[dict[str, Any]],
-    runtime: dict[str, str],
-    expected: dict[str, object],
-    statuses: list[int | None],
-    effects: list[bool],
-    effect_counts: list[int],
-) -> None:
-    require(len(requests) == len(statuses), "unexpected request count")
-    expected_body = json.dumps(expected, ensure_ascii=False, separators=(",", ":"))
-    for index, request in enumerate(requests):
-        require(request.get("sequence") == index + 1, "request sequence is not contiguous")
+        require(result == expected_body, "200 response body was not returned intact")
         require(
-            request.get("operationId") == "updateDepotSettings",
-            "an unapproved operation was called",
+            optional_result == expected_optional_body,
+            "supplied optional fields were not returned intact",
         )
-        require(request.get("method") == "PUT", "updateDepotSettings must use PUT")
-        require(
-            request.get("path") == "/v1/system/settings/depot",
-            "updateDepotSettings path changed",
-        )
-        require(
-            request.get("rawTarget") == "/v1/system/settings/depot",
-            "raw target contains a query or delimiter",
-        )
-        require(request.get("rawQuery") == "", "updateDepotSettings has no query")
-        require(request.get("body") == expected_body, "request body bytes changed")
-        require(
-            request.get("bodyLength") == len(expected_body.encode("utf-8")),
-            "request body length changed",
-        )
-        require(request.get("validAttempt") == index + 1, "mock rejected an attempt")
-
-        headers = request.get("headerValues", {})
-        require(
-            headers.get("authorization") == [f"Bearer {runtime['accessToken']}"],
-            "Authorization header value or multiplicity changed",
-        )
-        require(
-            headers.get("accept") == ["application/json"],
-            "Accept header value or multiplicity changed",
-        )
-        require(
-            headers.get("content-type") == ["application/json"],
-            "Content-Type header value or multiplicity changed",
-        )
-        require(
-            headers.get("content-length") == [str(len(expected_body.encode("utf-8")))],
-            "Content-Length header value or multiplicity changed",
-        )
-        require(
-            "transfer-encoding" not in headers,
-            "request must use fixed length rather than chunked transfer",
-        )
-
-        decoded = json.loads(request["body"])
-        require(set(decoded) == {"vmwareAccount"}, "top-level optional fields were sent")
-        account = decoded["vmwareAccount"]
-        require(
-            isinstance(account, dict)
-            and set(account) == set(expected["vmwareAccount"]),
-            "unset DepotAccount fields were sent",
-        )
-        require(
-            all(name not in decoded for name in UNSET_TOP_LEVEL),
-            "an unset top-level member was transmitted",
-        )
-        require(
-            all(
-                name not in account
-                for name in UNSET_ACCOUNT
-                if name not in expected["vmwareAccount"]
-            ),
-            "an unset account member was transmitted",
-        )
-
-    require(
-        [request.get("body") for request in requests]
-        == [expected_body] * len(requests),
-        "retry representation was not byte-identical",
-    )
-    if requests:
-        require(
-            [request.get("headerValues") for request in requests]
-            == [requests[0].get("headerValues")] * len(requests),
-            "retry header values changed between attempts",
-        )
-    require(
-        [request.get("responseStatus") for request in requests] == statuses,
-        "scripted response sequence changed",
-    )
-    require(
-        [request.get("effectApplied") for request in requests] == effects,
-        "retry duplicated the replacement effect",
-    )
-    require(
-        [request.get("effectCount") for request in requests] == effect_counts,
-        "semantic mutation count changed",
-    )
-
-
-def verify_primary_replacement() -> None:
-    requests, runtime, outcomes, _module = run_mock_calls(
-        lambda values: [
-            {"download_token": values["downloadToken"], "max_retries": 1}
+        lines = [
+            line
+            for line in request_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
         ]
-    )
-    expected: dict[str, object] = {
-        "vmwareAccount": {"downloadToken": runtime["downloadToken"]}
-    }
-    require_success(outcomes[0], expected)
-    verify_exact_requests(
-        requests,
-        runtime,
-        expected,
-        statuses=[500, 202],
-        effects=[True, False],
-        effect_counts=[1, 1],
-    )
+        require(len(lines) == 3, f"expected exactly three sends, observed {len(lines)}")
+        entries = [json.loads(line) for line in lines]
 
+        raw_bodies: list[bytes] = []
+        for sequence, entry in enumerate(entries, start=1):
+            require(entry.get("sequence") == sequence, "request sequence is not stable")
+            require(
+                entry.get("operationId") == EXPECTED_OPERATION_ID,
+                "wrong contract operation was called",
+            )
+            require(entry.get("method") == "PUT", "wire method must be PUT")
+            require(
+                entry.get("target") == "/v1/services-config",
+                "wire target must have the exact path and no query",
+            )
+            headers = header_map(entry.get("headers"))
+            require(
+                headers.get("authorization") == [f"Bearer {access_token}"],
+                "Authorization header is missing or malformed",
+            )
+            require(
+                headers.get("accept") == ["application/json"],
+                "Accept header must be exactly application/json",
+            )
+            require(
+                headers.get("content-type") == ["application/json"],
+                "Content-Type header must be exactly application/json",
+            )
+            try:
+                raw_body = bytes.fromhex(entry["body_hex"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise VerificationFailure("request log body is malformed") from exc
+            raw_bodies.append(raw_body)
+            try:
+                decoded_body = json.loads(raw_body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise VerificationFailure("request body is not UTF-8 JSON") from exc
+            expected_for_send = expected_body if sequence <= 2 else expected_optional_body
+            require(
+                decoded_body == expected_for_send,
+                "request JSON has the wrong exact shape",
+            )
+            require(
+                entry.get("body_json") == expected_for_send,
+                "mock-observed request JSON has the wrong exact shape",
+            )
+            if sequence <= 2:
+                require(
+                    set(decoded_body) == {"services"}
+                    and set(decoded_body["services"][0])
+                    == {"name", "type", "key", "nodes"}
+                    and set(decoded_body["services"][0]["nodes"][0])
+                    == {"name", "addresses"},
+                    "unset optional fields must be omitted, not serialized empty",
+                )
 
-def verify_activation_code() -> None:
-    requests, runtime, outcomes, _module = run_mock_calls(
-        lambda values: [
-            {
-                "download_token": values["downloadToken"],
-                "download_activation_code": values["activationCode"],
-                "max_retries": 1,
-            }
-        ]
-    )
-    expected: dict[str, object] = {
-        "vmwareAccount": {
-            "downloadToken": runtime["downloadToken"],
-            "downloadActivationCode": runtime["activationCode"],
-        }
-    }
-    require_success(outcomes[0], expected)
-    verify_exact_requests(
-        requests,
-        runtime,
-        expected,
-        statuses=[500, 202],
-        effects=[True, False],
-        effect_counts=[1, 1],
-    )
-
-
-def verify_success_response_is_returned() -> None:
-    def response_scenario(values: dict[str, str]) -> dict[str, Any]:
-        return {
-            "responsePlan": [202],
-            "successResponse": {
-                "vmwareAccount": {
-                    "downloadToken": values["downloadToken"],
-                    "status": "READY",
-                    "message": "configured",
-                },
-                "depotConfiguration": {"isOfflineDepot": False},
-            },
-        }
-
-    requests, runtime, outcomes, _module = run_mock_calls(
-        lambda values: [
-            {"download_token": values["downloadToken"], "max_retries": 0}
-        ],
-        response_scenario,
-    )
-    request_value: dict[str, object] = {
-        "vmwareAccount": {"downloadToken": runtime["downloadToken"]}
-    }
-    response_value: dict[str, object] = response_scenario(runtime)["successResponse"]
-    require_success(outcomes[0], response_value)
-    verify_exact_requests(
-        requests,
-        runtime,
-        request_value,
-        statuses=[202],
-        effects=[True],
-        effect_counts=[1],
-    )
-
-
-def verify_input_validation() -> None:
-    def invalid_calls(values: dict[str, str]) -> list[dict[str, Any]]:
-        valid_token = values["downloadToken"]
-        return [
-            {"download_token": None},
-            {"download_token": True},
-            {"download_token": ""},
-            {"download_token": " \t"},
-            {"download_token": "x" * 33},
-            {"download_token": valid_token, "download_activation_code": ""},
-            {"download_token": valid_token, "download_activation_code": " \n"},
-            {"download_token": valid_token, "download_activation_code": 1},
-            {"download_token": valid_token, "max_retries": True},
-            {"download_token": valid_token, "max_retries": -1},
-            {"download_token": valid_token, "max_retries": 6},
-            {"download_token": valid_token, "max_retries": 1.0},
-            {"download_token": valid_token, "max_retries": "1"},
-        ]
-
-    requests, runtime, outcomes, module = run_mock_calls(invalid_calls)
-    require(not requests, "invalid input must be rejected before making a request")
-    require(len(outcomes) == 13, "input validation cases did not all run")
-    for outcome in outcomes:
-        require_client_error(outcome, module, list(runtime.values()))
-
-
-def verify_http_retry_policy() -> None:
-    for status in (400, 503, 201):
-        requests, runtime, outcomes, module = run_mock_calls(
-            lambda values: [
-                {"download_token": values["downloadToken"], "max_retries": 5}
-            ],
-            lambda _values, value=status: {"responsePlan": [value, 202]},
+        require(raw_bodies[0] == raw_bodies[1], "retry must replay identical body bytes")
+        require(
+            [entry.get("response_status") for entry in entries] == [500, 200, 200],
+            "mock did not exercise transient retry followed by a normal update",
         )
-        require_client_error(outcomes[0], module, list(runtime.values()))
-        verify_exact_requests(
-            requests,
-            runtime,
-            {"vmwareAccount": {"downloadToken": runtime["downloadToken"]}},
-            statuses=[status],
-            effects=[False],
-            effect_counts=[0],
+        require(
+            [entry.get("effect_applied") for entry in entries] == [True, False, True],
+            "retry duplicated the mutation effect",
         )
-
-    requests, runtime, outcomes, module = run_mock_calls(
-        lambda values: [
-            {"download_token": values["downloadToken"], "max_retries": 0}
-        ],
-        lambda _values: {"responsePlan": [500, 202]},
-    )
-    require_client_error(outcomes[0], module, list(runtime.values()))
-    verify_exact_requests(
-        requests,
-        runtime,
-        {"vmwareAccount": {"downloadToken": runtime["downloadToken"]}},
-        statuses=[500],
-        effects=[True],
-        effect_counts=[1],
-    )
-
-    requests, runtime, outcomes, module = run_mock_calls(
-        lambda values: [
-            {"download_token": values["downloadToken"], "max_retries": 2}
-        ],
-        lambda _values: {"responsePlan": [500]},
-    )
-    require_client_error(outcomes[0], module, list(runtime.values()))
-    verify_exact_requests(
-        requests,
-        runtime,
-        {"vmwareAccount": {"downloadToken": runtime["downloadToken"]}},
-        statuses=[500, 500, 500],
-        effects=[True, False, False],
-        effect_counts=[1, 1, 1],
-    )
-
-
-def verify_transport_retry_policy() -> None:
-    for first_response, first_status in (("disconnect", None), ("partial-202", 202)):
-        requests, runtime, outcomes, _module = run_mock_calls(
-            lambda values: [
-                {"download_token": values["downloadToken"], "max_retries": 1}
-            ],
-            lambda _values, response=first_response: {
-                "responsePlan": [response, 202]
-            },
+        require(
+            [entry.get("effect_count") for entry in entries] == [1, 1, 2],
+            "retry must not add an effect; a distinct later update must add one",
         )
-        expected: dict[str, object] = {
-            "vmwareAccount": {"downloadToken": runtime["downloadToken"]}
-        }
-        require_success(outcomes[0], expected)
-        verify_exact_requests(
-            requests,
-            runtime,
-            expected,
-            statuses=[first_status, 202],
-            effects=[True, False],
-            effect_counts=[1, 1],
-        )
-
-    requests, runtime, outcomes, module = run_mock_calls(
-        lambda values: [
-            {"download_token": values["downloadToken"], "max_retries": 0}
-        ],
-        lambda _values: {"responsePlan": ["disconnect", 202]},
-    )
-    require_client_error(outcomes[0], module, list(runtime.values()))
-    verify_exact_requests(
-        requests,
-        runtime,
-        {"vmwareAccount": {"downloadToken": runtime["downloadToken"]}},
-        statuses=[None],
-        effects=[True],
-        effect_counts=[1],
-    )
-
-
-def verify_success_response_validation() -> None:
-    scenarios: list[Callable[[dict[str, str]], dict[str, Any]]] = [
-        lambda _values: {
-            "responsePlan": [202],
-            "successRawBody": "{not-json",
-        },
-        lambda _values: {
-            "responsePlan": [202],
-            "successContentType": "text/plain",
-        },
-        lambda _values: {"responsePlan": [202], "successResponse": []},
-        lambda _values: {"responsePlan": [202], "successResponse": {}},
-        lambda _values: {
-            "responsePlan": [202],
-            "successResponse": {"vmwareAccount": {"downloadToken": "different"}},
-        },
-        lambda values: {
-            "responsePlan": [202],
-            "successResponse": {
-                "vmwareAccount": {
-                    "downloadToken": values["downloadToken"],
-                    "downloadActivationCode": values["activationCode"],
-                }
-            },
-        },
-    ]
-    for scenario_builder in scenarios:
-        requests, runtime, outcomes, module = run_mock_calls(
-            lambda values: [
-                {"download_token": values["downloadToken"], "max_retries": 5}
-            ],
-            scenario_builder,
-        )
-        require_client_error(outcomes[0], module, list(runtime.values()))
-        verify_exact_requests(
-            requests,
-            runtime,
-            {"vmwareAccount": {"downloadToken": runtime["downloadToken"]}},
-            statuses=[202],
-            effects=[True],
-            effect_counts=[1],
-        )
-
-    requests, runtime, outcomes, module = run_mock_calls(
-        lambda values: [
-            {
-                "download_token": values["downloadToken"],
-                "download_activation_code": values["activationCode"],
-                "max_retries": 5,
-            }
-        ],
-        lambda values: {
-            "responsePlan": [202],
-            "successResponse": {
-                "vmwareAccount": {
-                    "downloadToken": values["downloadToken"],
-                    "downloadActivationCode": "different",
-                }
-            },
-        },
-    )
-    require_client_error(outcomes[0], module, list(runtime.values()))
-    verify_exact_requests(
-        requests,
-        runtime,
-        {
-            "vmwareAccount": {
-                "downloadToken": runtime["downloadToken"],
-                "downloadActivationCode": runtime["activationCode"],
-            }
-        },
-        statuses=[202],
-        effects=[True],
-        effect_counts=[1],
-    )
 
 
 def main() -> int:
     try:
-        verify_contract()
-        verify_package_shape()
-        verify_input_validation()
-        verify_primary_replacement()
-        verify_activation_code()
-        verify_success_response_is_returned()
-        verify_http_retry_policy()
-        verify_transport_retry_policy()
-        verify_success_response_validation()
-    except VerificationError as error:
-        print(f"VERIFICATION FAILED: {error}", file=sys.stderr)
+        contract_bytes, _contract = verify_provenance()
+        verify_stdlib_only()
+        sys.path.insert(0, str(SRC_PATH))
+        from vcf_depot import SddcManagerClient, SddcManagerError
+
+        verify_constructor_contract(SddcManagerClient, SddcManagerError)
+        run_retry_scenario(contract_bytes, SddcManagerClient)
+    except Exception as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        if not isinstance(exc, VerificationFailure):
+            traceback.print_exc()
         return 1
     print(
-        "VERIFICATION PASSED: exact updateDepotSettings retry with one semantic effect"
+        "PASS: updateServicesConfig used the exact wire contract, omitted unset "
+        "fields, and applied one effect across the identical PUT retry"
     )
     return 0
 

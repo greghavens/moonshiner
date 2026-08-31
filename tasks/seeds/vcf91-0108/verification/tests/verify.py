@@ -201,7 +201,7 @@ def verify_provenance(contract: dict, sources: dict) -> None:
             "name",
             "power_state",
             "cpu_count",
-            "memory_size_mib",
+            "memory_size_MiB",
         ]
         and vm_summary["properties"]["power_state"].get("enum")
         == ["POWERED_OFF", "POWERED_ON", "SUSPENDED"],
@@ -480,9 +480,9 @@ def verify_primary(package: object, temp: Path) -> tuple[int, list[str]]:
     username = f"inventory-svc-{suffix}"
     password = f"päss:{secrets.token_urlsafe(16)}"
     tokens = [
-        f"session-one-{secrets.token_urlsafe(18)}",
-        f"session-two-{secrets.token_urlsafe(18)}",
-        f"session-three-{secrets.token_urlsafe(18)}",
+        "0123456789abcdef0123456789abcdef",
+        "123456789abcdef0123456789abcdef0",
+        "23456789abcdef0123456789abcdef01",
     ]
     error_secret = f"server-detail-{secrets.token_urlsafe(18)}"
     protocol_name = f"protocol-{suffix}"
@@ -490,29 +490,85 @@ def verify_primary(package: object, temp: Path) -> tuple[int, list[str]]:
     perpetual_401_name = f"expired-again-{suffix}"
 
     datacenters = [
-        {"datacenter": f"dc-middle-{suffix}", "name": f"Middle {suffix}"},
-        {"datacenter": f"dc-zulu-{suffix}", "name": f"Zulu {suffix}"},
-        {"datacenter": f"dc-alpha-{suffix}", "name": f"Alpha {suffix}"},
+        {"datacenter": "datacenter-3", "name": "VCF-Datacenter"},
     ]
     vms = [
         {
-            "vm": f"vm-middle-{suffix}",
-            "name": f"Middle VM {suffix}",
-            "power_state": "SUSPENDED",
-            "cpu_count": 2,
-        },
-        {
-            "vm": f"vm-zulu-{suffix}",
-            "name": f"Zulu VM {suffix}",
-            "power_state": "POWERED_OFF",
-            "memory_size_mib": 4096,
-        },
-        {
-            "vm": f"vm-alpha-{suffix}",
-            "name": f"Alpha VM {suffix}",
+            "vm": "vm-19",
+            "name": "sddcm01",
             "power_state": "POWERED_ON",
-            "cpu_count": None,
-            "memory_size_mib": None,
+            "cpu_count": 4,
+            "memory_size_MiB": 16384,
+        },
+        {
+            "vm": "vm-20",
+            "name": "vc01",
+            "power_state": "POWERED_ON",
+            "cpu_count": 4,
+            "memory_size_MiB": 21504,
+        },
+        {
+            "vm": "vm-28",
+            "name": "nsx01a",
+            "power_state": "POWERED_ON",
+            "cpu_count": 6,
+            "memory_size_MiB": 24576,
+        },
+        {
+            "vm": "vm-33",
+            "name": "vcf-msr01-nxpxf",
+            "power_state": "POWERED_ON",
+            "cpu_count": 4,
+            "memory_size_MiB": 10240,
+        },
+        {
+            "vm": "vm-34",
+            "name": "vcf-msr01-5ghdn",
+            "power_state": "POWERED_ON",
+            "cpu_count": 8,
+            "memory_size_MiB": 24576,
+        },
+        {
+            "vm": "vm-35",
+            "name": "vcf-msr01-x6j88",
+            "power_state": "POWERED_ON",
+            "cpu_count": 8,
+            "memory_size_MiB": 24576,
+        },
+        {
+            "vm": "vm-36",
+            "name": "vcf-msr01-6zpgq",
+            "power_state": "POWERED_ON",
+            "cpu_count": 8,
+            "memory_size_MiB": 24576,
+        },
+        {
+            "vm": "vm-37",
+            "name": "vcf01",
+            "power_state": "POWERED_ON",
+            "cpu_count": 4,
+            "memory_size_MiB": 16384,
+        },
+        {
+            "vm": "vm-38",
+            "name": "vcf-proxy01",
+            "power_state": "POWERED_ON",
+            "cpu_count": 4,
+            "memory_size_MiB": 16384,
+        },
+        {
+            "vm": "vm-39",
+            "name": "vcf-lic01",
+            "power_state": "POWERED_ON",
+            "cpu_count": 2,
+            "memory_size_MiB": 4096,
+        },
+        {
+            "vm": "vm-43",
+            "name": "vcf-asr01-szwjz",
+            "power_state": "POWERED_ON",
+            "cpu_count": 8,
+            "memory_size_MiB": 98304,
         },
     ]
     scenario = {

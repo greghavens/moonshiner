@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,26 +88,31 @@ func TestProtectedCloneWireAndPolling(t *testing.T) {
 	t.Parallel()
 
 	const (
-		sessionID = "session-wire-42"
-		taskID    = "task-wire-42"
-		resultVM  = "vm-result-42"
+		sessionID = "0123456789abcdef0123456789abcdef"
+		taskID    = "task-4194:7978ee81-a66c-4c37-8653-c577c0161e9d"
+		resultVM  = "vm-1044:7978ee81-a66c-4c37-8653-c577c0161e9d"
 	)
 	server := newMock(t, mockvcenter.Scenario{
 		SessionID: sessionID,
 		TaskID:    taskID,
 		ResultVM:  resultVM,
 		Statuses: []mockvcenter.Status{
-			mockvcenter.StatusPending,
 			mockvcenter.StatusRunning,
-			mockvcenter.StatusBlocked,
+			mockvcenter.StatusRunning,
+			mockvcenter.StatusRunning,
+			mockvcenter.StatusRunning,
+			mockvcenter.StatusRunning,
+			mockvcenter.StatusRunning,
+			mockvcenter.StatusRunning,
+			mockvcenter.StatusRunning,
 			mockvcenter.StatusSucceeded,
 		},
 	})
 	client := newClient(t, server, sessionID)
 
 	got, err := client.CloneAndWait(context.Background(), vcenter.CloneSpec{
-		Source:        "vm-source-42",
-		Name:          "clone-minimal",
+		Source:        "vm-39",
+		Name:          "moonshiner-live-validation-0109-min",
 		DisksToRemove: []string{},
 		DisksToUpdate: map[string]vcenter.DiskCloneSpec{},
 	}, 0)
@@ -118,8 +124,8 @@ func TestProtectedCloneWireAndPolling(t *testing.T) {
 	}
 
 	requests := server.Requests()
-	if len(requests) != 5 {
-		t.Fatalf("request count = %d, want 5", len(requests))
+	if len(requests) != 10 {
+		t.Fatalf("request count = %d, want 10", len(requests))
 	}
 	clone := requests[0]
 	assertRequest(t, clone, http.MethodPost, "/api/vcenter/vm", "action=clone&vmw-task=true", sessionID)
@@ -131,8 +137,8 @@ func TestProtectedCloneWireAndPolling(t *testing.T) {
 		t.Fatalf("decode clone request: %v", err)
 	}
 	wantBody := map[string]any{
-		"source": "vm-source-42",
-		"name":   "clone-minimal",
+		"source": "vm-39",
+		"name":   "moonshiner-live-validation-0109-min",
 	}
 	if !reflect.DeepEqual(body, wantBody) {
 		t.Errorf("minimal clone body = %#v, want %#v", body, wantBody)
@@ -161,12 +167,12 @@ func TestProtectedOptionalWireShapes(t *testing.T) {
 		{
 			name: "explicit false is present",
 			spec: vcenter.CloneSpec{
-				Source:  "vm-source-options",
+				Source:  "vm-39",
 				Name:    "clone-power-off",
 				PowerOn: &powerOff,
 			},
 			wantBody: map[string]any{
-				"source":   "vm-source-options",
+				"source":   "vm-39",
 				"name":     "clone-power-off",
 				"power_on": false,
 			},
@@ -174,32 +180,34 @@ func TestProtectedOptionalWireShapes(t *testing.T) {
 		{
 			name: "populated nested fields only",
 			spec: vcenter.CloneSpec{
-				Source: "vm-source-options",
-				Name:   "clone-placed",
+				Source: "vm-39",
+				Name:   "moonshiner-live-validation-0109-populated",
 				Placement: &vcenter.ClonePlacementSpec{
-					Folder:    "group-v9",
-					Datastore: "datastore-19",
+					Folder:       "group-v4",
+					ResourcePool: "resgroup-10",
+					Datastore:    "datastore-17",
 				},
+				DisksToRemove: []string{"2002"},
 				DisksToUpdate: map[string]vcenter.DiskCloneSpec{
-					"2000": {Datastore: "datastore-20"},
+					"2000": {Datastore: "datastore-17"},
 				},
-				GuestCustomizationSpec: &vcenter.GuestCustomizationSpec{Name: "linux-base"},
+				PowerOn: &powerOff,
 			},
 			wantBody: map[string]any{
-				"source": "vm-source-options",
-				"name":   "clone-placed",
+				"source": "vm-39",
+				"name":   "moonshiner-live-validation-0109-populated",
 				"placement": map[string]any{
-					"folder":    "group-v9",
-					"datastore": "datastore-19",
+					"folder":        "group-v4",
+					"resource_pool": "resgroup-10",
+					"datastore":     "datastore-17",
 				},
+				"disks_to_remove": []any{"2002"},
 				"disks_to_update": map[string]any{
 					"2000": map[string]any{
-						"datastore": "datastore-20",
+						"datastore": "datastore-17",
 					},
 				},
-				"guest_customization_spec": map[string]any{
-					"name": "linux-base",
-				},
+				"power_on": false,
 			},
 		},
 	}
@@ -210,12 +218,12 @@ func TestProtectedOptionalWireShapes(t *testing.T) {
 			t.Parallel()
 
 			server := newMock(t, mockvcenter.Scenario{
-				SessionID: "session-options",
-				TaskID:    "task-options",
-				ResultVM:  "vm-options",
+				SessionID: "123456789abcdef0123456789abcdef0",
+				TaskID:    "task-4196:7978ee81-a66c-4c37-8653-c577c0161e9d",
+				ResultVM:  "vm-1046:7978ee81-a66c-4c37-8653-c577c0161e9d",
 				Statuses:  []mockvcenter.Status{mockvcenter.StatusSucceeded},
 			})
-			client := newClient(t, server, "session-options")
+			client := newClient(t, server, "123456789abcdef0123456789abcdef0")
 			if _, err := client.CloneAndWait(context.Background(), testCase.spec, 0); err != nil {
 				t.Fatalf("CloneAndWait: %v", err)
 			}
@@ -232,6 +240,32 @@ func TestProtectedOptionalWireShapes(t *testing.T) {
 				t.Errorf("clone body = %#v, want %#v", body, testCase.wantBody)
 			}
 		})
+	}
+}
+
+func TestProtectedGuestCustomizationNotFound(t *testing.T) {
+	t.Parallel()
+
+	const sessionID = "23456789abcdef0123456789abcdef01"
+	server := newMock(t, mockvcenter.Scenario{
+		SessionID: sessionID,
+		TaskID:    "task-4198:7978ee81-a66c-4c37-8653-c577c0161e9d",
+		ResultVM:  "vm-1048:7978ee81-a66c-4c37-8653-c577c0161e9d",
+		Statuses:  []mockvcenter.Status{mockvcenter.StatusSucceeded},
+	})
+	client := newClient(t, server, sessionID)
+	_, err := client.CloneAndWait(context.Background(), vcenter.CloneSpec{
+		Source: "vm-39",
+		Name:   "moonshiner-live-validation-0109-missing",
+		GuestCustomizationSpec: &vcenter.GuestCustomizationSpec{
+			Name: "missing-vcf-customization",
+		},
+	}, 0)
+	if err == nil || !strings.Contains(err.Error(), "HTTP status 404") {
+		t.Fatalf("missing customization error = %v", err)
+	}
+	if got := len(server.Requests()); got != 1 {
+		t.Fatalf("request count = %d, want one synchronous clone failure", got)
 	}
 }
 

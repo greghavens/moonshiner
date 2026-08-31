@@ -15,8 +15,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Dependency-free client for the focused VCF Operations Log Management
- * contract in docs/contract.json.
+ * Dependency-free client for VCF Operations Log Management.
  */
 public final class VcfLogForwarderClient {
     private static final String TEST_FORWARDER = "testLogForwarderConnection";

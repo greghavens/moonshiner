@@ -22,8 +22,8 @@ const (
 	expectedSpec   = "specifications/vsphere/openapi/automation/vcenter.yaml"
 	expectedBlob   = "8028b0824c4ff3503d05f44814f967938a795c40"
 	expectedOp     = "Content.LocalLibrary_create"
-	sessionToken   = "session-protected-value"
-	clientToken    = "b8a2a2e3-2314-43cd-a871-6ede0f429751"
+	sessionToken   = "0123456789abcdef0123456789abcdef"
+	clientToken    = "a1b2c3d4-e5f6-47a8-91b2-c3d4e5f60718"
 )
 
 type operationSource struct {
@@ -234,6 +234,8 @@ func TestProtectedContractProvenance(t *testing.T) {
 
 func TestCreateLocalLibraryRetryContract(t *testing.T) {
 	t.Parallel()
+	// Drop and truncated-response cases are controlled transport coverage. The
+	// live endpoint was separately verified to return one UUID for exact replay.
 
 	tests := []struct {
 		name         string
@@ -271,18 +273,18 @@ func TestCreateLocalLibraryRetryContract(t *testing.T) {
 					First:               tt.first,
 					ExpectedSession:     sessionToken,
 					ExpectedClientToken: clientToken,
-					LibraryID:           "library-7",
+					LibraryID:           "92e84cd2-3ad7-4dd5-9745-83360a89c4bf",
 				},
 			)
 			defer mock.Close()
 
 			client := mustClient(t, mock, sessionToken)
-			datastoreID := "datastore-42"
+			datastoreID := "datastore-17"
 			got, err := client.CreateLocalLibrary(
 				context.Background(),
 				clientToken,
 				vcenter.LocalLibrarySpec{
-					Name: "Operations Library",
+					Name: "moonshiner-live-validation-0112",
 					StorageBackings: []vcenter.StorageBacking{
 						{
 							Type:        vcenter.StorageBackingDatastore,
@@ -296,7 +298,7 @@ func TestCreateLocalLibraryRetryContract(t *testing.T) {
 			}
 			want := vcenter.CreateResult{
 				OperationID: expectedOp,
-				LibraryID:   "library-7",
+				LibraryID:   "92e84cd2-3ad7-4dd5-9745-83360a89c4bf",
 				ClientToken: clientToken,
 				Attempts:    tt.wantAttempts,
 			}
@@ -306,7 +308,7 @@ func TestCreateLocalLibraryRetryContract(t *testing.T) {
 
 			records := readLog(t, logPath)
 			wantBody := []byte(
-				`{"name":"Operations Library","storage_backings":[{"type":"DATASTORE","datastore_id":"datastore-42"}]}`,
+				`{"name":"moonshiner-live-validation-0112","storage_backings":[{"type":"DATASTORE","datastore_id":"datastore-17"}]}`,
 			)
 			assertExactWire(
 				t,
@@ -335,7 +337,7 @@ func TestOptionalMemberShapes(t *testing.T) {
 		{
 			name: "explicit empty description remains present",
 			spec: func() vcenter.LocalLibrarySpec {
-				datastoreID := "datastore-8"
+				datastoreID := "datastore-17"
 				description := ""
 				return vcenter.LocalLibrarySpec{
 					Name: "Empty description",
@@ -348,10 +350,10 @@ func TestOptionalMemberShapes(t *testing.T) {
 					Description: &description,
 				}
 			},
-			wantBody: `{"name":"Empty description","storage_backings":[{"type":"DATASTORE","datastore_id":"datastore-8"}],"description":""}`,
+			wantBody: `{"name":"Empty description","storage_backings":[{"type":"DATASTORE","datastore_id":"datastore-17"}],"description":""}`,
 		},
 		{
-			name: "other backing omits datastore id",
+			name: "other backing contract coverage omits datastore id",
 			spec: func() vcenter.LocalLibrarySpec {
 				storageURI := "nfs://storage.example/library"
 				description := "replicated content"

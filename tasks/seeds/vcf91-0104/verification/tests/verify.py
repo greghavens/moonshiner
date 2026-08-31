@@ -211,7 +211,7 @@ def assert_constructor_validation() -> None:
 
 
 def assert_argument_validation(directory: Path) -> None:
-    token = "argument-" + secrets.token_urlsafe(12)
+    token = secrets.token_hex(16)
     log_path = directory / "arguments.jsonl"
     with ContractMock(
         CONTRACT_PATH,
@@ -241,15 +241,15 @@ def assert_argument_validation(directory: Path) -> None:
 
 
 def assert_success(directory: Path) -> None:
-    token = "session-" + secrets.token_urlsafe(24)
-    vm = "vm " + secrets.token_urlsafe(8) + "/blue β"
-    cpu_count = 2 + secrets.randbelow(15)
+    token = secrets.token_hex(16)
+    vm = "vm-1038"
+    cpu_count = 6
     log_path = directory / "success.jsonl"
 
     with ContractMock(
         CONTRACT_PATH,
         log_path,
-        power_payload={"state": "POWERED_OFF", "clean_power_off": False},
+        power_payload={"state": "POWERED_OFF", "clean_power_off": True},
     ) as mock:
         client = VCenterClient(mock.base_url + "/", token, timeout=3.0)
         result = client.set_cpu_count_if_powered_off(vm, cpu_count)
@@ -339,8 +339,8 @@ def assert_success(directory: Path) -> None:
 
 def assert_gate_failures(directory: Path) -> None:
     for index, state in enumerate(["POWERED_ON", "SUSPENDED"], start=1):
-        token = "gate-" + secrets.token_urlsafe(18)
-        vm = f"vm-gate-{index}/" + secrets.token_urlsafe(8)
+        token = secrets.token_hex(16)
+        vm = "vm-39" if state == "POWERED_ON" else "vm-1038"
         log_path = directory / f"gate-{index}.jsonl"
         with ContractMock(
             CONTRACT_PATH,
@@ -378,7 +378,7 @@ def assert_malformed_prechecks(directory: Path) -> None:
         ["POWERED_OFF"],
     ]
     for index, payload in enumerate(malformed_payloads, start=1):
-        token = "protocol-" + secrets.token_urlsafe(16)
+        token = secrets.token_hex(16)
         log_path = directory / f"protocol-{index}.jsonl"
         with ContractMock(
             CONTRACT_PATH,
@@ -389,7 +389,7 @@ def assert_malformed_prechecks(directory: Path) -> None:
             error = require_raises(
                 ProtocolError,
                 lambda: client.set_cpu_count_if_powered_off(
-                    "vm-protocol-" + secrets.token_urlsafe(5),
+                    "vm-1038",
                     8,
                 ),
                 "malformed power success was accepted",
@@ -405,26 +405,42 @@ def assert_malformed_prechecks(directory: Path) -> None:
 
 
 def assert_http_failures(directory: Path) -> None:
-    token = "http-" + secrets.token_urlsafe(22)
+    token = secrets.token_hex(16)
     sentinel = "payload-" + secrets.token_urlsafe(18)
     precheck_log = directory / "precheck-http.jsonl"
-    payload = {"error_type": "SERVICE_UNAVAILABLE", "sentinel": sentinel}
+    payload = {
+        "error_type": "NOT_FOUND",
+        "messages": [
+            {
+                "args": ["vm/missing snow β"],
+                "default_message": sentinel,
+                "id": "com.vmware.api.vcenter.vm.not_found",
+            },
+            {
+                "args": [],
+                "default_message": "The object was not found.",
+                "id": "vmsg.ManagedObjectNotFound.summary",
+            },
+        ],
+    }
     with ContractMock(
         CONTRACT_PATH,
         precheck_log,
         power_payload=payload,
-        power_status=503,
+        power_status=404,
     ) as mock:
         client = VCenterClient(mock.base_url, token)
         error = require_raises(
             VcenterError,
-            lambda: client.set_cpu_count_if_powered_off("vm-http", 4),
+            lambda: client.set_cpu_count_if_powered_off(
+                "vm/missing snow β", 4
+            ),
             "precheck HTTP error was accepted",
         )
         mutation_count = mock.mutation_count
 
     require(error.operation_id == POWER_OPERATION, "wrong precheck error operation")
-    require(error.status_code == 503, "precheck HTTP status was not preserved")
+    require(error.status_code == 404, "precheck HTTP status was not preserved")
     require(error.payload == payload, "precheck JSON error was not preserved")
     require(len(read_log(precheck_log)) == 1, "HTTP precheck failure issued PATCH")
     require(mutation_count == 0, "HTTP precheck failure changed mock state")
@@ -432,7 +448,7 @@ def assert_http_failures(directory: Path) -> None:
         require(token not in rendered, "error exposed the session token")
         require(sentinel not in rendered, "error exposed response payload data")
 
-    update_token = "update-" + secrets.token_urlsafe(22)
+    update_token = secrets.token_hex(16)
     update_sentinel = "update-payload-" + secrets.token_urlsafe(15)
     update_log = directory / "update-http.jsonl"
     update_payload = {"error_type": "RESOURCE_BUSY", "sentinel": update_sentinel}
@@ -446,7 +462,7 @@ def assert_http_failures(directory: Path) -> None:
         client = VCenterClient(mock.base_url, update_token)
         error = require_raises(
             VcenterError,
-            lambda: client.set_cpu_count_if_powered_off("vm-update", 10),
+            lambda: client.set_cpu_count_if_powered_off("vm-1038", 10),
             "mutation HTTP error was accepted",
         )
         mutation_count = mock.mutation_count

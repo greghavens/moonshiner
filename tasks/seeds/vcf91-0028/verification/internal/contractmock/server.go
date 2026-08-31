@@ -9,14 +9,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
 )
 
-const DeleteDepotSettings = "deleteDepotSettings"
+const DeleteServiceConfigByKey = "deleteServiceConfigByKey"
 
 // Plan selects a contract-valid failure scenario.
 type Plan struct {
@@ -45,8 +44,7 @@ type Server struct {
 	plan       Plan
 	token      string
 	method     string
-	path       string
-	queryName  string
+	pathPrefix string
 
 	mu           sync.Mutex
 	requests     []Request
@@ -60,23 +58,22 @@ type contractFile struct {
 		OperationID     string `json:"operationId"`
 		Method          string `json:"method"`
 		Path            string `json:"path"`
-		QueryParameters []struct {
+		PathParameters []struct {
 			Name     string `json:"name"`
 			In       string `json:"in"`
 			Required bool   `json:"required"`
-		} `json:"query_parameters"`
+		} `json:"path_parameters"`
 	} `json:"operations"`
 }
 
 // New starts a loopback server on an ephemeral IPv4 address.
 func New(plan Plan) *Server {
-	method, path, queryName := loadPinnedRoute()
+	method, pathPrefix := loadPinnedRoute()
 	server := &Server{
 		plan:       plan,
 		token:      randomValue("access"),
 		method:     method,
-		path:       path,
-		queryName:  queryName,
+		pathPrefix: pathPrefix,
 		configured: true,
 	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -136,8 +133,8 @@ func (s *Server) EffectCount() int {
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	operationID := ""
-	if r.Method == s.method && r.URL.Path == s.path {
-		operationID = DeleteDepotSettings
+	if r.Method == s.method && validServicePath(r.URL.Path, s.pathPrefix) {
+		operationID = DeleteServiceConfigByKey
 	}
 
 	status := s.handle(operationID, r, body)
@@ -175,7 +172,7 @@ func (s *Server) handle(operationID string, r *http.Request, body []byte) int {
 		len(body) != 0 {
 		return http.StatusBadRequest
 	}
-	if !validQuery(r.URL.Query(), s.queryName) {
+	if r.URL.RawQuery != "" {
 		return http.StatusBadRequest
 	}
 	if s.plan.RejectStatus != 0 {
@@ -197,12 +194,8 @@ func (s *Server) handle(operationID string, r *http.Request, body []byte) int {
 	return http.StatusNoContent
 }
 
-func validQuery(query url.Values, name string) bool {
-	if len(query) == 0 {
-		return true
-	}
-	values, ok := query[name]
-	return ok && len(query) == 1 && len(values) == 1 && values[0] != ""
+func validServicePath(path, prefix string) bool {
+	return len(path) > len(prefix) && path[:len(prefix)] == prefix
 }
 
 func (s *Server) record(request Request) {
@@ -211,7 +204,7 @@ func (s *Server) record(request Request) {
 	s.requests = append(s.requests, request)
 }
 
-func loadPinnedRoute() (string, string, string) {
+func loadPinnedRoute() (string, string) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
 		panic("cannot locate contract mock source")
@@ -235,16 +228,16 @@ func loadPinnedRoute() (string, string, string) {
 		panic("contract mock requires exactly one operation")
 	}
 	operation := contract.Operations[0]
-	if operation.OperationID != DeleteDepotSettings ||
+	if operation.OperationID != DeleteServiceConfigByKey ||
 		operation.Method != http.MethodDelete ||
-		operation.Path != "/v1/system/settings/depot" ||
-		len(operation.QueryParameters) != 1 ||
-		operation.QueryParameters[0].Name != "depotType" ||
-		operation.QueryParameters[0].In != "query" ||
-		operation.QueryParameters[0].Required {
+		operation.Path != "/v1/services-config/{serviceKey}" ||
+		len(operation.PathParameters) != 1 ||
+		operation.PathParameters[0].Name != "serviceKey" ||
+		operation.PathParameters[0].In != "path" ||
+		!operation.PathParameters[0].Required {
 		panic("protected contract does not match the loopback route")
 	}
-	return operation.Method, operation.Path, operation.QueryParameters[0].Name
+	return operation.Method, "/v1/services-config/"
 }
 
 func writeError(w http.ResponseWriter, status int, code string) {
@@ -252,7 +245,7 @@ func writeError(w http.ResponseWriter, status int, code string) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"errorCode":          code,
-		"message":            "the depot settings request did not complete",
+		"message":            "the service configuration request did not complete",
 		"remediationMessage": "retry only when the outcome is safe",
 		"referenceToken":     "loopback-reference",
 	})

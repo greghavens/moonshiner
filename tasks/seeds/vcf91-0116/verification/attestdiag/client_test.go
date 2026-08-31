@@ -21,7 +21,7 @@ import (
 
 const contractPath = "../docs/contract.json"
 
-func TestCollectDiagnosisWireAndClassification(t *testing.T) {
+func TestContractCoverageCollectDiagnosisWireAndClassification(t *testing.T) {
 	tests := []struct {
 		name        string
 		active      bool
@@ -256,16 +256,22 @@ func TestListTPMsRejectsInvalidOptionsBeforeTraffic(t *testing.T) {
 
 func TestCollectDiagnosisRejectsAmbiguousInventoryBeforeLaterOperations(t *testing.T) {
 	tests := []struct {
-		name     string
-		tpmCount int
+		name       string
+		tpmCount   int
+		liveShaped bool
 	}{
-		{name: "no TPM", tpmCount: 0},
-		{name: "multiple TPMs", tpmCount: 2},
+		{name: "live environment has no TPM", tpmCount: 0, liveShaped: true},
+		{name: "contract coverage has multiple TPMs", tpmCount: 2},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			scenario := newScenario(t)
 			scenario.TPMCount = test.tpmCount
+			if test.liveShaped {
+				scenario.SessionID = "0123456789abcdef0123456789abcdef"
+				scenario.Host = "host-12"
+				scenario.TPM = "tpm-fixture"
+			}
 			server := contractmock.Start(t, contractPath, scenario)
 			client := newClient(t, server.URL, scenario.SessionID)
 			_, err := attestdiag.CollectDiagnosis(
@@ -283,6 +289,10 @@ func TestCollectDiagnosisRejectsAmbiguousInventoryBeforeLaterOperations(t *testi
 			if len(records) != 1 ||
 				records[0].Method != http.MethodGet {
 				t.Fatalf("ambiguous inventory was not terminal: %v", records)
+			}
+			if test.liveShaped && records[0].RequestURI !=
+				"/api/vcenter/trusted-infrastructure/hosts/host-12/hardware/tpm" {
+				t.Fatalf("live zero-TPM target = %q", records[0].RequestURI)
 			}
 		})
 	}

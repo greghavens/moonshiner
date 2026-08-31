@@ -313,14 +313,18 @@ class Handler(BaseHTTPRequestHandler):
         self._respond(200, {"components": selected}, "getComponents")
 
     def _get_component_nodes(self, component_id, values):
-        page_number = 0
+        page_number = 1
         if "pageNumber" in values:
             raw = values["pageNumber"]
             if not raw.isdigit():
                 self._bad_request("getComponentNodes", "invalid-integer",
-                                  "pageNumber must be a non-negative integer")
+                                  "pageNumber must be a positive integer")
                 return
             page_number = int(raw)
+            if page_number < 1:
+                self._bad_request("getComponentNodes", "page-number-out-of-range",
+                                  "pageNumber must be a positive integer")
+                return
 
         page_size = DEFAULT_PAGE_SIZE
         if "pageSize" in values:
@@ -352,8 +356,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # A page can fail after an earlier page succeeded. The client must
-        # terminate without leaking the node collected from page zero.
-        if component_id == LATE_FAILURE_ID and page_number == 1:
+        # terminate without leaking the node collected from page one.
+        if component_id == LATE_FAILURE_ID and page_number == 2:
             self._respond(500, error_body("SDDC_LCM_INTERNAL_ERROR",
                                           "Injected failure on the second page"),
                           "getComponentNodes")
@@ -365,7 +369,7 @@ class Handler(BaseHTTPRequestHandler):
 
         total = len(nodes)
         total_pages = (total + page_size - 1) // page_size
-        start = page_number * page_size
+        start = (page_number - 1) * page_size
         page = nodes[start:start + page_size]
 
         reported_page_number = page_number

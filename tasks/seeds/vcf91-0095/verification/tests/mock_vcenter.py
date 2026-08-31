@@ -64,8 +64,7 @@ def main() -> int:
 
     old_token = scenario["old_token"]
     new_token = scenario["new_token"]
-    old_item = scenario["old_item"]
-    new_item = scenario["new_item"]
+    items = scenario["items"]
     release_file = Path(scenario["release_file"])
     if not isinstance(old_token, str) or not old_token:
         raise ValueError("scenario old_token must be non-empty")
@@ -73,7 +72,9 @@ def main() -> int:
         raise ValueError("scenario new_token must be non-empty")
     if old_token == new_token:
         raise ValueError("scenario session tokens must differ")
-    if not isinstance(old_item, dict) or not isinstance(new_item, dict):
+    if not isinstance(items, list) or not items:
+        raise ValueError("scenario items must be a non-empty array")
+    if any(not isinstance(item, dict) for item in items):
         raise ValueError("scenario role items must be objects")
 
     state_lock = threading.Lock()
@@ -177,10 +178,10 @@ def main() -> int:
                         )
                         return
                     time.sleep(0.01)
-                self._send_json(200, {"items": [old_item]})
+                self._send_json(200, {"items": items})
                 return
 
-            self._send_json(200, {"items": [new_item]})
+            self._send_json(200, {"items": items})
 
         do_GET = _handle
         do_POST = _handle

@@ -1,20 +1,15 @@
 Set-StrictMode -Version Latest
 
 function New-VcfVcenterResizeClient {
-    [CmdletBinding(DefaultParameterSetName = 'Token')]
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory, ParameterSetName = 'Connection')]
-        [VMware.Sdk.OpenApi.Cmdlets.IServerConnection] $Connection,
-
-        [Parameter(Mandatory, ParameterSetName = 'Token')]
-        [Parameter(ParameterSetName = 'Connection')]
+        [Parameter(Mandatory)]
         [uri] $Server,
 
-        [Parameter(Mandatory, ParameterSetName = 'Token')]
+        [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
         [string] $SessionToken,
 
-        [Parameter(ParameterSetName = 'Token')]
         [switch] $SkipCertificateCheck
     )
 

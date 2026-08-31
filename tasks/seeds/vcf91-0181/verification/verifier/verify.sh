@@ -16,7 +16,7 @@ export GOTOOLCHAIN=local
 export GOPROXY=off
 export GOSUMDB=off
 
-if [[ "$(go list -m all)" != "moonshiner/vcf91-0181" ]]; then
+if [[ "$(go list -m all)" != "vcflogtask" ]]; then
   echo "third-party Go modules are not allowed" >&2
   exit 1
 fi

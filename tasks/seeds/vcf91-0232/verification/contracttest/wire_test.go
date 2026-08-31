@@ -123,12 +123,12 @@ func fixturePlan(t *testing.T) map[string]any {
 }
 
 const (
-	opsBinaryURL = "https://depot.vcf.example.com/PROD/COMP/VCF_OPERATIONS/9.1.0.0/vcf-operations-9.1.0.0.ova"
+	opsBinaryURL = "https://depot.vcf.example.com/PROD/COMP/OPS/9.1.0.0/vcf-operations-9.1.0.0.ova"
 	taskTarget   = "/v1/tasks/" + taskID
 )
 
 // minimalCreateBody is the body of an install raised from a plan that sets no
-// optional input. The depot published no binary for VCF_AUTOMATION and the plan
+// optional input. The depot published no binary for VCFA and the plan
 // carries no repository certificate, so the optional repository object has
 // nothing to hold and does not appear at all -- not as {} and not as null.
 //
@@ -138,7 +138,7 @@ var minimalCreateBody = map[string]any{
 	"componentSpecs": []any{
 		map[string]any{
 			"deploymentType": "ComponentImportSpec",
-			"componentType":  "VCF_AUTOMATION",
+			"componentType":  "VCFA",
 			"fqdn":           "auto-a.vcf.example.com",
 			"password":       "VMw@re123!Auto",
 			"version":        "9.1.0.0",
@@ -201,11 +201,11 @@ func TestWireShape(t *testing.T) {
 						// The depot version is optional and the plan pins it.
 						"version": "9.1.0.0",
 						"componentVersions": []any{
-							// VCF_OPERATIONS pins a version, VCF_AUTOMATION does
+							// OPS pins a version, VCFA does
 							// not, so the second entry carries no version field
 							// at all.
-							map[string]any{"component": "VCF_OPERATIONS", "version": "9.1.0.0"},
-							map[string]any{"component": "VCF_AUTOMATION"},
+							map[string]any{"component": "OPS", "version": "9.1.0.0"},
+							map[string]any{"component": "VCFA"},
 						},
 					},
 				},
@@ -220,7 +220,7 @@ func TestWireShape(t *testing.T) {
 						"componentSpecs": []any{
 							map[string]any{
 								"deploymentType": "ComponentImportSpec",
-								"componentType":  "VCF_OPERATIONS",
+								"componentType":  "OPS",
 								"fqdn":           ops["fqdn"],
 								"password":       ops["password"],
 								"username":       ops["username"],
@@ -235,7 +235,7 @@ func TestWireShape(t *testing.T) {
 							},
 							map[string]any{
 								"deploymentType": "ComponentImportSpec",
-								"componentType":  "VCF_AUTOMATION",
+								"componentType":  "VCFA",
 								"fqdn":           auto["fqdn"],
 								"password":       auto["password"],
 								"version":        "9.1.0.0",
@@ -270,7 +270,7 @@ func TestWireShape(t *testing.T) {
 				"depot": depotSpec(),
 				"components": []any{
 					map[string]any{
-						"componentType": "VCF_AUTOMATION",
+						"componentType": "VCFA",
 						"fqdn":          "auto-a.vcf.example.com",
 						"password":      "VMw@re123!Auto",
 					},
@@ -296,7 +296,7 @@ func TestWireShape(t *testing.T) {
 					absentHeaders: []string{"X-Correlation-Id"},
 					body: map[string]any{
 						"fleetDepotSpec":    depotSpec(),
-						"componentVersions": []any{map[string]any{"component": "VCF_AUTOMATION"}},
+						"componentVersions": []any{map[string]any{"component": "VCFA"}},
 					},
 				},
 				// The credential expires on the one request that changes the

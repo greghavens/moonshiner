@@ -20,13 +20,13 @@ CONTRACT_PATH = ROOT / "docs" / "contract.json"
 SOURCES_PATH = ROOT / "docs" / "official_sources.json"
 MOCK_PATH = ROOT / ".moonshiner" / "mock_sddc_manager.py"
 
-EXPECTED_COMMIT = "c3f3b52c845dd967cabbc21680e893292077d5ba"
+EXPECTED_COMMIT = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
 EXPECTED_SPEC_PATH = "specifications/sddc-manager/sddc-manager-openapi.json"
 EXPECTED_OPERATIONS = [
     ("createToken", "POST", "/v1/tokens"),
     ("updateProxyConfiguration", "PATCH", "/v1/system/proxy-configuration"),
     ("getTask", "GET", "/v1/tasks/{id}"),
-    ("updateDepotSettings", "PUT", "/v1/system/settings/depot"),
+    ("updateServicesConfig", "PUT", "/v1/services-config"),
 ]
 
 
@@ -66,8 +66,15 @@ def verify_contract_provenance() -> None:
     require(proxy.get("required") == [], "ProxyConfiguration has no OpenAPI required fields")
     require(proxy["properties"]["isConfigured"].get("readOnly") is True, "isConfigured must remain read-only")
     require(proxy["properties"]["transferProtocol"].get("enum") == ["HTTP", "HTTPS"], "proxy protocol enum drifted")
-    account = contract["schemas"]["DepotAccount"]
-    require(account["properties"]["downloadToken"].get("maxLength") == 32, "downloadToken constraint drifted")
+    services = contract["schemas"]["ServicesConfig"]
+    require(services.get("required") == ["services"], "ServicesConfig must require services")
+    service = contract["schemas"]["ServiceConfig"]
+    require(service.get("required") == ["key", "name", "nodes", "type"],
+            "ServiceConfig required fields drifted")
+    node = contract["schemas"]["ServiceNode"]
+    require(node.get("required") == ["addresses", "name"], "ServiceNode required fields drifted")
+    address = contract["schemas"]["ServiceNodeAddress"]
+    require(address.get("required") == ["type", "value"], "ServiceNodeAddress required fields drifted")
 
 
 def verify_module_source() -> None:
@@ -77,9 +84,11 @@ def verify_module_source() -> None:
         "Initialize-VcfProxyConfiguration",
         "Invoke-VcfUpdateProxyConfiguration",
         "Invoke-VcfGetTask",
-        "Initialize-VcfDepotAccount",
-        "Initialize-VcfDepotSettings",
-        "Invoke-VcfUpdateDepotSettings",
+        "Initialize-VcfServiceNodeAddress",
+        "Initialize-VcfServiceNode",
+        "Initialize-VcfServiceConfig",
+        "Initialize-VcfServicesConfig",
+        "Invoke-VcfUpdateServicesConfig",
     ]
     pwsh = shutil.which("pwsh")
     require(pwsh is not None, "pwsh prerequisite is missing")
@@ -222,9 +231,11 @@ foreach ($sdkCommand in @(
     'Initialize-VcfProxyConfiguration',
     'Invoke-VcfUpdateProxyConfiguration',
     'Invoke-VcfGetTask',
-    'Initialize-VcfDepotAccount',
-    'Initialize-VcfDepotSettings',
-    'Invoke-VcfUpdateDepotSettings'
+    'Initialize-VcfServiceNodeAddress',
+    'Initialize-VcfServiceNode',
+    'Initialize-VcfServiceConfig',
+    'Initialize-VcfServicesConfig',
+    'Invoke-VcfUpdateServicesConfig'
 )) {
     if ((Get-Command $sdkCommand -ErrorAction Stop).Source -cne 'VMware.Sdk.Vcf.SddcManager') {
         throw "$sdkCommand was not resolved from the genuine VMware SDK module."
@@ -243,7 +254,12 @@ $result = Invoke-VcfLifecycleConnectivityChange `
     -ProxyHost $env:VCF_PROXY_HOST `
     -ProxyPort ([int]$env:VCF_PROXY_PORT) `
     -ProxyProtocol $env:VCF_PROXY_PROTOCOL `
-    -DepotDownloadToken $env:VCF_DEPOT_TOKEN
+    -ServiceName $env:VCF_SERVICE_NAME `
+    -ServiceType $env:VCF_SERVICE_TYPE `
+    -ServiceKey $env:VCF_SERVICE_KEY `
+    -NodeName $env:VCF_NODE_NAME `
+    -AddressType $env:VCF_ADDRESS_TYPE `
+    -AddressValue $env:VCF_ADDRESS_VALUE
 'MOONSHINER_RESULT:' + ($result | ConvertTo-Json -Depth 20 -Compress)
 """
     environment = os.environ.copy()
@@ -254,7 +270,12 @@ $result = Invoke-VcfLifecycleConnectivityChange `
     environment["VCF_PROXY_HOST"] = str(ready["proxyHost"])
     environment["VCF_PROXY_PORT"] = str(ready["proxyPort"])
     environment["VCF_PROXY_PROTOCOL"] = str(ready["proxyProtocol"])
-    environment["VCF_DEPOT_TOKEN"] = str(ready["depotToken"])
+    environment["VCF_SERVICE_NAME"] = str(ready["serviceName"])
+    environment["VCF_SERVICE_TYPE"] = str(ready["serviceType"])
+    environment["VCF_SERVICE_KEY"] = str(ready["serviceKey"])
+    environment["VCF_NODE_NAME"] = str(ready["nodeName"])
+    environment["VCF_ADDRESS_TYPE"] = str(ready["addressType"])
+    environment["VCF_ADDRESS_VALUE"] = str(ready["addressValue"])
     run = subprocess.run(
         [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
         cwd=ROOT,
@@ -280,7 +301,7 @@ def verify_result(result: dict[str, object], ready: dict[str, object]) -> None:
     steps = result.get("Steps")
     require(isinstance(steps, list) and len(steps) == 2, "Steps must be an ordered two-element array")
 
-    proxy, depot = steps
+    proxy, services = steps
     require(proxy.get("Name") == "Proxy", "first report must be Proxy")
     require(proxy.get("OperationId") == "updateProxyConfiguration", "proxy operationId is wrong")
     require(proxy.get("Status") == "Succeeded", "proxy success was not preserved")
@@ -289,13 +310,15 @@ def verify_result(result: dict[str, object], ready: dict[str, object]) -> None:
     require(proxy.get("ErrorCode") is None and proxy.get("ErrorMessage") is None,
             "successful proxy report must not contain an error")
 
-    require(depot.get("Name") == "Depot", "second report must be Depot")
-    require(depot.get("OperationId") == "updateDepotSettings", "depot operationId is wrong")
-    require(depot.get("Status") == "Failed", "depot failure was not reported")
-    require(depot.get("TaskId") is None and depot.get("TaskStatus") is None,
-            "failed synchronous depot call must not invent task data")
-    require(depot.get("ErrorCode") == "DEPOT_TOKEN_REJECTED", "structured depot error code was not retained")
-    require(depot.get("ErrorMessage") == ready["failureMessage"], "depot error message was not retained")
+    require(services.get("Name") == "ServicesConfig", "second report must be ServicesConfig")
+    require(services.get("OperationId") == "updateServicesConfig", "services operationId is wrong")
+    require(services.get("Status") == "Failed", "services failure was not reported")
+    require(services.get("TaskId") is None and services.get("TaskStatus") is None,
+            "failed synchronous services call must not invent task data")
+    require(services.get("ErrorCode") == "SERVICES_CONFIG_SCHEMA_VALIDATION_FAILED",
+            "structured services error code was not retained")
+    require(services.get("ErrorMessage") == ready["failureMessage"],
+            "services error message was not retained")
 
 
 def read_request_log(path: Path) -> list[dict[str, object]]:
@@ -308,13 +331,13 @@ def verify_wire(requests: list[dict[str, object]], ready: dict[str, object]) -> 
         (None, "GET", "/v1/sddc-manager"),
         ("updateProxyConfiguration", "PATCH", "/v1/system/proxy-configuration"),
         ("getTask", "GET", f"/v1/tasks/{ready['taskId']}"),
-        ("updateDepotSettings", "PUT", "/v1/system/settings/depot"),
+        ("updateServicesConfig", "PUT", "/v1/services-config"),
     ]
     observed = [(item.get("operationId"), item.get("method"), item.get("path")) for item in requests]
     require(observed == expected, f"wrong request sequence or unexpected request: {observed!r}")
     require(all(item.get("query") == "" for item in requests), "no operation in this contract uses a query string")
 
-    token, probe, proxy, task, depot = requests
+    token, probe, proxy, task, services = requests
     require(token.get("jsonBody") == {"username": ready["username"], "password": ready["password"]},
             "createToken wire body must contain only username and password; apiKey/idToken must be omitted")
     require(proxy.get("jsonBody") == {
@@ -323,16 +346,27 @@ def verify_wire(requests: list[dict[str, object]], ready: dict[str, object]) -> 
         "port": ready["proxyPort"],
         "transferProtocol": ready["proxyProtocol"],
     }, "proxy wire body has a missing, extra, empty, or incorrectly typed field")
-    require(depot.get("jsonBody") == {
-        "vmwareAccount": {"downloadToken": ready["depotToken"]}
-    }, "depot wire body must omit every unset DepotAccount/DepotSettings field")
+    require(services.get("jsonBody") == {
+        "services": [{
+            "name": ready["serviceName"],
+            "type": ready["serviceType"],
+            "key": ready["serviceKey"],
+            "nodes": [{
+                "name": ready["nodeName"],
+                "addresses": [{
+                    "type": ready["addressType"],
+                    "value": ready["addressValue"],
+                }],
+            }],
+        }],
+    }, "services wire body must contain required fields and omit every optional field")
     require(probe.get("rawBody") == "", "SDK version probe must not send a request body")
     require(task.get("rawBody") == "", "getTask must not send a request body")
 
-    for item in (token, proxy, depot):
+    for item in (token, proxy, services):
         content_type = str(item.get("headers", {}).get("content-type", "")).lower()
         require(content_type.startswith("application/json"), "JSON mutations must send application/json")
-    for item in (probe, proxy, task, depot):
+    for item in (probe, proxy, task, services):
         authorization = str(item.get("headers", {}).get("authorization", ""))
         require(authorization == f"Bearer {ready['accessToken']}",
                 "authenticated calls must use the SDK bearer token")

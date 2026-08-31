@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 BASE = "/suite-api"
-SCHEME = "vRealizeOpsToken"
+SCHEME = "OpsToken"
 
 # ---------------------------------------------------------------------------
 # Fixture world: workload domain wld01, VCF Operations 9.1
@@ -124,15 +124,13 @@ def body_resources(names, kinds):
             },
             "resourceHealth": "RED",
             "resourceHealthValue": 8.0,
-            "monitoringInterval": 5,
-            "monitoringIntervalSeconds": 300,
             "dtEnabled": True,
             "resourceStatusStates": [
                 {
                     "adapterInstanceId": W.adapter_id,
                     "resourceState": "STARTED",
                     "resourceStatus": "DATA_RECEIVING",
-                    "statusMessage": "Collecting; last collection completed 2026-03-11T06:00:00Z",
+                    "statusMessage": "",
                 }
             ],
         },
@@ -147,15 +145,13 @@ def body_resources(names, kinds):
             },
             "resourceHealth": "GREEN",
             "resourceHealthValue": 100.0,
-            "monitoringInterval": 5,
-            "monitoringIntervalSeconds": 300,
             "dtEnabled": True,
             "resourceStatusStates": [
                 {
                     "adapterInstanceId": W.adapter_id,
                     "resourceState": "STARTED",
                     "resourceStatus": "DATA_RECEIVING",
-                    "statusMessage": "Collecting; last collection completed 2026-03-11T06:00:00Z",
+                    "statusMessage": "",
                 }
             ],
         },
@@ -179,8 +175,8 @@ def body_alerts(spec):
             "alertLevel": "CRITICAL",
             "status": "ACTIVE",
             "controlState": "OPEN",
-            "type": "Storage",
-            "subType": "Capacity",
+            "type": "18",
+            "subType": "20",
             "alertImpact": "RISK",
             "alertDefinitionId": "AlertDefinition-VMWARE-Datastore-capacity-remaining",
             "alertDefinitionName": "Datastore is running out of disk space",
@@ -188,9 +184,6 @@ def body_alerts(spec):
             "updateTimeUTC": T_TASK_UPDATED,
             "cancelTimeUTC": 0,
             "suspendUntilTimeUTC": 0,
-            "ownerId": None,
-            "ownerName": None,
-            "statKey": None,
         },
         {
             "alertId": W.alert_noise,
@@ -198,8 +191,8 @@ def body_alerts(spec):
             "alertLevel": "IMMEDIATE",
             "status": "ACTIVE",
             "controlState": "SUSPENDED",
-            "type": "Storage",
-            "subType": "Performance",
+            "type": "18",
+            "subType": "20",
             "alertImpact": "HEALTH",
             "alertDefinitionId": "AlertDefinition-VMWARE-Datastore-latency",
             "alertDefinitionName": "Datastore write latency is above tolerance",
@@ -207,9 +200,6 @@ def body_alerts(spec):
             "updateTimeUTC": T_NOISE_ALERT,
             "cancelTimeUTC": 0,
             "suspendUntilTimeUTC": 1773280800000,
-            "ownerId": None,
-            "ownerName": None,
-            "statKey": None,
         },
     ]
     out = catalog
@@ -493,9 +483,9 @@ class Handler(BaseHTTPRequestHandler):
                 200,
                 {
                     "token": tok,
-                    "validity": 1773216000000 + seq,
-                    "expiresAt": "2026-03-11T08:00:00.000Z",
-                    "roles": ["ContentAdmin", "ReadOnly"],
+                    "validity": 1788106992611 + seq,
+                    "expiresAt": "Sunday, August 30, 2026 at 4:23:12 PM Coordinated Universal Time",
+                    "roles": [],
                 },
                 "acquireToken",
             )

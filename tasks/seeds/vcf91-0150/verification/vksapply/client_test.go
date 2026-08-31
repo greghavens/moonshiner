@@ -44,12 +44,30 @@ func baseRequest() ApplyRequest {
 		Namespace:            testNamespace,
 		ClusterName:          testCluster,
 		FieldManager:         "platform owner/blue",
-		ClusterClass:         "builtin-generic-v3.5.0",
-		KubernetesVersion:    "v1.33.6+vmware.1-fips",
-		VMClass:              "best-effort-medium",
-		StorageClass:         "vsan-default",
+		ClusterClass:         "vsphere-9.1.2668",
+		KubernetesVersion:    "v1.34.2",
+		TopologyVariables:    liveTopologyVariables(),
 		ControlPlaneReplicas: 3,
+		WorkerClass:          "vsphere-9.1.2668-worker",
+		WorkerName:           "workers",
 	}
+}
+
+func liveTopologyVariables() []TopologyVariable {
+	names := []string{
+		"datastore", "dnsImageTag", "imageRepository", "infraServerThumbprint",
+		"network", "infraServerURL", "resourcePool", "vmTemplate", "datacenter",
+		"etcdImageTag", "folder", "controlPlaneIpAddr", "credsSecretName",
+		"kubeVipPodManifest",
+	}
+	variables := make([]TopologyVariable, len(names))
+	for index, name := range names {
+		variables[index] = TopologyVariable{
+			Name:  name,
+			Value: map[string]any{"liveValidated": true, "name": name},
+		}
+	}
+	return variables
 }
 
 func newClientForServer(t *testing.T, server *contractmock.Server) *Client {
@@ -76,7 +94,6 @@ func TestApplyWireProjectionTable(t *testing.T) {
 		name      string
 		mutate    func(*ApplyRequest)
 		wantQuery string
-		wantBody  string
 	}{
 		{
 			name: "unset optional fields are absent",
@@ -85,7 +102,6 @@ func TestApplyWireProjectionTable(t *testing.T) {
 				request.ServiceCIDRs = []string{}
 			},
 			wantQuery: "fieldManager=platform+owner%2Fblue",
-			wantBody:  `{"apiVersion":"cluster.x-k8s.io/v1beta2","kind":"Cluster","metadata":{"name":"vks +/canary","namespace":"team blue/edge%?"},"spec":{"topology":{"class":"builtin-generic-v3.5.0","version":"v1.33.6+vmware.1-fips","variables":[{"name":"vmClass","value":"best-effort-medium"},{"name":"storageClass","value":"vsan-default"}],"controlPlane":{"replicas":3}}}}`,
 		},
 		{
 			name: "explicit zero false and one-sided network survive",
@@ -95,7 +111,6 @@ func TestApplyWireProjectionTable(t *testing.T) {
 				request.Force = &forceFalse
 			},
 			wantQuery: "fieldManager=platform+owner%2Fblue&force=false",
-			wantBody:  `{"apiVersion":"cluster.x-k8s.io/v1beta2","kind":"Cluster","metadata":{"name":"vks +/canary","namespace":"team blue/edge%?"},"spec":{"topology":{"class":"builtin-generic-v3.5.0","version":"v1.33.6+vmware.1-fips","variables":[{"name":"vmClass","value":"best-effort-medium"},{"name":"storageClass","value":"vsan-default"}],"controlPlane":{"replicas":3},"workers":{"machineDeployments":[{"class":"node-pool","name":"worker","replicas":0}]}},"clusterNetwork":{"pods":{"cidrBlocks":["10.244.0.0/16","fd00:10:244::/56"]}}}}`,
 		},
 		{
 			name: "both network members and true force preserve order",
@@ -105,7 +120,6 @@ func TestApplyWireProjectionTable(t *testing.T) {
 				request.Force = &forceTrue
 			},
 			wantQuery: "fieldManager=platform+owner%2Fblue&force=true",
-			wantBody:  `{"apiVersion":"cluster.x-k8s.io/v1beta2","kind":"Cluster","metadata":{"name":"vks +/canary","namespace":"team blue/edge%?"},"spec":{"topology":{"class":"builtin-generic-v3.5.0","version":"v1.33.6+vmware.1-fips","variables":[{"name":"vmClass","value":"best-effort-medium"},{"name":"storageClass","value":"vsan-default"}],"controlPlane":{"replicas":3}},"clusterNetwork":{"pods":{"cidrBlocks":["10.244.0.0/16"]},"services":{"cidrBlocks":["10.96.0.0/12","fd00:10:96::/112"]}}}}`,
 		},
 	}
 
@@ -138,7 +152,7 @@ func TestApplyWireProjectionTable(t *testing.T) {
 			}
 			assertNamespaceWire(t, records[0])
 			wantTarget := clusterTarget(request.Namespace, request.ClusterName, test.wantQuery)
-			assertApplyWire(t, records[1], wantTarget, test.wantBody)
+			assertApplyWire(t, records[1], wantTarget, expectedApplyBody(t, request))
 			assertJSONMembers(
 				t,
 				records[1].Body,
@@ -148,6 +162,46 @@ func TestApplyWireProjectionTable(t *testing.T) {
 			)
 		})
 	}
+}
+
+func TestLiveValidatedBoundaryResponses(t *testing.T) {
+	t.Run("namespace not found", func(t *testing.T) {
+		scenario := baseScenario()
+		scenario.NamespaceHTTPStatus = http.StatusNotFound
+		scenario.ErrorBody = `{"error_type":"NOT_FOUND","messages":[{"args":[],"default_message":"Namespace was not found.","id":"vcenter.wcp.workload.notfound"}]}`
+		server := contractmock.Start(t, scenario)
+		client := newClientForServer(t, server)
+		_, err := client.Apply(context.Background(), baseRequest())
+		var apiError *APIError
+		if !errors.As(err, &apiError) ||
+			apiError.Operation != NamespaceGetOperation ||
+			apiError.StatusCode != http.StatusNotFound ||
+			string(apiError.Body) != scenario.ErrorBody {
+			t.Fatalf("error = %#v, want live namespace 404", err)
+		}
+		if records := server.Records(); len(records) != 1 {
+			t.Fatalf("namespace 404 made %d requests, want 1", len(records))
+		}
+	})
+
+	t.Run("strict apply admission rejection", func(t *testing.T) {
+		scenario := baseScenario()
+		scenario.ApplyHTTPStatus = http.StatusUnprocessableEntity
+		scenario.ErrorBody = `{"apiVersion":"v1","code":422,"kind":"Status","reason":"Invalid","status":"Failure"}`
+		server := contractmock.Start(t, scenario)
+		client := newClientForServer(t, server)
+		_, err := client.Apply(context.Background(), baseRequest())
+		var apiError *APIError
+		if !errors.As(err, &apiError) ||
+			apiError.Operation != ClusterApplyOperation ||
+			apiError.StatusCode != http.StatusUnprocessableEntity ||
+			string(apiError.Body) != scenario.ErrorBody {
+			t.Fatalf("error = %#v, want live Kubernetes admission 422", err)
+		}
+		if records := server.Records(); len(records) != 2 {
+			t.Fatalf("admission rejection made %d requests, want 2", len(records))
+		}
+	})
 }
 
 func TestAmbiguousApplyReplayIsByteIdenticalAndNonDuplicating(t *testing.T) {
@@ -537,8 +591,10 @@ func TestValidationBeforeTrafficTable(t *testing.T) {
 		{"blank field manager", context.Background(), func(r *ApplyRequest) { r.FieldManager = "" }},
 		{"blank cluster class", context.Background(), func(r *ApplyRequest) { r.ClusterClass = " " }},
 		{"blank kubernetes version", context.Background(), func(r *ApplyRequest) { r.KubernetesVersion = "" }},
-		{"blank vm class", context.Background(), func(r *ApplyRequest) { r.VMClass = "\t" }},
-		{"blank storage class", context.Background(), func(r *ApplyRequest) { r.StorageClass = "" }},
+		{"missing topology variables", context.Background(), func(r *ApplyRequest) { r.TopologyVariables = nil }},
+		{"wrong topology variable order", context.Background(), func(r *ApplyRequest) {
+			r.TopologyVariables[0], r.TopologyVariables[1] = r.TopologyVariables[1], r.TopologyVariables[0]
+		}},
 		{"zero control plane", context.Background(), func(r *ApplyRequest) { r.ControlPlaneReplicas = 0 }},
 		{"negative control plane", context.Background(), func(r *ApplyRequest) { r.ControlPlaneReplicas = -1 }},
 		{"negative workers", context.Background(), func(r *ApplyRequest) { r.WorkerReplicas = &negative }},
@@ -550,6 +606,7 @@ func TestValidationBeforeTrafficTable(t *testing.T) {
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			request := baseRequest()
+			request.TopologyVariables = append([]TopologyVariable(nil), request.TopologyVariables...)
 			test.mutate(&request)
 			_, err := client.Apply(test.ctx, request)
 			var validationError *ValidationError
@@ -880,6 +937,92 @@ func assertNamespaceWire(t *testing.T, record contractmock.RequestRecord) {
 	assertHeaderAbsent(t, record, "Content-Length")
 }
 
+func expectedApplyBody(t *testing.T, request ApplyRequest) string {
+	t.Helper()
+	type variable struct {
+		Name  string `json:"name"`
+		Value any    `json:"value"`
+	}
+	type classRef struct {
+		Name string `json:"name"`
+	}
+	type controlPlane struct {
+		Replicas int32 `json:"replicas"`
+	}
+	type machineDeployment struct {
+		Class    string `json:"class"`
+		Name     string `json:"name"`
+		Replicas int32  `json:"replicas"`
+	}
+	type workers struct {
+		MachineDeployments []machineDeployment `json:"machineDeployments"`
+	}
+	type topology struct {
+		ClassRef     classRef     `json:"classRef"`
+		Version      string       `json:"version"`
+		ControlPlane controlPlane `json:"controlPlane"`
+		Workers      *workers     `json:"workers,omitempty"`
+		Variables    []variable   `json:"variables"`
+	}
+	type cidrBlocks struct {
+		CIDRBlocks []string `json:"cidrBlocks"`
+	}
+	type network struct {
+		Pods     *cidrBlocks `json:"pods,omitempty"`
+		Services *cidrBlocks `json:"services,omitempty"`
+	}
+	type metadata struct {
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"`
+	}
+	type spec struct {
+		Topology       topology `json:"topology"`
+		ClusterNetwork *network `json:"clusterNetwork,omitempty"`
+	}
+	type document struct {
+		APIVersion string   `json:"apiVersion"`
+		Kind       string   `json:"kind"`
+		Metadata   metadata `json:"metadata"`
+		Spec       spec     `json:"spec"`
+	}
+
+	variables := make([]variable, len(request.TopologyVariables))
+	for index, item := range request.TopologyVariables {
+		variables[index] = variable{Name: item.Name, Value: item.Value}
+	}
+	topologyValue := topology{
+		ClassRef:     classRef{Name: request.ClusterClass},
+		Version:      request.KubernetesVersion,
+		ControlPlane: controlPlane{Replicas: request.ControlPlaneReplicas},
+		Variables:    variables,
+	}
+	if request.WorkerReplicas != nil {
+		topologyValue.Workers = &workers{MachineDeployments: []machineDeployment{{
+			Class: request.WorkerClass, Name: request.WorkerName, Replicas: *request.WorkerReplicas,
+		}}}
+	}
+	var networkValue *network
+	if len(request.PodCIDRs) > 0 || len(request.ServiceCIDRs) > 0 {
+		networkValue = &network{}
+		if len(request.PodCIDRs) > 0 {
+			networkValue.Pods = &cidrBlocks{CIDRBlocks: request.PodCIDRs}
+		}
+		if len(request.ServiceCIDRs) > 0 {
+			networkValue.Services = &cidrBlocks{CIDRBlocks: request.ServiceCIDRs}
+		}
+	}
+	encoded, err := json.Marshal(document{
+		APIVersion: "cluster.x-k8s.io/v1beta2",
+		Kind:       "Cluster",
+		Metadata:   metadata{Name: request.ClusterName, Namespace: request.Namespace},
+		Spec:       spec{Topology: topologyValue, ClusterNetwork: networkValue},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
+}
+
 func assertApplyWire(t *testing.T, record contractmock.RequestRecord, wantTarget, wantBody string) {
 	t.Helper()
 	if record.ContractName != "applyVksCluster" ||
@@ -924,6 +1067,14 @@ func assertJSONMembers(t *testing.T, body string, wantWorkers, wantPods, wantSer
 	}
 	spec := document["spec"].(map[string]any)
 	topology := spec["topology"].(map[string]any)
+	classRef := topology["classRef"].(map[string]any)
+	if classRef["name"] != "vsphere-9.1.2668" {
+		t.Errorf("classRef = %#v", classRef)
+	}
+	variables := topology["variables"].([]any)
+	if len(variables) != 14 {
+		t.Errorf("topology variable count = %d, want 14", len(variables))
+	}
 	_, workers := topology["workers"]
 	if workers != wantWorkers {
 		t.Errorf("workers present = %v, want %v", workers, wantWorkers)

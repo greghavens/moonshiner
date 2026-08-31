@@ -37,6 +37,21 @@ function Set-VcfSddcLcmConfiguration {
 
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
+        [string] $VspPlatformFqdn,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $VspInstanceFqdn,
+
+        [Parameter()]
+        [string] $VspFleetFqdn,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $VspSslThumbprint,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string] $FleetLcmFqdn,
 
         [Parameter(Mandatory)]

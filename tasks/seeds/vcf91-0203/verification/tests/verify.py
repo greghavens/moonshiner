@@ -82,9 +82,10 @@ class Verification(unittest.TestCase):
 
     def test_download_is_encoded_exactly_and_polled_to_success(self) -> None:
         with ContractMock(
-            (" pending ", "Queued", "  in progress  ", "  successful  ")
+            (" pending ", "Queued", "  in progress  ", "  successful  "),
+            visibility_misses=2,
         ) as mock:
-            client = VcfInstallerClient(mock.base_url)
+            client = VcfInstallerClient(mock.base_url, mock.access_token)
             result = client.download_bundle_and_wait(
                 "bundle/9.1 core",
                 BundleDownloadSpec(download_now=True),
@@ -96,12 +97,18 @@ class Verification(unittest.TestCase):
         self.assertEqual(
             result["status"].strip().upper().replace(" ", "_"), "SUCCESSFUL"
         )
-        self.assertEqual(len(log), 5, "accepted work must be polled to terminal state")
+        self.assertEqual(
+            len(log), 7,
+            "accepted work must survive live post-acceptance visibility misses",
+        )
         start = log[0]
         self.assertEqual(start.method, "PATCH")
         self.assertEqual(start.raw_path, "/v1/bundles/bundle%2F9.1%20core")
         self.assertEqual(start.query, "")
         self.assertEqual(start.headers.get("accept"), "application/json")
+        self.assertEqual(
+            start.headers.get("authorization"), "Bearer " + mock.access_token
+        )
         self.assertEqual(start.headers.get("content-type"), "application/json")
         self.assertEqual(
             start.raw_body,
@@ -114,12 +121,15 @@ class Verification(unittest.TestCase):
             self.assertEqual(poll.query, "")
             self.assertEqual(poll.raw_body, b"")
             self.assertEqual(poll.headers.get("accept"), "application/json")
+            self.assertEqual(
+                poll.headers.get("authorization"), "Bearer " + mock.access_token
+            )
             self.assertNotIn("content-type", poll.headers)
 
     def test_explicit_false_is_sent_and_task_id_is_encoded(self) -> None:
         task_id = "task/9.1 ready"
         with ContractMock(("SUCCESSFUL",), task_id=task_id) as mock:
-            client = VcfInstallerClient(mock.base_url)
+            client = VcfInstallerClient(mock.base_url, mock.access_token)
             accepted = client.start_bundle_download(
                 "bundle-91", BundleDownloadSpec(download_now=False)
             )
@@ -135,6 +145,9 @@ class Verification(unittest.TestCase):
         self.assertEqual(log[1].raw_path, "/v1/tasks/task%2F9.1%20ready")
         self.assertEqual(log[1].raw_body, b"")
         self.assertNotIn("content-type", log[1].headers)
+        self.assertEqual(
+            log[1].headers.get("authorization"), "Bearer " + mock.access_token
+        )
 
     def test_every_non_success_terminal_state_raises_and_stops(self) -> None:
         variants = {
@@ -147,7 +160,7 @@ class Verification(unittest.TestCase):
         for normalized, spelling in variants.items():
             with self.subTest(status=normalized):
                 with ContractMock((spelling,)) as mock:
-                    client = VcfInstallerClient(mock.base_url)
+                    client = VcfInstallerClient(mock.base_url, mock.access_token)
                     with self.assertRaises(TaskFailedError) as caught:
                         client.download_bundle_and_wait(
                             "bundle-91",
@@ -161,7 +174,7 @@ class Verification(unittest.TestCase):
 
     def test_unknown_status_is_a_protocol_error(self) -> None:
         with ContractMock(("AWAITING_ORACLE",)) as mock:
-            client = VcfInstallerClient(mock.base_url)
+            client = VcfInstallerClient(mock.base_url, mock.access_token)
             with self.assertRaises(ProtocolError):
                 client.download_bundle_and_wait(
                     "bundle-91",
@@ -174,7 +187,7 @@ class Verification(unittest.TestCase):
 
     def test_zero_timeout_does_not_issue_a_poll(self) -> None:
         with ContractMock(("QUEUED",)) as mock:
-            client = VcfInstallerClient(mock.base_url)
+            client = VcfInstallerClient(mock.base_url, mock.access_token)
             with self.assertRaises(PollTimeoutError):
                 client.download_bundle_and_wait(
                     "bundle-91",
@@ -187,7 +200,7 @@ class Verification(unittest.TestCase):
 
     def test_non_2xx_and_invalid_json_are_api_errors(self) -> None:
         with ContractMock(start_response=(503, {"message": "unavailable"})) as mock:
-            client = VcfInstallerClient(mock.base_url)
+            client = VcfInstallerClient(mock.base_url, mock.access_token)
             with self.assertRaises(ApiError) as http_error:
                 client.start_bundle_download(
                     "bundle-91", BundleDownloadSpec(download_now=True)
@@ -196,12 +209,32 @@ class Verification(unittest.TestCase):
 
         with ContractMock(
             (),
+            task_responses=((404, {
+                "errorCode": "TA_TASK_NOT_FOUND",
+                "arguments": ["task-bundle-download-91"],
+                "message": "Task with ID task-bundle-download-91 not found",
+                "referenceToken": "loopback-reference",
+            }),),
+        ) as mock:
+            client = VcfInstallerClient(mock.base_url, mock.access_token)
+            with self.assertRaises(ApiError) as missing_error:
+                client.get_task("task-bundle-download-91")
+        self.assertEqual(missing_error.exception.status_code, 404)
+
+        with ContractMock(
+            (),
             task_responses=((200, b"{not-json"),),
         ) as mock:
-            client = VcfInstallerClient(mock.base_url)
+            client = VcfInstallerClient(mock.base_url, mock.access_token)
             with self.assertRaises(ApiError) as json_error:
                 client.get_task("task-bundle-download-91")
         self.assertEqual(json_error.exception.status_code, 200)
+
+    def test_access_token_is_required_before_traffic(self) -> None:
+        for token in ("", "  ", "bad\rheader", "bad\nheader"):
+            with self.subTest(token=repr(token)):
+                with self.assertRaises(ValueError):
+                    VcfInstallerClient("https://installer.example", token)
 
     def test_malformed_successful_task_objects_are_protocol_errors(self) -> None:
         malformed = (
@@ -223,7 +256,7 @@ class Verification(unittest.TestCase):
         for value in malformed:
             with self.subTest(value=value):
                 with ContractMock(start_response=(202, value)) as mock:
-                    client = VcfInstallerClient(mock.base_url)
+                    client = VcfInstallerClient(mock.base_url, mock.access_token)
                     with self.assertRaises(ProtocolError):
                         client.start_bundle_download(
                             "bundle-91", BundleDownloadSpec(download_now=True)

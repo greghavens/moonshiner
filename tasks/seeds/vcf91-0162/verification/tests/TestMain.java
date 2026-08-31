@@ -628,6 +628,9 @@ public final class TestMain {
                 "Basic username colon");
         require(logLines(requestLog) == 0, "validation performed traffic");
 
+        validateLiveBlankDiscovery(
+                endpoint, oldSession, kubernetesToken, namespace, clusterName);
+
         ExecutorService executor = Executors.newFixedThreadPool(3);
         try {
             Future<VcfVksSessionRotationClient.ClusterResult> oldLookup =
@@ -690,5 +693,51 @@ public final class TestMain {
                     "fallback drain state differs");
         }
         System.out.println("TEST_MAIN_OK");
+    }
+
+    private static void validateLiveBlankDiscovery(
+            URI endpoint,
+            String session,
+            String kubernetesToken,
+            String namespace,
+            String clusterName) throws Exception {
+        int[] calls = {0};
+        VcfVksSessionRotationClient.Exchange exchange =
+                (operation, request) -> {
+                    calls[0]++;
+                    require(operation.equals(
+                                    VcfVksSessionRotationClient
+                                            .LIST_NAMESPACES_OPERATION),
+                            "blank discovery reached a later operation");
+                    require(request.method().equals("GET")
+                                    && request.uri().getRawPath().equals(
+                                            "/api/vcenter/"
+                                                    + "namespaces-user/namespaces"),
+                            "blank discovery used the wrong request");
+                    return new VcfVksSessionRotationClient.WireResponse(
+                            200,
+                            ("[{\"master_host\":\"\",\"namespace\":\"\","
+                                    + "\"control_plane_api_server_port\":6443}]")
+                                    .getBytes(StandardCharsets.UTF_8));
+                };
+        VcfVksSessionRotationClient blankClient =
+                new VcfVksSessionRotationClient(
+                        endpoint,
+                        session,
+                        kubernetesToken,
+                        "http",
+                        Duration.ofSeconds(5),
+                        exchange);
+        try {
+            blankClient.getCluster(namespace, clusterName);
+            throw new AssertionError("live blank discovery was accepted");
+        } catch (VcfVksSessionRotationClient.ProtocolException expected) {
+            require(expected.operation().equals(
+                            VcfVksSessionRotationClient
+                                    .LIST_NAMESPACES_OPERATION),
+                    "blank discovery reported the wrong operation");
+        }
+        require(calls[0] == 1,
+                "blank discovery must stop before Kubernetes");
     }
 }

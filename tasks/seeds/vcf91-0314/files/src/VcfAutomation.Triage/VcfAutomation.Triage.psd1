@@ -30,7 +30,7 @@
     # CloudBuilder, SddcManager, Installer and Ops only. VCF Automation has no
     # generated binding because it has no published API specification, which is
     # why the operations in this module are hand-rolled REST calls written
-    # against the reference-derived contract in docs/contract.json.
+    # against the reference-derived API contract.
     PrivateData          = @{
         PSData = @{
             Tags                       = @('VCF', 'VCF-Automation', 'VMware', 'Triage')

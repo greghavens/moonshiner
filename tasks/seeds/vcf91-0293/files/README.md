@@ -21,7 +21,6 @@ only record an operator has of that split, so it has to be exactly right.
 | `src/vcfon_syslog/client.py` | One method per contract operation. **To implement.** |
 | `src/vcfon_syslog/rollout.py` | `apply_syslog_plan`. **To implement.** |
 | `fixtures/*.json` | Example plans. |
-| `tests/mock_appliance.py` | Loopback mock appliance pinned to `docs/contract.json`, with a JSONL request log. |
 | `tests/verify.py` | The verifier. `python3 tests/verify.py` |
 
 ## Operations used
@@ -110,7 +109,3 @@ boolean `status` from that target's `StatusResponse`. `error` is
 ```
 python3 tests/verify.py
 ```
-
-The verifier starts the loopback mock on `127.0.0.1`, runs three plans through
-it and checks both the returned report and the recorded request log. It contacts
-no live VMware endpoint.

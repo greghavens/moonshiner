@@ -86,9 +86,9 @@ func TestCLI(t *testing.T) {
 			wantRefreshes: 2,
 			wantStdout: []string{
 				"succeeded",
-				"VCF_OPERATIONS",
-				"VCF_AUTOMATION",
-				"VCF_OPERATIONS_FLEET_MANAGEMENT",
+				"OPS",
+				"VCFA",
+				"VCF_FLEET_LCM",
 				"refreshed 2 time(s)",
 			},
 		},

@@ -59,7 +59,7 @@ function Set-VcfNsxCredential {
 
         [Parameter(Mandatory)]
         [ValidateNotNull()]
-        [VMware.Bindings.Nsx.Policy.Api.PolicyApi] $PolicyApi
+        [scriptblock] $Cutover
     )
 
     throw 'TODO: drain old-client requests before publishing the new client.'

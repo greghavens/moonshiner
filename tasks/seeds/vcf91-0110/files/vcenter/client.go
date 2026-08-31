@@ -1,2 +1,2 @@
-// TODO: implement the contract-pinned client described in README.md.
+// TODO: implement the focused client described in README.md.
 package vcenter

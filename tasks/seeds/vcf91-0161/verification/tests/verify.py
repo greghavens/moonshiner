@@ -30,9 +30,9 @@ KUBERNETES_OPERATION = (
 
 # The harness protects verify.py itself. These hashes protect every other fixture.
 PROTECTED_SHA256 = {
-    "tests/TestMain.java": "6c26ae4aeb382bd9e4be1e4be7e5439f16025294308b4ec2a615ead0209347a8",
-    "tools/contract_mock.py": "8196bda9b45eafe8b3bccd41dcbe8ca312d756c011d97a882520b6a2acb52f07",
-    "docs/contract.json": "7ff4de96ca9fae48bc8ebc57bfdea4e6be94d65fe224d6579457d9669c689c44",
+    "tests/TestMain.java": "fc8716825aca9797758e234f9c06243d63cc75d02e175e5ed19985b1dba42209",
+    "tools/contract_mock.py": "94d02f2281a2ae8b0d3bac2b1462c73f9c0bb8a6a58e30bae7b4b89e6ec5dbb3",
+    "docs/contract.json": "5e80939eb3ee25ceb3051df4cc50fb6c4d07c46ed7569ab62063fa59a8c95063",
     "docs/official_sources.json": "fe902e1128d401e73cb16a788f61a5b9b3f3672c762e940bb950ad87c5825609",
 }
 
@@ -142,7 +142,6 @@ def verify_contract() -> None:
     require(
         cluster.get("optionalFields")
         == [
-            "spec.topology.classNamespace",
             "spec.topology.controlPlane",
             "spec.topology.workers",
             "spec.clusterNetwork",
@@ -181,13 +180,11 @@ def fixture_values(scenario: str) -> dict[str, str]:
         "differentSupervisor": "other-supervisor-" + suffix,
         "clusterName": "payments-" + suffix,
         "differentClusterName": "other-cluster-" + suffix,
-        "clusterClass": "builtin-generic-v3.5.0",
-        "kubernetesVersion": "v1.33.6+vmware.1-fips-vkr.2",
-        "vmClass": "guaranteed-small",
-        "storageClass": "vsan-policy-" + suffix,
-        "classNamespace": "vmware-system-vks-public",
+        "clusterClass": "vsphere-9.1.2668",
+        "kubernetesVersion": "v1.34.2",
         "controlPlaneReplicas": "3",
-        "workerPoolName": "worker-" + suffix,
+        "workerClass": "vsphere-9.1.2668-worker",
+        "workerPoolName": "workers",
         "workerReplicas": "0",
         "serviceDomain": "svc-" + suffix + ".local",
         "uid": secrets.token_hex(16),
@@ -202,16 +199,17 @@ def write_fixture(path: Path, values: dict[str, str]) -> None:
 
 
 def expected_body(values: dict[str, str], full: bool) -> bytes:
+    variable_names = [
+        "datastore", "dnsImageTag", "imageRepository",
+        "infraServerThumbprint", "network", "infraServerURL",
+        "resourcePool", "vmTemplate", "datacenter", "etcdImageTag",
+        "folder", "controlPlaneIpAddr", "credsSecretName",
+        "kubeVipPodManifest",
+    ]
     topology: dict[str, object] = {
-        "class": values["clusterClass"],
+        "classRef": {"name": values["clusterClass"]},
         "version": values["kubernetesVersion"],
     }
-    if full:
-        topology["classNamespace"] = values["classNamespace"]
-    topology["variables"] = [
-        {"name": "vmClass", "value": values["vmClass"]},
-        {"name": "storageClass", "value": values["storageClass"]},
-    ]
     if full:
         topology["controlPlane"] = {
             "replicas": int(values["controlPlaneReplicas"])
@@ -219,12 +217,19 @@ def expected_body(values: dict[str, str], full: bool) -> bytes:
         topology["workers"] = {
             "machineDeployments": [
                 {
-                    "class": "node-pool",
+                    "class": values["workerClass"],
                     "name": values["workerPoolName"],
                     "replicas": int(values["workerReplicas"]),
                 }
             ]
         }
+    topology["variables"] = [
+        {
+            "name": name,
+            "value": {"liveValidated": True, "name": name},
+        }
+        for name in variable_names
+    ]
     spec: dict[str, object] = {"topology": topology}
     if full:
         spec["clusterNetwork"] = {
@@ -333,7 +338,6 @@ def assert_create_wire(
             "explicit zero replicas were not preserved",
         )
     else:
-        require("classNamespace" not in topology, "unset classNamespace sent")
         require("controlPlane" not in topology, "empty controlPlane sent")
         require("workers" not in topology, "empty workers sent")
         require(
@@ -461,6 +465,7 @@ def run_scenario(
     )
     assert_precheck_wire(entries[0], values)
     if scenario in {
+        "live_namespace_404",
         "namespace_not_ready",
         "supervisor_mismatch",
         "malformed_precheck",
@@ -509,6 +514,8 @@ def main() -> int:
         classes.mkdir()
         compile_harness(classes)
         for scenario in [
+            "live_namespace_404",
+            "live_admission_422",
             "minimal",
             "full",
             "namespace_not_ready",

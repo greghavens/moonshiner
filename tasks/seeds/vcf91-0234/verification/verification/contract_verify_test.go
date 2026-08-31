@@ -727,6 +727,20 @@ func TestSubmissionErrorsAreClassified(t *testing.T) {
 		}
 	})
 
+	t.Run("non-UUID correlation id never reaches the wire", func(t *testing.T) {
+		mock := contractmock.Start(t, contractmock.Options{})
+		client := newClient(t, mock)
+
+		spec := minimalSpec()
+		spec.CorrelationID = "not-a-uuid"
+		if _, err := client.ApplyComponentUpgrade(context.Background(), componentID, spec); !errors.Is(err, sddclcm.ErrMissingCorrelationID) {
+			t.Fatalf("error = %v, want ErrMissingCorrelationID", err)
+		}
+		if got := len(mock.Requests()); got != 0 {
+			t.Fatalf("sent %d requests for a non-UUID correlation id, want 0", got)
+		}
+	})
+
 	t.Run("reusing a correlation id for different bytes is rejected and not retried", func(t *testing.T) {
 		mock := contractmock.Start(t, contractmock.Options{})
 		client := newClient(t, mock)

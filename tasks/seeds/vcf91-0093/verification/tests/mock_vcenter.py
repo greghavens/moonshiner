@@ -71,6 +71,7 @@ def main() -> int:
 
     token = scenario["session_token"]
     vm = scenario["vm"]
+    missing_vm = scenario["missing_vm"]
     cpu_count = scenario["cpu_count"]
     memory_mib = scenario["memory_mib"]
     power_error_message = scenario["power_error_message"]
@@ -78,6 +79,8 @@ def main() -> int:
         raise ValueError("scenario session_token must be a non-empty string")
     if not isinstance(vm, str) or not vm:
         raise ValueError("scenario vm must be a non-empty string")
+    if not isinstance(missing_vm, str) or not missing_vm:
+        raise ValueError("scenario missing_vm must be a non-empty string")
     if not isinstance(cpu_count, int) or cpu_count < 1:
         raise ValueError("scenario cpu_count must be positive")
     if not isinstance(memory_mib, int) or memory_mib < 1:
@@ -86,6 +89,9 @@ def main() -> int:
         raise ValueError("scenario power_error_message must be non-empty")
 
     encoded_vm = quote(vm, safe="")
+    missing_cpu_path = operations[0]["path"].replace(
+        "{vm}", quote(missing_vm, safe="")
+    )
     routes: list[dict] = []
     for index, operation in enumerate(operations):
         raw_target = operation["path"].replace("{vm}", encoded_vm)
@@ -96,7 +102,7 @@ def main() -> int:
             expected_body = compact_json({"count": cpu_count})
             expected_content_type = "application/json"
         elif index == 1:
-            expected_body = compact_json({"size_mib": memory_mib})
+            expected_body = compact_json({"size_MiB": memory_mib})
             expected_content_type = "application/json"
         routes.append(
             {
@@ -153,6 +159,10 @@ def main() -> int:
                 ),
                 None,
             )
+            missing_route = (
+                self.command == "PATCH"
+                and self.path == missing_cpu_path
+            )
 
             with state_lock:
                 status = 404
@@ -162,7 +172,37 @@ def main() -> int:
                 }
                 request_valid = False
                 sequence_valid = False
-                if route is not None:
+                if missing_route:
+                    sequence_valid = True
+                    request_valid = (
+                        self.headers.get("vmware-api-session-id") == token
+                        and self.headers.get("Accept") == "application/json"
+                        and self.headers.get("Authorization") is None
+                        and self.headers.get("Content-Type")
+                        == "application/json"
+                        and body == compact_json({"count": cpu_count})
+                    )
+                    if not request_valid:
+                        status = 400
+                        response = {
+                            "error_type": "INVALID_ARGUMENT",
+                            "messages": [],
+                        }
+                    else:
+                        status = 404
+                        response = {
+                            "error_type": "NOT_FOUND",
+                            "messages": [
+                                {
+                                    "args": [missing_vm],
+                                    "default_message": (
+                                        f"Virtual machine '{missing_vm}' was not found."
+                                    ),
+                                    "id": "vmsg.ManagedObjectNotFound.summary",
+                                }
+                            ],
+                        }
+                elif route is not None:
                     sequence_valid = route["index"] == next_index
                     request_valid = (
                         sequence_valid
@@ -187,14 +227,19 @@ def main() -> int:
                             "messages": [],
                         }
                     elif route["operationId"] == "Vcenter.Vm.Power_start":
-                        status = 503
+                        status = 404
                         response = {
-                            "error_type": "SERVICE_UNAVAILABLE",
+                            "error_type": "NOT_FOUND",
                             "messages": [
                                 {
-                                    "args": [],
+                                    "args": [vm],
                                     "default_message": power_error_message,
-                                    "id": "com.vmware.vcenter.power.unavailable",
+                                    "id": "com.vmware.api.vcenter.vm.not_found",
+                                },
+                                {
+                                    "args": [vm],
+                                    "default_message": "The virtual machine was not found.",
+                                    "id": "vmsg.ManagedObjectNotFound.summary",
                                 }
                             ],
                         }
@@ -206,7 +251,13 @@ def main() -> int:
 
                 entry = {
                     "operationId": (
-                        route["operationId"] if route is not None else None
+                        (
+                            operations[0]["operationId"]
+                            if missing_route
+                            else route["operationId"]
+                            if route is not None
+                            else None
+                        )
                     ),
                     "sequenceIndex": (
                         route["index"] if route is not None else None
@@ -226,6 +277,7 @@ def main() -> int:
                     "contentLength": len(body),
                     "bodyHex": body.hex(),
                     "status": status,
+                    "response": response,
                 }
                 append_log(log_file, entry)
 

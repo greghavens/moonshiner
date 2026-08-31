@@ -161,6 +161,7 @@ def assert_known_route(record: dict[str, object]) -> None:
     path = record["path"]
     known = {
         ("POST", "/v1/tokens"),
+        ("GET", "/v1/sddc-manager"),
         ("GET", "/v1/system/appliance-info"),
         ("PATCH", "/v1/system/proxy-configuration"),
     }

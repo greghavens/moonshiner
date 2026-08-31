@@ -28,7 +28,7 @@ class SddcManagerError(RuntimeError):
 
 
 class SddcManagerClient:
-    """Client for the four operations named by the protected contract."""
+    """Client for the four operations named by the documented API contract."""
 
     def __init__(
         self,

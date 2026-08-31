@@ -195,12 +195,26 @@ class Handler(BaseHTTPRequestHandler):
         project_id = path_values["project-id"]
         domain_id = path_values["domain-id"]
         policy_id = path_values["security-policy-id"]
+        project_prefix = f"/orgs/{org_id}/projects/{project_id}"
+        default_key = (org_id, project_id, domain_id, "default-layer3-section")
+        self.server.state.policies.setdefault(
+            default_key,
+            {
+                "resource_type": "SecurityPolicy",
+                "id": "default-layer3-section",
+                "display_name": "default-layer3-section",
+                "category": "Application",
+                "path": project_prefix
+                + f"/infra/domains/{domain_id}/security-policies/default-layer3-section",
+            },
+        )
         policy = {
             "resource_type": "SecurityPolicy",
             "id": policy_id,
             "display_name": body["display_name"],
             "category": "Application",
-            "path": f"/infra/domains/{domain_id}/security-policies/{policy_id}",
+            "path": project_prefix
+            + f"/infra/domains/{domain_id}/security-policies/{policy_id}",
         }
         key = (org_id, project_id, domain_id, policy_id)
         intent_path = policy["path"]
@@ -235,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             consolidated = "SUCCESS"
             publish = "REALIZED"
-            prefix = "/infra/domains/"
+            prefix = f"/orgs/{org_id}/projects/{project_id}/infra/domains/"
             suffix = "/security-policies/"
             if intent_path.startswith(prefix) and suffix in intent_path:
                 domain_id = intent_path[len(prefix) : intent_path.index(suffix)]

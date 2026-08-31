@@ -29,6 +29,7 @@ const (
 	groupName    = "Seed Overcommitted Clusters"
 	adapterKind  = "Container"
 	resourceKind = "Environment"
+	memberID     = "11111111-1111-4111-8111-111111111111"
 )
 
 func boolPtr(b bool) *bool { return &b }
@@ -53,6 +54,9 @@ func desiredGroup() customgroup.CustomGroup {
 			Name:            groupName,
 			AdapterKindKey:  adapterKind,
 			ResourceKindKey: resourceKind,
+		},
+		MembershipDefinition: customgroup.MembershipDefinition{
+			IncludedResources: []string{memberID},
 		},
 	}
 }
@@ -291,7 +295,7 @@ func TestCreateRequestWireShape(t *testing.T) {
 		mustBeAbsent []string
 	}{
 		{
-			name: "minimal group omits every unset optional property",
+			name: "minimal valid group omits every unset optional property",
 			in:   desiredGroup(),
 			want: map[string]any{
 				"resourceKey": map[string]any{
@@ -299,11 +303,12 @@ func TestCreateRequestWireShape(t *testing.T) {
 					"adapterKindKey":  adapterKind,
 					"resourceKindKey": resourceKind,
 				},
-				"membershipDefinition": map[string]any{},
+				"membershipDefinition": map[string]any{
+					"includedResources": []any{memberID},
+				},
 			},
 			mustBeAbsent: []string{
 				"id", "policy", "autoResolveMembership", "links",
-				"membershipDefinition.includedResources",
 				"membershipDefinition.excludedResources",
 				"resourceKey.resourceIdentifiers",
 				"resourceKey.extension",
@@ -324,7 +329,9 @@ func TestCreateRequestWireShape(t *testing.T) {
 					"resourceKindKey": resourceKind,
 				},
 				"autoResolveMembership": false,
-				"membershipDefinition":  map[string]any{},
+				"membershipDefinition": map[string]any{
+					"includedResources": []any{memberID},
+				},
 			},
 			mustBeAbsent: []string{"id", "policy"},
 		},
@@ -342,7 +349,9 @@ func TestCreateRequestWireShape(t *testing.T) {
 					"resourceKindKey": resourceKind,
 				},
 				"autoResolveMembership": true,
-				"membershipDefinition":  map[string]any{},
+				"membershipDefinition": map[string]any{
+					"includedResources": []any{memberID},
+				},
 			},
 			mustBeAbsent: []string{"id", "policy"},
 		},
@@ -388,13 +397,13 @@ func TestCreateRequestWireShape(t *testing.T) {
 					"resourceKindKey": resourceKind,
 				},
 				"membershipDefinition": map[string]any{
+					"includedResources": []any{memberID},
 					"excludedResources": []any{
 						"33333333-3333-4333-8333-333333333333",
 						"44444444-4444-4444-8444-444444444444",
 					},
 				},
 			},
-			mustBeAbsent: []string{"membershipDefinition.includedResources"},
 		},
 		{
 			name: "server assigned properties never travel outbound",
@@ -410,7 +419,9 @@ func TestCreateRequestWireShape(t *testing.T) {
 					"adapterKindKey":  adapterKind,
 					"resourceKindKey": resourceKind,
 				},
-				"membershipDefinition": map[string]any{},
+				"membershipDefinition": map[string]any{
+					"includedResources": []any{memberID},
+				},
 			},
 			mustBeAbsent: []string{"id", "policy"},
 		},
@@ -440,6 +451,37 @@ func TestCreateRequestWireShape(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("request body mismatch\n got: %s\nwant: %s", pretty(got), pretty(tc.want))
+			}
+		})
+	}
+}
+
+// TestCreateRejectsMembershipWithoutIncludedResources proves the live appliance
+// validation is enforced locally before any request is sent.
+func TestCreateRejectsMembershipWithoutIncludedResources(t *testing.T) {
+	cases := []struct {
+		name       string
+		membership customgroup.MembershipDefinition
+	}{
+		{name: "empty membership"},
+		{
+			name: "excluded resources only",
+			membership: customgroup.MembershipDefinition{
+				ExcludedResources: []string{"33333333-3333-4333-8333-333333333333"},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, srv := newClient(t)
+			g := desiredGroup()
+			g.MembershipDefinition = tc.membership
+			if _, err := c.CreateCustomGroup(context.Background(), g); err == nil {
+				t.Fatal("CreateCustomGroup succeeded, want local validation error")
+			}
+			if n := srv.CountFor("createCustomGroup"); n != 0 {
+				t.Fatalf("createCustomGroup was called %d times, want 0", n)
 			}
 		})
 	}

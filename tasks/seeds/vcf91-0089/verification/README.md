@@ -3,10 +3,11 @@
 Complete `src/VcfVCenterAutomation/VcfVCenterAutomation.psm1`. The surrounding
 files are the protected contract, loopback mock, and acceptance verifier.
 
-The module manifest deliberately requires the preinstalled
-`VMware.Sdk.Vcf.SddcManager` PowerCLI module. Do not install or vendor VMware
-modules. That prerequisite supplies the VMware OpenAPI connection types used by
-the public API.
+The module manifest requires the preinstalled `VMware.Sdk.vSphere` 13.5.0
+PowerCLI module, which exports `Invoke-CloneVmAsync` for
+`Vcenter.VM_clone$Task` and `Invoke-GetTask` for `Cis.Tasks_get`. Do not install
+or vendor VMware modules. That prerequisite supplies the VMware OpenAPI
+connection types used by the public API.
 
 ## Public commands
 

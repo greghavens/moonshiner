@@ -24,4 +24,4 @@ def collect_vm_snapshot_inventory(
 ) -> dict[str, Any]:
     """Collect every snapshot page and return the stable inventory report."""
 
-    raise NotImplementedError("implement the contract-pinned inventory collection")
+    raise NotImplementedError("implement the focused inventory collection")

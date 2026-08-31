@@ -60,10 +60,11 @@ func TestListClustersConsumesEveryPageAndStabilizesOrder(t *testing.T) {
 			}
 
 			scenario := contractmock.Scenario{
-				Namespace: namespace,
-				SessionID: sessionID,
-				PageLimit: 2,
-				Pages:     pages,
+				Namespace:       namespace,
+				SessionID:       sessionID,
+				KubernetesToken: "kubernetes-" + randomSuffix(t),
+				PageLimit:       2,
+				Pages:           pages,
 			}
 			server := newServer(t, scenario)
 			defer server.Close()
@@ -90,12 +91,43 @@ func TestListClustersConsumesEveryPageAndStabilizesOrder(t *testing.T) {
 	}
 }
 
+func TestLiveBlankDiscoveryStopsBeforeKubernetes(t *testing.T) {
+	scenario := contractmock.Scenario{
+		Namespace:       "vmsp-platform",
+		SessionID:       "8a1d0d1b3fe94ad0b05f3a8fcfd92ab5",
+		KubernetesToken: "distinct-kubernetes-bearer",
+		PageLimit:       200,
+		BlankDiscovery:  true,
+		Pages: []contractmock.Page{{Items: []contractmock.Resource{
+			{
+				Name:            "vcf-msr01",
+				UID:             "fcccd77e-e4fa-4ab8-a6a2-4dadf2b34212",
+				ResourceVersion: "2623515",
+			},
+		}}},
+	}
+	server := newServer(t, scenario)
+	defer server.Close()
+	client := newClient(t, server, scenario)
+	_, err := client.ListClusters(context.Background())
+	var protocolError *vksinventory.ProtocolError
+	if !errors.As(err, &protocolError) ||
+		protocolError.Operation != contractmock.OperationNamespaceList {
+		t.Fatalf("error = %#v, want live discovery ProtocolError", err)
+	}
+	requests := server.Requests()
+	if len(requests) != 1 || requests[0].Operation != contractmock.OperationNamespaceList {
+		t.Fatalf("live discovery failure requests = %#v", requests)
+	}
+}
+
 func TestNewClientValidationIsTableDriven(t *testing.T) {
 	valid := func() vksinventory.Config {
 		return vksinventory.Config{
 			VCenterURL:       "http://127.0.0.1:9443",
 			Namespace:        "tenant-a",
 			SessionID:        "session-a",
+			KubernetesToken:  "kubernetes-a",
 			KubernetesScheme: "http",
 			PageLimit:        2,
 			HTTPClient:       &http.Client{},
@@ -115,6 +147,8 @@ func TestNewClientValidationIsTableDriven(t *testing.T) {
 		{name: "blank namespace", mutate: func(c *vksinventory.Config) { c.Namespace = " \n" }},
 		{name: "blank session", mutate: func(c *vksinventory.Config) { c.SessionID = " \t" }},
 		{name: "unsafe session", mutate: func(c *vksinventory.Config) { c.SessionID = "session\r\nleak" }},
+		{name: "blank Kubernetes token", mutate: func(c *vksinventory.Config) { c.KubernetesToken = " \t" }},
+		{name: "unsafe Kubernetes token", mutate: func(c *vksinventory.Config) { c.KubernetesToken = "token\r\nleak" }},
 		{name: "uppercase Kubernetes scheme", mutate: func(c *vksinventory.Config) { c.KubernetesScheme = "HTTP" }},
 		{name: "zero page limit", mutate: func(c *vksinventory.Config) { c.PageLimit = 0 }},
 		{name: "negative page limit", mutate: func(c *vksinventory.Config) { c.PageLimit = -2 }},
@@ -204,8 +238,8 @@ func TestProtocolGuardsAreTableDriven(t *testing.T) {
 			if !errors.As(err, &protocolError) {
 				t.Fatalf("ListClusters error = %T %v, want *ProtocolError", err, err)
 			}
-			if strings.Contains(err.Error(), scenario.SessionID) {
-				t.Fatal("ProtocolError disclosed the session identifier")
+			if strings.Contains(err.Error(), scenario.SessionID) || strings.Contains(err.Error(), scenario.KubernetesToken) {
+				t.Fatal("ProtocolError disclosed a credential")
 			}
 		})
 	}
@@ -248,8 +282,8 @@ func TestHTTPFailuresAreTypedAndRedacted(t *testing.T) {
 			if apiError.Operation != tt.operation || apiError.StatusCode != tt.status {
 				t.Fatalf("APIError = %#v, want operation %q status %d", apiError, tt.operation, tt.status)
 			}
-			if strings.Contains(err.Error(), scenario.SessionID) {
-				t.Fatal("APIError disclosed response content or the session identifier")
+			if strings.Contains(err.Error(), scenario.SessionID) || strings.Contains(err.Error(), scenario.KubernetesToken) {
+				t.Fatal("APIError disclosed response content or a credential")
 			}
 			if got := len(server.Requests()); got != tt.requests {
 				t.Fatalf("request count = %d, want %d", got, tt.requests)
@@ -270,8 +304,8 @@ func TestCancellationRemainsDiscoverableWithoutTraffic(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("ListClusters error = %v, want errors.Is(context.Canceled)", err)
 	}
-	if strings.Contains(err.Error(), scenario.SessionID) {
-		t.Fatal("cancellation error disclosed the session identifier")
+	if strings.Contains(err.Error(), scenario.SessionID) || strings.Contains(err.Error(), scenario.KubernetesToken) {
+		t.Fatal("cancellation error disclosed a credential")
 	}
 	if got := len(server.Requests()); got != 0 {
 		t.Fatalf("canceled call made %d requests, want 0", got)
@@ -348,7 +382,7 @@ func assertExactTranscript(t *testing.T, got []contractmock.Request, scenario co
 			t.Errorf("page %d raw target = %q, want %q", pageIndex, request.RawTarget, wantTarget)
 		}
 		assertOnlyValue(t, request.Header, "Accept", "application/json")
-		assertOnlyValue(t, request.Header, "Authorization", "Bearer "+scenario.SessionID)
+		assertOnlyValue(t, request.Header, "Authorization", "Bearer "+scenario.KubernetesToken)
 		assertAbsent(t, request.Header, "vmware-api-session-id")
 		assertAbsent(t, request.Header, "Content-Type")
 	}
@@ -395,6 +429,7 @@ func newClient(t *testing.T, server *contractmock.Server, scenario contractmock.
 		VCenterURL:       server.URL(),
 		Namespace:        scenario.Namespace,
 		SessionID:        scenario.SessionID,
+		KubernetesToken:  scenario.KubernetesToken,
 		KubernetesScheme: "http",
 		PageLimit:        scenario.PageLimit,
 		HTTPClient:       server.Client(),
@@ -409,9 +444,10 @@ func basicScenario(t *testing.T) contractmock.Scenario {
 	t.Helper()
 	suffix := randomSuffix(t)
 	return contractmock.Scenario{
-		Namespace: "tenant /+雪-" + suffix,
-		SessionID: "session-" + randomSuffix(t),
-		PageLimit: 2,
+		Namespace:       "tenant /+雪-" + suffix,
+		SessionID:       "session-" + randomSuffix(t),
+		KubernetesToken: "kubernetes-" + randomSuffix(t),
+		PageLimit:       2,
 		Pages: []contractmock.Page{{
 			Items: []contractmock.Resource{resource("alpha", suffix)},
 		}},

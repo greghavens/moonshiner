@@ -20,7 +20,7 @@ PROTECTED_HASHES = {
     "docs/contract.json": "3d9fde11a8d735f418021814a04147c8cde9fbd33ccd50356486c7ea8cf373ff",
     "docs/official_sources.json": "f1604d5fbf475fb6b6cab78bf42350969763ad9fecbae4faa0aa0527b79fd5d0",
     "tests/TestMain.java": "ba41691c08dd12f1046733489eb44aa7e37d2f1d6a7c6971ad93129d184e4bfb",
-    "tests/mock_server.py": "5d3d6b4d5221c29b74e15ed13762e5cf15f5d26412b23775befc0fc9d20f7eae",
+    "tests/mock_server.py": "45521d3371e0b5c80e142ae332170663e9935d1e099399f4c2c0d8494b820263",
 }
 OPTIONAL_FILTERS = {
     "type",
@@ -124,7 +124,7 @@ def check_wire_log(log_path: Path, server_info: dict) -> None:
         for line in log_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    expected_pages = [0, 1, 2, 0, 1, 2]
+    expected_pages = [1, 2, 3, 1, 2, 3]
     if len(entries) != len(expected_pages):
         fail(f"expected two complete traversals, got {len(entries)} requests")
     if [entry["sequence"] for entry in entries] != list(range(1, 7)):

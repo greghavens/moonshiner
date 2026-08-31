@@ -299,6 +299,41 @@ func TestCurrentGenerationUnauthorizedIsTerminal(t *testing.T) {
 	}
 }
 
+func TestLiveNamespaceNotFoundStopsBeforeKubernetes(t *testing.T) {
+	namespace := "vmsp-platform"
+	server, err := contractmock.New(contractPath, contractmock.Fixture{
+		Namespace:  namespace,
+		Supervisor: "supervisor-42",
+		Clusters: []contractmock.Cluster{
+			{Name: "vcf-msr01", UID: "fcccd77e-e4fa-4ab8-a6a2-4dadf2b34212", ResourceVersion: "2623515"},
+		},
+		OldAuth: oldAuth,
+		NewAuth: newAuth,
+		ForcedStatus: map[string]int{
+			vksrotate.OperationGetSupervisorNamespace: http.StatusNotFound,
+		},
+		ForcedBody: map[string]string{
+			vksrotate.OperationGetSupervisorNamespace: `{"error_type":"NOT_FOUND","messages":[{"args":[],"default_message":"Namespace was not found.","id":"vcenter.wcp.workload.notfound"}]}`,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(server.Close)
+	client := newClient(t, server)
+	_, err = client.Inspect(context.Background(), namespace)
+	var apiError *vksrotate.APIError
+	if !errors.As(err, &apiError) ||
+		apiError.Operation != vksrotate.OperationGetSupervisorNamespace ||
+		apiError.StatusCode != http.StatusNotFound {
+		t.Fatalf("error = %#v, want live namespace 404", err)
+	}
+	requests := server.Requests()
+	if len(requests) != 1 || requests[0].Operation != vksrotate.OperationGetSupervisorNamespace {
+		t.Fatalf("namespace 404 requests = %#v", requests)
+	}
+}
+
 func TestValidationAndInvalidRotationPerformNoIO(t *testing.T) {
 	t.Parallel()
 

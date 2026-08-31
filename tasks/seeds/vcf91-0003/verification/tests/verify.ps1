@@ -119,9 +119,9 @@ Assert-True 'module source exists' (
 
 # Fail closed if an agent changes any protected fixture it was told not to edit.
 $protectedHashes = @{
-    $contractPath = 'f1075a21916bae66b509e18e6855709e0bc580cfe50eba51f6c791e1e54e94b8'
+    $contractPath = '81d9ccba6721d48560e7c2b994aa911fd94bac6a443175f597a01750b2a7dfdc'
     $sourcesPath = 'd7a4af0fb2c68da83ff2294e2a51986b0b79a9d320c585d7a168851ce93ea733'
-    $mockPath = 'c5c826c58652253c179d0d9183b043419f3f29da4a84d8164991fb392e836641'
+    $mockPath = '9d517614926559d6b3337c9ccb28101cc96ff1df23d6fae9be034435c13782ed'
     $moduleManifest = 'c9b7b92546e712d6c92a95d2239c9182d40e35708a3b82a3fd586d6ba58794a4'
     $gitignorePath = '2eab86595eefa9c93d8c44f171b67960bd1fdffe1a31613167fac1908a0708ae'
 }

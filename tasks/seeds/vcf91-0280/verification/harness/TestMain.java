@@ -2,7 +2,8 @@ import java.nio.file.Path;
 
 /**
  * Drives {@link OpsAdapterClient} against {@link MockOpsServer} and prints one machine-readable
- * line per scenario.
+ * line per scenario. The mock reproduces the deployed precheck's credential-persistence side
+ * effect, so a correct client must reuse the returned credential identifier on create.
  *
  * <p>Usage: {@code java TestMain <contract.json> <request-log.jsonl>}
  *
@@ -39,7 +40,7 @@ public final class TestMain {
             run(mock, "precheck_blocks_mutation", () -> client.onboard(
                     OpsAdapterClient.AdapterInstanceSpec.builder("Lab VC Adapter Instance", "VMWARE")
                             .description("A vCenter Adapter Instance")
-                            .credential(principalCredential())
+                            .credential(principalCredential("Unreachable Principal Credential"))
                             .addResourceIdentifier("AUTODISCOVERY", "true")
                             .addResourceIdentifier("VCURL", "vcenter-down.lab.local")
                             .build()));
@@ -47,8 +48,14 @@ public final class TestMain {
             run(mock, "identifier_defaults_requested",
                     () -> client.onboard(reachableSpec("Edge VC Adapter Instance"), true));
 
-            run(mock, "create_rejected",
-                    () -> client.onboard(reachableSpec("Duplicate VC Adapter Instance")));
+            run(mock, "create_rejected", () -> client.onboard(
+                    OpsAdapterClient.AdapterInstanceSpec.builder(
+                                    "Incomplete VC Adapter Instance", "VMWARE")
+                            .description("A vCenter Adapter Instance")
+                            .credential(principalCredential("Incomplete VC Adapter Credential"))
+                            .addResourceIdentifier("AUTODISCOVERY", "true")
+                            .addResourceIdentifier("VCURL", "vcenter-a.lab.local")
+                            .build()));
         }
     }
 
@@ -60,15 +67,15 @@ public final class TestMain {
                 .physicalDatacenterId("22222222-2222-2222-2222-222222222222")
                 .monitoringInterval(0)
                 .monitoringIntervalSeconds(300)
-                .credential(principalCredential())
+                .credential(principalCredential(name + " Credential"))
                 .addResourceIdentifier("AUTODISCOVERY", "true")
                 .addResourceIdentifier("PROCESSCHANGEEVENTS", "true")
                 .addResourceIdentifier("VCURL", "vcenter-a.lab.local")
                 .build();
     }
 
-    private static OpsAdapterClient.Credential principalCredential() {
-        return OpsAdapterClient.Credential.builder("Principal Credential", "VMWARE", "PRINCIPALCREDENTIAL")
+    private static OpsAdapterClient.Credential principalCredential(String name) {
+        return OpsAdapterClient.Credential.builder(name, "VMWARE", "PRINCIPALCREDENTIAL")
                 .addField("USER", "svc-vcfops@lab.local")
                 .addField("PASSWORD", "s3cr3t")
                 .build();

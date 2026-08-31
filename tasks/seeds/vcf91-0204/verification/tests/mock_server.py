@@ -207,25 +207,25 @@ class ContractHandler(BaseHTTPRequestHandler):
         if query["pageSize"][0] != str(state.page_size):
             return 400, error_body("WIRE_SHAPE", "pageSize changed")
 
-        page_number = 0
+        page_number = 1
         if "pageNumber" in query:
             try:
                 page_number = int(query["pageNumber"][0])
             except ValueError:
                 return 400, error_body("WIRE_SHAPE", "pageNumber is not an integer")
-        expected_page = len(state.successful_pages)
+        expected_page = len(state.successful_pages) + 1
         if page_number != expected_page:
             return 409, error_body("WORK_REPLAY", "page sequence changed")
         expected_target = (
             f"pageSize={state.page_size}"
-            if page_number == 0
+            if page_number == 1
             else f"pageNumber={page_number}&pageSize={state.page_size}"
         )
         if raw_query != expected_target:
             return 400, error_body("WIRE_SHAPE", "query order or encoding changed")
 
         authorization = self.headers.get("Authorization")
-        if page_number == 1 and not state.expiry_sent:
+        if page_number == 2 and not state.expiry_sent:
             state.expiry_sent = True
             if authorization != f"Bearer {state.old_token}":
                 return 403, error_body(
@@ -236,10 +236,10 @@ class ContractHandler(BaseHTTPRequestHandler):
         expected_token = state.new_token if state.refreshed else state.old_token
         if authorization != f"Bearer {expected_token}":
             return 403, error_body("AUTHORIZATION", "unexpected access token")
-        if page_number >= state.total_pages:
+        if page_number > state.total_pages:
             return 400, error_body("PAGE_RANGE", "page is out of range")
 
-        start = page_number * state.page_size
+        start = (page_number - 1) * state.page_size
         elements = list(state.tasks[start : start + state.page_size])
         if page_number % 2 == 0:
             elements.reverse()
@@ -260,8 +260,8 @@ class ContractHandler(BaseHTTPRequestHandler):
             return 400, error_body("WIRE_SHAPE", "refresh query must be absent")
         if not state.expiry_sent or state.refreshed:
             return 409, error_body("REFRESH_SEQUENCE", "refresh is out of sequence")
-        if self.headers.get("Authorization") != f"Bearer {state.old_token}":
-            return 403, error_body("AUTHORIZATION", "refresh used the wrong token")
+        if self.headers.get("Authorization") is not None:
+            return 403, error_body("AUTHORIZATION", "refresh must be unauthenticated")
         media_type = self.headers.get("Content-Type", "").split(";", 1)[0]
         if media_type.strip().casefold() != "application/json":
             return 415, error_body("MEDIA_TYPE", "refresh must be JSON")

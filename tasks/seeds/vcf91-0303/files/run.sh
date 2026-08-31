@@ -1,5 +1,5 @@
 #!/bin/sh
-# Compile the client together with the harness and drive it against the loopback mock.
+# Runs the task's checks.
 # Artifacts land in out/ for the verifier to read.
 set -eu
 

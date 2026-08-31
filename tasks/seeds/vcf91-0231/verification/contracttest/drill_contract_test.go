@@ -51,7 +51,7 @@ func TestRestoreDrillContract(t *testing.T) {
 			name: "every optional value supplied",
 			plan: map[string]any{
 				"scope":                "FLEET",
-				"correlationId":        "drill-2026-02-11",
+				"correlationId":        "dbf7816d-28f6-42a3-9262-491e435d52e8",
 				"encryptionPassphrase": "cor-rect-horse",
 				"components": []any{
 					map[string]any{
@@ -132,9 +132,9 @@ func TestRestoreDrillContract(t *testing.T) {
 					"encryptionPassphrase": "cor-rect-horse"
 				}`)
 				for _, action := range actions {
-					if got := action.Header.Get("X-Correlation-Id"); got != "drill-2026-02-11" {
+					if got := action.Header.Get("X-Correlation-Id"); got != "dbf7816d-28f6-42a3-9262-491e435d52e8" {
 						t.Errorf("request %d X-Correlation-Id is %q, want %q",
-							action.Seq, got, "drill-2026-02-11")
+							action.Seq, got, "dbf7816d-28f6-42a3-9262-491e435d52e8")
 					}
 				}
 				// Only backupRestoreComponentsAction declares the header.
@@ -428,6 +428,15 @@ func TestRestoreDrillContract(t *testing.T) {
 					"periodEnd":   "2026-02-11T00:00:00Z",
 				})
 			},
+		},
+		{
+			name: "a non-UUID correlation id is rejected before any request",
+			plan: map[string]any{
+				"correlationId": "not-a-uuid",
+				"components": []any{map[string]any{"componentType": "vidb"}},
+			},
+			mock:    mocklcm.Options{PollsBeforeTerminal: 2},
+			wantErr: "bare UUID",
 		},
 		{
 			name: "a component with no matching backup makes the run impossible",

@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	wantCommit = "c3f3b52c845dd967cabbc21680e893292077d5ba"
-	wantSpec   = "specifications/vcf-installer/vcf-installer-openapi.json"
+	wantCommit = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
+	wantSpec   = "specifications/sddc-manager/sddc-manager-openapi.json"
 )
 
 func repositoryRoot(t *testing.T) string {
@@ -96,13 +96,13 @@ func TestOfficialSourceRecordsEveryContractOperation(t *testing.T) {
 	if len(contract.Operations) != 1 || len(official.Operations) != 1 || len(official.OperationIDs) != 1 {
 		t.Fatalf("operation counts contract=%d official=%d ids=%d, want one", len(contract.Operations), len(official.Operations), len(official.OperationIDs))
 	}
-	wantID, wantMethod, wantPath := "deleteDepotSettings", http.MethodDelete, "/v1/system/settings/depot"
+	wantID, wantMethod, wantPath := "deleteServiceConfigByKey", http.MethodDelete, "/v1/services-config/{serviceKey}"
 	got := contract.Operations[0]
 	if got.OperationID != wantID || got.Method != wantMethod || got.Path != wantPath {
 		t.Fatalf("contract operation = %+v", got)
 	}
-	if len(got.Parameters) != 1 || got.Parameters[0].Name != "depotType" || got.Parameters[0].In != "query" || got.Parameters[0].Required || got.Parameters[0].Schema.Type != "string" {
-		t.Fatalf("depotType projection = %+v", got.Parameters)
+	if len(got.Parameters) != 1 || got.Parameters[0].Name != "serviceKey" || got.Parameters[0].In != "path" || !got.Parameters[0].Required || got.Parameters[0].Schema.Type != "string" {
+		t.Fatalf("serviceKey projection = %+v", got.Parameters)
 	}
 	if len(got.Responses) != 3 || got.Responses["204"].Description != "No Content" || got.Responses["400"].Description != "Bad Request" || got.Responses["500"].Description != "Internal Server Error" {
 		t.Fatalf("response projection = %+v", got.Responses)
@@ -120,7 +120,7 @@ func TestAmbiguousDeleteRetriesWithoutDuplicatingEffect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	if err := client.DeleteDepotSettings(context.Background(), vcfinstaller.DeleteOptions{MaxAttempts: 2}); err != nil {
+	if err := client.DeleteDepotSettings(context.Background(), vcfinstaller.DeleteOptions{ServiceKey: "vcf-depot-key", MaxAttempts: 2}); err != nil {
 		t.Fatalf("DeleteDepotSettings: %v", err)
 	}
 
@@ -132,11 +132,11 @@ func TestAmbiguousDeleteRetriesWithoutDuplicatingEffect(t *testing.T) {
 		t.Fatalf("semantic delete effects = %d, want exactly one", effects)
 	}
 	for index, request := range requests {
-		if request.OperationID != "deleteDepotSettings" || request.Method != http.MethodDelete {
+		if request.OperationID != "deleteServiceConfigByKey" || request.Method != http.MethodDelete {
 			t.Fatalf("attempt %d = %v", index+1, request)
 		}
-		if request.RawTarget != "/v1/system/settings/depot" {
-			t.Fatalf("attempt %d raw target = %q; unset depotType must not produce an empty query or bare ?", index+1, request.RawTarget)
+		if request.RawTarget != "/v1/services-config/vcf-depot-key" {
+			t.Fatalf("attempt %d raw target = %q; service key must be one path segment without a query", index+1, request.RawTarget)
 		}
 		assertSingleHeader(t, request.Header, "Authorization", "Bearer "+token)
 		assertSingleHeader(t, request.Header, "Accept", "application/json")
@@ -153,19 +153,14 @@ func TestAmbiguousDeleteRetriesWithoutDuplicatingEffect(t *testing.T) {
 	}
 }
 
-func TestDepotTypeOptionalWireTable(t *testing.T) {
-	empty := ""
-	vcfDepot := "VCF_DEPOT"
-	special := "VCF DEPOT/primary"
+func TestServiceKeyWireTable(t *testing.T) {
 	tests := []struct {
-		name      string
-		depotType *string
-		want      string
+		name       string
+		serviceKey string
+		want       string
 	}{
-		{name: "unset is omitted", depotType: nil, want: "/v1/system/settings/depot"},
-		{name: "explicit empty remains present", depotType: &empty, want: "/v1/system/settings/depot?depotType="},
-		{name: "named depot", depotType: &vcfDepot, want: "/v1/system/settings/depot?depotType=VCF_DEPOT"},
-		{name: "query escaping", depotType: &special, want: "/v1/system/settings/depot?depotType=VCF+DEPOT%2Fprimary"},
+		{name: "plain key", serviceKey: "vcf-depot-key", want: "/v1/services-config/vcf-depot-key"},
+		{name: "path escaping", serviceKey: "VCF DEPOT/primary", want: "/v1/services-config/VCF%20DEPOT%2Fprimary"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -174,7 +169,7 @@ func TestDepotTypeOptionalWireTable(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := client.DeleteDepotSettings(context.Background(), vcfinstaller.DeleteOptions{DepotType: test.depotType, MaxAttempts: 1}); err != nil {
+			if err := client.DeleteDepotSettings(context.Background(), vcfinstaller.DeleteOptions{ServiceKey: test.serviceKey, MaxAttempts: 1}); err != nil {
 				t.Fatalf("DeleteDepotSettings: %v", err)
 			}
 			requests := server.Requests()
@@ -220,7 +215,7 @@ func TestStatusRetryTable(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = client.DeleteDepotSettings(context.Background(), vcfinstaller.DeleteOptions{MaxAttempts: test.maxAttempts})
+			err = client.DeleteDepotSettings(context.Background(), vcfinstaller.DeleteOptions{ServiceKey: "vcf-depot-key", MaxAttempts: test.maxAttempts})
 			if got := calls.Load(); got != test.wantCalls {
 				t.Fatalf("calls = %d, want %d", got, test.wantCalls)
 			}
@@ -229,7 +224,7 @@ func TestStatusRetryTable(t *testing.T) {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
-			} else if !errors.As(err, &api) || api.OperationID != "deleteDepotSettings" || api.StatusCode != test.wantStatus || api.Attempts != test.wantAttempts {
+			} else if !errors.As(err, &api) || api.OperationID != "deleteServiceConfigByKey" || api.StatusCode != test.wantStatus || api.Attempts != test.wantAttempts {
 				t.Fatalf("error = %T %v, want APIError status=%d attempts=%d", err, err, test.wantStatus, test.wantAttempts)
 			}
 			for index, body := range bodies {
@@ -256,9 +251,9 @@ func TestRedirectIsFinalAndDoesNotBroadenDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = client.DeleteDepotSettings(context.Background(), vcfinstaller.DeleteOptions{MaxAttempts: 2})
+	err = client.DeleteDepotSettings(context.Background(), vcfinstaller.DeleteOptions{ServiceKey: "vcf-depot-key", MaxAttempts: 2})
 	var api *vcfinstaller.APIError
-	if !errors.As(err, &api) || api.OperationID != "deleteDepotSettings" || api.StatusCode != http.StatusTemporaryRedirect || api.Attempts != 1 {
+	if !errors.As(err, &api) || api.OperationID != "deleteServiceConfigByKey" || api.StatusCode != http.StatusTemporaryRedirect || api.Attempts != 1 {
 		t.Fatalf("error = %T %v, want final APIError status=%d attempts=1", err, err, http.StatusTemporaryRedirect)
 	}
 	if got := calls.Load(); got != 1 {
@@ -284,7 +279,7 @@ func TestResponseBodiesAreClosedOnRetryAndSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := client.DeleteDepotSettings(context.Background(), vcfinstaller.DeleteOptions{MaxAttempts: 2}); err != nil {
+	if err := client.DeleteDepotSettings(context.Background(), vcfinstaller.DeleteOptions{ServiceKey: "vcf-depot-key", MaxAttempts: 2}); err != nil {
 		t.Fatalf("DeleteDepotSettings: %v", err)
 	}
 	if len(bodies) != 2 {
@@ -310,9 +305,9 @@ func TestTransportFailureRetryAndSecretSafety(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = client.DeleteDepotSettings(context.Background(), vcfinstaller.DeleteOptions{MaxAttempts: 3})
+	err = client.DeleteDepotSettings(context.Background(), vcfinstaller.DeleteOptions{ServiceKey: "vcf-depot-key", MaxAttempts: 3})
 	var transportError *vcfinstaller.TransportError
-	if !errors.As(err, &transportError) || transportError.OperationID != "deleteDepotSettings" || transportError.Attempts != 3 {
+	if !errors.As(err, &transportError) || transportError.OperationID != "deleteServiceConfigByKey" || transportError.Attempts != 3 {
 		t.Fatalf("error = %T %v, want TransportError after three attempts", err, err)
 	}
 	if calls.Load() != 3 {
@@ -343,7 +338,7 @@ func TestContextCancellationInterruptsRetryDelay(t *testing.T) {
 	defer cancel()
 	result := make(chan error, 1)
 	go func() {
-		result <- client.DeleteDepotSettings(ctx, vcfinstaller.DeleteOptions{MaxAttempts: 5, RetryDelay: time.Hour})
+		result <- client.DeleteDepotSettings(ctx, vcfinstaller.DeleteOptions{ServiceKey: "vcf-depot-key", MaxAttempts: 5, RetryDelay: time.Hour})
 	}()
 	select {
 	case <-firstAttempt:
@@ -376,7 +371,7 @@ func TestExpiredContextPreservesDeadlineWithoutSending(t *testing.T) {
 	}
 	ctx, cancel := context.WithDeadline(context.Background(), time.Unix(1, 0))
 	defer cancel()
-	err = client.DeleteDepotSettings(ctx, vcfinstaller.DeleteOptions{MaxAttempts: 1})
+	err = client.DeleteDepotSettings(ctx, vcfinstaller.DeleteOptions{ServiceKey: "vcf-depot-key", MaxAttempts: 1})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %T %v, want context.DeadlineExceeded", err, err)
 	}
@@ -437,11 +432,14 @@ func TestArgumentErrorsDoNotSendRequests(t *testing.T) {
 		ctx     context.Context
 		options vcfinstaller.DeleteOptions
 	}{
-		{name: "nil context", ctx: nil, options: vcfinstaller.DeleteOptions{MaxAttempts: 1}},
-		{name: "negative attempts", ctx: context.Background(), options: vcfinstaller.DeleteOptions{MaxAttempts: -1}},
+		{name: "nil context", ctx: nil, options: vcfinstaller.DeleteOptions{ServiceKey: "vcf-depot-key", MaxAttempts: 1}},
+		{name: "negative attempts", ctx: context.Background(), options: vcfinstaller.DeleteOptions{ServiceKey: "vcf-depot-key", MaxAttempts: -1}},
 		{name: "zero attempts", ctx: context.Background(), options: vcfinstaller.DeleteOptions{}},
-		{name: "too many attempts", ctx: context.Background(), options: vcfinstaller.DeleteOptions{MaxAttempts: 6}},
-		{name: "negative delay", ctx: context.Background(), options: vcfinstaller.DeleteOptions{MaxAttempts: 1, RetryDelay: -time.Nanosecond}},
+		{name: "too many attempts", ctx: context.Background(), options: vcfinstaller.DeleteOptions{ServiceKey: "vcf-depot-key", MaxAttempts: 6}},
+		{name: "negative delay", ctx: context.Background(), options: vcfinstaller.DeleteOptions{ServiceKey: "vcf-depot-key", MaxAttempts: 1, RetryDelay: -time.Nanosecond}},
+		{name: "empty service key", ctx: context.Background(), options: vcfinstaller.DeleteOptions{MaxAttempts: 1}},
+		{name: "blank service key", ctx: context.Background(), options: vcfinstaller.DeleteOptions{ServiceKey: " ", MaxAttempts: 1}},
+		{name: "untrimmed service key", ctx: context.Background(), options: vcfinstaller.DeleteOptions{ServiceKey: " key ", MaxAttempts: 1}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

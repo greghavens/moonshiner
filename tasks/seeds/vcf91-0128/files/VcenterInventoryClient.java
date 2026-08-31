@@ -35,6 +35,8 @@ public final class VcenterInventoryClient {
     private final URI origin;
     private final String subjectToken;
     private final String subjectTokenType;
+    private final String audience;
+    private final String requestedTokenType;
     private final Duration requestTimeout;
     private final HttpClient httpClient;
     private String accessToken;
@@ -67,8 +69,11 @@ public final class VcenterInventoryClient {
             String accessToken,
             String subjectToken,
             String subjectTokenType,
+            String audience,
+            String requestedTokenType,
             Duration requestTimeout) {
-        this(origin, accessToken, subjectToken, subjectTokenType, requestTimeout, null);
+        this(origin, accessToken, subjectToken, subjectTokenType,
+                audience, requestedTokenType, requestTimeout, null);
     }
 
     VcenterInventoryClient(
@@ -76,12 +81,17 @@ public final class VcenterInventoryClient {
             String accessToken,
             String subjectToken,
             String subjectTokenType,
+            String audience,
+            String requestedTokenType,
             Duration requestTimeout,
             HttpClient testHttpClient) {
         this.origin = requireOrigin(origin);
         this.accessToken = requireCredential(accessToken, "accessToken");
         this.subjectToken = requireCredential(subjectToken, "subjectToken");
         this.subjectTokenType = requireCredential(subjectTokenType, "subjectTokenType");
+        this.audience = requireCredential(audience, "audience");
+        this.requestedTokenType = requireCredential(
+                requestedTokenType, "requestedTokenType");
         if (requestTimeout == null || requestTimeout.isZero() || requestTimeout.isNegative()) {
             throw new IllegalArgumentException("requestTimeout must be positive");
         }
@@ -130,7 +140,7 @@ public final class VcenterInventoryClient {
                     name,
                     powerState,
                     optionalLong(object, "cpu_count", "VM summary"),
-                    optionalLong(object, "memory_size_mib", "VM summary")));
+                    optionalLong(object, "memory_size_MiB", "VM summary")));
         }
         return result;
     }
@@ -182,6 +192,8 @@ public final class VcenterInventoryClient {
 
     private void issueAccessToken() throws IOException, InterruptedException {
         String form = "grant_type=" + formEncode(TOKEN_EXCHANGE_GRANT)
+                + "&audience=" + formEncode(audience)
+                + "&requested_token_type=" + formEncode(requestedTokenType)
                 + "&subject_token=" + formEncode(subjectToken)
                 + "&subject_token_type=" + formEncode(subjectTokenType);
         HttpRequest request = HttpRequest.newBuilder(

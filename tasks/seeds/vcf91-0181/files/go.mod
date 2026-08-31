@@ -1,3 +1,3 @@
-module moonshiner/vcf91-0181
+module vcflogtask
 
 go 1.22

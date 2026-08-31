@@ -24,9 +24,11 @@ declared in the starter. The implementation must:
    derived contract.
 2. Send `setConfig` to the caller-provided base URI with JSON and bearer
    authentication.
-3. Omit every unset optional property. In particular, do not serialize nulls,
-   empty strings, or placeholder objects for `vspCluster`, `vcenter`, Fleet LCM
-   `username`, `password`, or `opsToken`.
+3. Include `vspCluster` from the supplied platform, instance, optional Fleet,
+   and SSL-thumbprint parameters. Omit every unset optional property. In
+   particular, do not serialize nulls, empty strings, or placeholder objects
+   for `vcenter`, optional `vspCluster.fleetFqdn`, or Fleet LCM `username`,
+   `password`, or `opsToken`.
 4. Read the task `id` from the accepted response and call `getTask` repeatedly.
    `PENDING`, `SCHEDULED`, and `RUNNING` are nonterminal. Return the terminal
    Task object only when its status is `SUCCEEDED`; throw for `FAILED`,

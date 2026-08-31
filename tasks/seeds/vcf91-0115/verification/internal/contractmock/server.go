@@ -40,7 +40,7 @@ type VM struct {
 	Name          string `json:"name"`
 	PowerState    string `json:"power_state"`
 	CPUCount      *int64 `json:"cpu_count,omitempty"`
-	MemorySizeMiB *int64 `json:"memory_size_mib,omitempty"`
+	MemorySizeMiB *int64 `json:"memory_size_MiB,omitempty"`
 }
 
 // Scenario configures one deterministic mock.

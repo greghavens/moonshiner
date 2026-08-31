@@ -37,12 +37,12 @@ public class TestMain {
 
     static final String TOKEN = "3d7b1f90-8a4c-4e62-9b15-77c0a2e6d418::e5f1";
     static final String AUTH_HEADER_VALUE = "OpsToken " + TOKEN;
-    static final String SYMPTOM_ID = "6f2b6a2c-9c31-4b0e-b0a3-3f6a1e2d7c40";
-    static final String ALERT_ID = "b4e7c1a8-2d55-4f19-8a6c-9e0b3d7f5a21";
+    static final String SYMPTOM_ID = "SymptomDefinition-6f2b6a2c-9c31-4b0e-b0a3-3f6a1e2d7c40";
+    static final String ALERT_ID = "AlertDefinition-b4e7c1a8-2d55-4f19-8a6c-9e0b3d7f5a21";
     static final String RULE_ID = "81a93f76-71de-4f25-b9d0-e8a70b1334cc";
     static final String RULE_FAILURE_MESSAGE =
-            "Notification plugin instance f0e4b9c2-6b3f-4a51-9e77-2c1d5a8b0e33 is not configured on this node";
-    static final int RULE_FAILURE_API_CODE = 1412;
+            "No such Notification Plugin - f0e4b9c2-6b3f-4a51-9e77-2c1d5a8b0e33.";
+    static final int RULE_FAILURE_API_CODE = 404;
 
     static final String[] OPERATION_IDS = {
             "acquireToken", "createSymptomDefinition", "createAlertDefinition",
@@ -238,8 +238,8 @@ public class TestMain {
 
         // Optionals the change request leaves unset must not appear at all.
         expectAbsent(body1, "acquireToken body", "authSource");
-        expectAbsent(body2, "createSymptomDefinition body", "id", "cancelCycles", "realtimeMonitoringEnabled");
-        expectAbsent(body3, "createAlertDefinition body", "id", "type", "subType", "forVCDTenants");
+        expectAbsent(body2, "createSymptomDefinition body", "id", "realtimeMonitoringEnabled");
+        expectAbsent(body3, "createAlertDefinition body", "id", "forVCDTenants");
         expectAbsent(body4, "createNotificationPluginRule body",
                 "id", "templateId", "enabled", "sendHeartbeat", "resourceFilter", "resourceKindFilter");
 
@@ -248,7 +248,8 @@ public class TestMain {
 
         expectEqualJson("createSymptomDefinition body",
                 "{\"name\":\"Datastore write latency above 25 ms\","
-                        + "\"adapterKindKey\":\"VMWARE\",\"resourceKindKey\":\"Datastore\",\"waitCycles\":3,"
+                        + "\"adapterKindKey\":\"VMWARE\",\"resourceKindKey\":\"Datastore\","
+                        + "\"waitCycles\":3,\"cancelCycles\":3,"
                         + "\"state\":{\"severity\":\"WARNING\",\"condition\":{\"type\":\"CONDITION_HT\","
                         + "\"key\":\"storage|totalWriteLatency_average\",\"operator\":\"GT\","
                         + "\"valueType\":\"NUMERIC\",\"thresholdType\":\"STATIC\",\"instanced\":false,"
@@ -258,7 +259,7 @@ public class TestMain {
                 "{\"name\":\"Datastore write latency degradation\","
                         + "\"description\":\"Raised when datastore write latency stays above 25 ms.\","
                         + "\"adapterKindKey\":\"VMWARE\",\"resourceKindKey\":\"Datastore\","
-                        + "\"waitCycles\":1,\"cancelCycles\":1,"
+                        + "\"waitCycles\":1,\"cancelCycles\":1,\"type\":18,\"subType\":20,"
                         + "\"states\":[{\"severity\":\"WARNING\","
                         + "\"impact\":{\"impactType\":\"BADGE\",\"detail\":\"health\"},"
                         + "\"base-symptom-set\":{\"type\":\"SYMPTOM_SET\",\"relation\":\"SELF\","
@@ -273,8 +274,11 @@ public class TestMain {
 
         // Integer-typed properties travel as JSON integers, not as 3.0.
         expectJsonInteger(body2, "createSymptomDefinition body", "waitCycles");
+        expectJsonInteger(body2, "createSymptomDefinition body", "cancelCycles");
         expectJsonInteger(body3, "createAlertDefinition body", "waitCycles");
         expectJsonInteger(body3, "createAlertDefinition body", "cancelCycles");
+        expectJsonInteger(body3, "createAlertDefinition body", "type");
+        expectJsonInteger(body3, "createAlertDefinition body", "subType");
     }
 
     static void verifyAttemptSequence(List<Map<String, Object>> log, int expectedCount, String label) {
@@ -339,7 +343,7 @@ public class TestMain {
                 {"acquireToken", "SUCCEEDED", 200L, null},
                 {"createSymptomDefinition", "SUCCEEDED", 201L, SYMPTOM_ID},
                 {"createAlertDefinition", "SUCCEEDED", 201L, ALERT_ID},
-                {"createNotificationPluginRule", "FAILED", 422L, null},
+                {"createNotificationPluginRule", "FAILED", 404L, null},
         };
         for (int i = 0; i < want.length; i++) {
             String where = "report.steps[" + i + "]";
@@ -433,7 +437,7 @@ public class TestMain {
             boolean failed = i == failedIndex;
             expectEquals(where + ".operationId", OPERATION_IDS[i], step.get("operationId"));
             expectEquals(where + ".status", failed ? "FAILED" : "SUCCEEDED", step.get("status"));
-            long expectedHttpStatus = failed ? (i == 0 ? 401L : 422L) : SUCCESS_STATUSES[i];
+            long expectedHttpStatus = failed ? forcedFailureStatus(OPERATION_IDS[i]) : SUCCESS_STATUSES[i];
             expectNumberEquals(where + ".httpStatus", expectedHttpStatus, step.get("httpStatus"));
 
             String expectedResourceId = failed ? null : RESOURCE_IDS[i];
@@ -487,8 +491,28 @@ public class TestMain {
     }
 
     static String forcedFailureMessage(String operationId) {
-        return "createNotificationPluginRule".equals(operationId)
-                ? RULE_FAILURE_MESSAGE : "Forced rejection at " + operationId;
+        switch (operationId) {
+            case "acquireToken":
+                return "The provided username/password or token is not valid. Please try again.";
+            case "createSymptomDefinition":
+                return "Invalid request... #1 violations found.";
+            case "createAlertDefinition":
+                return "Value \"Invalid alert type, alertType: 0\" is invalid for request param.";
+            case "createNotificationPluginRule":
+                return RULE_FAILURE_MESSAGE;
+            default:
+                throw new IllegalArgumentException("unknown operationId " + operationId);
+        }
+    }
+
+    static long forcedFailureStatus(String operationId) {
+        switch (operationId) {
+            case "acquireToken": return 401L;
+            case "createSymptomDefinition": return 400L;
+            case "createAlertDefinition": return 400L;
+            case "createNotificationPluginRule": return 404L;
+            default: throw new IllegalArgumentException("unknown operationId " + operationId);
+        }
     }
 
     // ---------------------------------------------------------------- assertion helpers
@@ -778,29 +802,35 @@ public class TestMain {
             }
 
             if (operationId.equals(rejectedOperationId)) {
-                int status = "acquireToken".equals(operationId) ? 401 : 422;
-                Integer apiCode = "createNotificationPluginRule".equals(operationId)
-                        ? RULE_FAILURE_API_CODE : null;
-                return new Response(status, errorBody(status, forcedFailureMessage(operationId), apiCode));
+                int status = (int) forcedFailureStatus(operationId);
+                return new Response(status, forcedFailureBody(operationId));
             }
 
             switch (operationId) {
                 case "acquireToken": {
                     Map<String, Object> t = new LinkedHashMap<>();
                     t.put("token", TOKEN);
-                    t.put("validity", 1785000000000L);
-                    t.put("expiresAt", "Tuesday, August 4, 2026 6:00:00 PM UTC");
-                    t.put("roles", Arrays.asList("ContentAdmin"));
+                    t.put("validity", 1788105644852L);
+                    t.put("expiresAt", "Sunday, August 30, 2026 at 4:00:44 PM Coordinated Universal Time");
+                    t.put("roles", new ArrayList<>());
                     return new Response(200, Json.write(t));
                 }
                 case "createSymptomDefinition": {
                     Map<String, Object> created = new LinkedHashMap<>(body);
                     created.put("id", SYMPTOM_ID);
+                    Map<String, Object> state = asObject(created.get("state"), "symptom state");
+                    Map<String, Object> condition = asObject(state.get("condition"), "symptom condition");
+                    condition.put("value", "25.0");
                     return new Response(201, Json.write(created));
                 }
                 case "createAlertDefinition": {
                     Map<String, Object> created = new LinkedHashMap<>(body);
                     created.put("id", ALERT_ID);
+                    created.put("forVCDTenants", false);
+                    List<?> states = (List<?>) created.get("states");
+                    Map<String, Object> state = asObject(states.get(0), "alert state");
+                    Map<String, Object> set = asObject(state.get("base-symptom-set"), "base symptom set");
+                    set.put("alertConditions", new ArrayList<>());
                     return new Response(201, Json.write(created));
                 }
                 case "createNotificationPluginRule": {
@@ -819,11 +849,29 @@ public class TestMain {
 
         private String errorBody(int status, String message, Integer apiErrorCode) {
             Map<String, Object> err = new LinkedHashMap<>();
+            err.put("type", "Error");
             err.put("message", message);
             err.put("httpStatusCode", (long) status);
             if (apiErrorCode != null) {
                 err.put("apiErrorCode", (long) (int) apiErrorCode);
             }
+            return Json.write(err);
+        }
+
+        private String forcedFailureBody(String operationId) {
+            int status = (int) forcedFailureStatus(operationId);
+            Map<String, Object> err = new LinkedHashMap<>();
+            err.put("type", "Error");
+            err.put("message", forcedFailureMessage(operationId));
+            if ("createSymptomDefinition".equals(operationId)) {
+                Map<String, Object> failure = new LinkedHashMap<>();
+                failure.put("failureMessage", "Both waitCycles and cancelCycle must be null for type "
+                        + "CONDITION_LOG, and non-null for all other cases.");
+                failure.put("violationPath", "validSymptomDefinition");
+                err.put("validationFailures", List.of(failure));
+            }
+            err.put("httpStatusCode", (long) status);
+            err.put("apiErrorCode", (long) status);
             return Json.write(err);
         }
     }

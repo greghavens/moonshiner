@@ -282,7 +282,7 @@ func (s *Server) operationFor(method, path string) string {
 }
 
 func (s *Server) getDomains(w http.ResponseWriter, r *http.Request) {
-	if r.URL.RawQuery != "pageNumber=0&pageSize=100" || r.URL.ForceQuery {
+	if r.URL.RawQuery != "pageNumber=1&pageSize=100" || r.URL.ForceQuery {
 		writeJSON(w, http.StatusBadRequest, s.errorEnvelope("DOMAIN_QUERY"))
 		return
 	}
@@ -309,7 +309,7 @@ func (s *Server) getDomains(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
-	payload := pagePayload(elements)
+	payload := pagePayload(elements, 1)
 	if s.plan.MutateDomains != nil {
 		s.plan.MutateDomains(payload)
 	}
@@ -341,7 +341,7 @@ func (s *Server) getTasks(w http.ResponseWriter, r *http.Request) {
 	s.taskReplies++
 	s.mu.Unlock()
 
-	payload := pagePayload(elements)
+	payload := pagePayload(elements, 0)
 	if s.plan.MutateTasks != nil {
 		s.plan.MutateTasks(payload)
 	}
@@ -413,7 +413,7 @@ func (s *Server) record(request Request) {
 	s.requests = append(s.requests, request)
 }
 
-func pagePayload[T any](elements []T) map[string]any {
+func pagePayload[T any](elements []T, pageNumber int) map[string]any {
 	totalPages := 0
 	if len(elements) > 0 {
 		totalPages = 1
@@ -421,7 +421,7 @@ func pagePayload[T any](elements []T) map[string]any {
 	return map[string]any{
 		"elements": elements,
 		"pageMetadata": map[string]any{
-			"pageNumber":    0,
+			"pageNumber":    pageNumber,
 			"pageSize":      len(elements),
 			"totalElements": len(elements),
 			"totalPages":    totalPages,

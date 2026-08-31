@@ -167,11 +167,12 @@ func TestDiagnoseCorrelatesTaskEventsAndLogsWithExactWire(t *testing.T) {
 			},
 			{
 				Name: "logs/api/api.log",
-				Data: []byte(
-					evidenceLine(runtime.TaskID, runtime.ReferenceToken, "unrelated-event", "wrong resource event") +
-						evidenceLine(runtime.TaskID, "wrong-reference", runtime.EventID, "wrong reference") +
-						evidenceLine(runtime.TaskID, runtime.ReferenceToken, runtime.EventID, cause),
-				),
+				Data: []byte(evidenceLine(
+					runtime.TaskID,
+					runtime.ReferenceToken,
+					runtime.EventID,
+					cause,
+				)),
 			},
 		}
 		return plan
@@ -566,17 +567,17 @@ func TestTransportErrorDoesNotExposeItsCause(t *testing.T) {
 }
 
 func TestArchiveSafetyLimitsAreTableDriven(t *testing.T) {
-	manyFiles := make([]contractmock.ArchiveFile, 65)
+	manyFiles := make([]contractmock.ArchiveFile, 129)
 	for index := range manyFiles {
 		manyFiles[index] = contractmock.ArchiveFile{
 			Name: fmt.Sprintf("logs/%03d.log", index),
 			Data: []byte("{}\n"),
 		}
 	}
-	expandedFiles := make([]contractmock.ArchiveFile, 5)
+	expandedFiles := make([]contractmock.ArchiveFile, 33)
 	for index := range expandedFiles {
 		expandedFiles[index] = contractmock.ArchiveFile{
-			Name: fmt.Sprintf("logs/expanded-%d.txt", index),
+			Name: fmt.Sprintf("logs/expanded-%d.log", index),
 			Data: bytesOf('x', 1<<20),
 		}
 	}
@@ -604,7 +605,7 @@ func TestArchiveSafetyLimitsAreTableDriven(t *testing.T) {
 			name: "per file expansion",
 			files: []contractmock.ArchiveFile{{
 				Name: "logs/too-large.log",
-				Data: bytesOf('x', (1<<20)+1),
+				Data: bytesOf('x', (32<<20)+1),
 			}},
 		},
 		{
@@ -863,18 +864,28 @@ func newClient(
 	return client
 }
 
-func evidenceLine(taskID, referenceToken, eventID, cause string) string {
-	value := map[string]string{
-		"taskId":         taskID,
-		"referenceToken": referenceToken,
-		"eventId":        eventID,
-		"cause":          cause,
+func evidenceLine(taskID, referenceToken, _ string, cause string) string {
+	value := map[string]any{
+		"content": map[string]any{
+			"workflows": []any{
+				map[string]any{
+					"id": taskID,
+					"errors": []any{
+						map[string]any{
+							"referenceToken": referenceToken,
+							"errorCode":      "VCF_OPERATION_FAILED",
+							"message":        cause,
+						},
+					},
+				},
+			},
+		},
 	}
 	data, err := json.Marshal(value)
 	if err != nil {
 		panic(err)
 	}
-	return string(data) + "\n"
+	return string(data)
 }
 
 func secretAPIError() contractmock.VCFError {

@@ -3,25 +3,6 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $WarningPreference = 'SilentlyContinue'
 
-class TestVcfSdkConnection {
-    [uri] $ServerUri
-    [Net.Http.HttpClient] $HttpClient
-    [int] $GetClientCalls = 0
-
-    TestVcfSdkConnection(
-        [uri] $ServerUri,
-        [Net.Http.HttpClient] $HttpClient
-    ) {
-        $this.ServerUri = $ServerUri
-        $this.HttpClient = $HttpClient
-    }
-
-    [Net.Http.HttpClient] GetClient() {
-        $this.GetClientCalls++
-        return $this.HttpClient
-    }
-}
-
 function Assert-True {
     param(
         [bool] $Condition,
@@ -115,14 +96,14 @@ function New-TestTaskInfo {
 
     $Info = [ordered]@{
         description = [ordered]@{
-            id = 'com.example.clone.' + $RunId.Substring(0, 8)
-            default_message = 'runtime clone state ' + $Status
-            args = @($RunId.Substring(8, 4))
+            id = 'Description'
+            default_message = ''
+            args = @()
         }
-        service = 'com.vmware.vcenter.vm'
-        operation = 'clone'
+        service = '7978ee81-a66c-4c37-8653-c577c0161e9d'
+        operation = 'com.vmware.vcenter.vm.clone'
         status = $Status
-        cancelable = ($Status -in @('PENDING', 'RUNNING', 'BLOCKED'))
+        cancelable = $false
     }
     if ($PSBoundParameters.ContainsKey('Result')) {
         $Info.result = $Result
@@ -243,12 +224,8 @@ try {
         'StringComparer.Ordinal' 'contract collection comparer'
 
     $Manifest = Import-PowerShellDataFile -LiteralPath $ManifestPath
-    Assert-Equal @($Manifest.RequiredModules).Count 1 `
+    Assert-Equal @($Manifest.RequiredModules).Count 0 `
         'manifest prerequisite count'
-    Assert-Equal $Manifest.RequiredModules[0].ModuleName `
-        'VMware.Sdk.Vcf.SddcManager' 'VCF PowerCLI module prerequisite'
-    Assert-Equal ([version] $Manifest.RequiredModules[0].ModuleVersion) `
-        ([version] '13.5.0.25380678') 'VCF PowerCLI module version'
     Assert-Equal (($Manifest.FunctionsToExport) -join ',') `
         'New-VcfVcenterCloneInventoryClient,Invoke-VcfVcenterCloneInventory' `
         'manifest exports'
@@ -269,7 +246,7 @@ try {
     Assert-Equal @($ParseErrors).Count 0 'module parses without errors'
     $SourceText = Get-Content -Raw -LiteralPath $ModulePath
     foreach ($RequiredText in @(
-        '.GetClient()',
+        'DangerousAcceptAnyServerCertificateValidator',
         'Net.Http.HttpClient',
         'Net.Http.HttpRequestMessage',
         'vmware-api-session-id',
@@ -291,7 +268,9 @@ try {
         'TcpClient',
         'WebClient',
         'curl',
-        'wget'
+        'wget',
+        '.GetClient()',
+        'VMware.Sdk.Vcf.SddcManager'
     )) {
         Assert-True (
             $SourceText.IndexOf(
@@ -314,53 +293,14 @@ try {
     $InvokeCommand = Get-Command Invoke-VcfVcenterCloneInventory
     Assert-Equal $NewCommand.Parameters.Server.ParameterType.FullName `
         'System.Uri' 'server parameter type'
+    Assert-True (-not $NewCommand.Parameters.ContainsKey('Connection')) `
+        'client constructor has no unsupported connection parameter'
     Assert-Equal $InvokeCommand.Parameters.SourceVm.ParameterType.FullName `
         'System.String' 'source VM parameter type'
     Assert-Equal $InvokeCommand.Parameters.MaxPolls.ParameterType.FullName `
         'System.Int32' 'max polls parameter type'
     Assert-Equal $InvokeCommand.Parameters.PollIntervalMilliseconds.ParameterType.FullName `
         'System.Int32' 'poll interval parameter type'
-
-    $BorrowedHttpClient = [Net.Http.HttpClient]::new()
-    $SdkConnection = [TestVcfSdkConnection]::new(
-        [uri] 'https://sdk-vcenter.example.test/',
-        $BorrowedHttpClient
-    )
-    $ConnectionClient = New-VcfVcenterCloneInventoryClient `
-        -Connection $SdkConnection
-    Assert-Equal $SdkConnection.GetClientCalls 1 `
-        'connection form calls GetClient exactly once'
-    Assert-True (
-        [object]::ReferenceEquals(
-            $ConnectionClient.HttpClient,
-            $BorrowedHttpClient
-        )
-    ) 'connection form reuses the SDK HTTP client'
-    Assert-Equal $ConnectionClient.BaseUri.AbsoluteUri `
-        'https://sdk-vcenter.example.test/' `
-        'connection form uses the SDK server URI'
-
-    $OverrideClient = New-VcfVcenterCloneInventoryClient `
-        -Connection $SdkConnection `
-        -Server ([uri] 'https://override-vcenter.example.test:8443/')
-    Assert-Equal $SdkConnection.GetClientCalls 2 `
-        'connection form calls GetClient once per client creation'
-    Assert-True (
-        [object]::ReferenceEquals(
-            $OverrideClient.HttpClient,
-            $BorrowedHttpClient
-        )
-    ) 'server override still reuses the SDK HTTP client'
-    Assert-Equal $OverrideClient.BaseUri.AbsoluteUri `
-        'https://override-vcenter.example.test:8443/' `
-        'connection form honors the server override'
-    $BorrowedHttpClient.Dispose()
-
-    Assert-Throws {
-        New-VcfVcenterCloneInventoryClient -Connection ([pscustomobject]@{
-            ServerUri = [uri] 'https://sdk-vcenter.example.test/'
-        })
-    } 'connection form rejects an object without GetClient'
 
     foreach ($BadServer in @(
         [uri] 'relative-vcenter',
@@ -389,65 +329,64 @@ try {
     }
 
     $RunId = [guid]::NewGuid().ToString('N')
-    $SessionToken = 'session-' + $RunId
-    $SourceOne = 'vm/source one+雪-' + $RunId.Substring(0, 6)
+    $SessionToken = $RunId
+    $ServiceUuid = '7978ee81-a66c-4c37-8653-c577c0161e9d'
+    $SourceOne = 'vm-39'
     $NameOne = 'clone Alpha café ' + $RunId.Substring(6, 6)
-    $TaskOne = 'task/one +雪-' + $RunId.Substring(12, 6) + '?'
-    $SourceTwo = 'vm-source-two-' + $RunId.Substring(18, 6)
+    $TaskOne = 'task-4135:' + $ServiceUuid
+    $SourceTwo = 'vm-39'
     $NameTwo = 'clone Zulu ' + $RunId.Substring(24, 6)
-    $TaskTwo = 'task two/' + $RunId.Substring(0, 6) + '#'
-    $FailedSource = 'vm-failed-' + $RunId.Substring(6, 6)
+    $TaskTwo = 'task-4136:' + $ServiceUuid
+    $FailedSource = 'vm-39'
     $FailedName = 'failed clone ' + $RunId.Substring(12, 6)
-    $FailedTask = 'task-failed/' + $RunId.Substring(18, 6)
-    $LimitSource = 'vm-limit-' + $RunId.Substring(24, 6)
+    $FailedTask = 'task-4137:' + $ServiceUuid
+    $LimitSource = 'vm-39'
     $LimitName = 'limited clone ' + $RunId.Substring(0, 6)
-    $LimitTask = 'task-limit/' + $RunId.Substring(6, 6)
-    $UnknownSource = 'vm-unknown-' + $RunId.Substring(12, 6)
+    $LimitTask = 'task-4138:' + $ServiceUuid
+    $UnknownSource = 'vm-39'
     $UnknownName = 'unknown clone ' + $RunId.Substring(18, 6)
-    $UnknownTask = 'task-unknown/' + $RunId.Substring(24, 6)
-    $MalformedSource = 'vm-malformed-' + $RunId.Substring(2, 6)
+    $UnknownTask = 'task-4139:' + $ServiceUuid
+    $MalformedSource = 'vm-39'
     $MalformedName = 'malformed clone ' + $RunId.Substring(8, 6)
-    $MalformedTask = 'task-malformed/' + $RunId.Substring(14, 6)
+    $MalformedTask = 'task-4140:' + $ServiceUuid
     $SecretFailure = 'secret-error-' + $RunId
 
     $Inventory = @(
         [ordered]@{
-            vm = 'vm-b-' + $RunId.Substring(0, 4)
-            name = 'Alpha'
+            memory_size_MiB = 16384
+            vm = 'vm-19'
+            name = 'sddcm01'
             power_state = 'POWERED_ON'
             cpu_count = 4
-            memory_size_mib = 8192
-            runtime_field = 'preserve-b'
+            runtime_field = 'preserve-sddc'
         },
         [ordered]@{
-            vm = 'vm-z-' + $RunId.Substring(4, 4)
-            name = 'Zulu'
-            power_state = 'POWERED_OFF'
-            cpu_count = 2
-            runtime_field = 'preserve-z'
+            memory_size_MiB = 21504
+            vm = 'vm-20'
+            name = 'vc01'
+            power_state = 'POWERED_ON'
+            cpu_count = 4
+            runtime_field = 'preserve-vc'
         },
         [ordered]@{
-            vm = 'vm-l-' + $RunId.Substring(8, 4)
-            name = 'alpha'
-            power_state = 'SUSPENDED'
-            memory_size_mib = 4096
-            runtime_field = 'preserve-l'
+            memory_size_MiB = 24576
+            vm = 'vm-28'
+            name = 'nsx01a'
+            power_state = 'POWERED_ON'
+            cpu_count = 6
+            runtime_field = 'preserve-nsx'
         },
         [ordered]@{
-            vm = 'vm-a-' + $RunId.Substring(12, 4)
-            name = 'Alpha'
-            power_state = 'POWERED_OFF'
-            runtime_field = 'preserve-a'
+            memory_size_MiB = 10240
+            vm = 'vm-33'
+            name = 'vcf-msr01-nxpxf'
+            power_state = 'POWERED_ON'
+            cpu_count = 4
+            runtime_field = 'preserve-msr'
         }
     )
-    $SuccessResultOne = [ordered]@{
-        vm = 'vm-clone-' + $RunId.Substring(16, 6)
-        marker = 'result-one-' + $RunId.Substring(22, 6)
-    }
-    $SuccessResultTwo = [ordered]@{
-        vm = 'vm-clone-' + $RunId.Substring(2, 6)
-        marker = 'result-two-' + $RunId.Substring(10, 6)
-    }
+    $SuccessResultOne = 'vm-1030:' + $ServiceUuid
+    $SuccessResultTwo = 'vm-1031:' + $ServiceUuid
     $MalformedTaskInfo = New-TestTaskInfo SUCCEEDED $RunId
     $MalformedTaskInfo.Remove('cancelable')
     $Scenario = [ordered]@{
@@ -593,19 +532,19 @@ try {
     Assert-Equal $ResultOne.TaskId $TaskOne 'first task identifier'
     Assert-Equal $ResultOne.Status 'SUCCEEDED' 'first terminal status'
     Assert-Equal ([int] $ResultOne.PollCount) 4 'first one-based poll count'
-    Assert-Equal $ResultOne.Result.marker $SuccessResultOne.marker `
-        'first task result is preserved'
+    Assert-Equal $ResultOne.Result $SuccessResultOne `
+        'first decorated task result is preserved'
     Assert-Equal $ResultTwo.TaskId $TaskTwo 'second task identifier'
     Assert-Equal $ResultTwo.Status 'SUCCEEDED' 'second terminal status'
     Assert-Equal ([int] $ResultTwo.PollCount) 2 'second one-based poll count'
-    Assert-Equal $ResultTwo.Result.marker $SuccessResultTwo.marker `
-        'second task result is preserved'
+    Assert-Equal $ResultTwo.Result $SuccessResultTwo `
+        'second decorated task result is preserved'
 
     $ExpectedVmOrder = @(
-        $Inventory[3].vm,
+        $Inventory[2].vm,
         $Inventory[0].vm,
         $Inventory[1].vm,
-        $Inventory[2].vm
+        $Inventory[3].vm
     )
     foreach ($NumberedResult in @($ResultOne, $ResultTwo)) {
         $ActualInventory = @($NumberedResult.Inventory)
@@ -616,7 +555,7 @@ try {
             'VM inventory uses ordinal name then VM ordering'
         Assert-Equal (
             ($ActualInventory | ForEach-Object runtime_field) -join ','
-        ) 'preserve-a,preserve-b,preserve-z,preserve-l' `
+        ) 'preserve-nsx,preserve-sddc,preserve-vc,preserve-msr' `
             'complete VM summary objects are preserved'
     }
     Assert-Equal (

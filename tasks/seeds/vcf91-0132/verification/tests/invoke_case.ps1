@@ -26,8 +26,24 @@ try {
         ClusterName = $config.cluster_name
         KubernetesVersion = $config.kubernetes_version
         ClusterClass = $config.cluster_class
+        TopologyVariables = $config.topology_variables
+        WorkerClass = $config.worker_class
+        WorkerName = $config.worker_name
+        ControlPlaneReplicas = $config.control_plane_replicas
+        WorkerReplicas = $config.worker_replicas
         AmbiguityProbeCount = 3
         AmbiguityProbeDelayMilliseconds = 1
+    }
+
+    $liveGapError = $null
+    try {
+        $null = Ensure-VcfVksCluster @arguments
+    }
+    catch {
+        $liveGapError = $_
+    }
+    if ($null -eq $liveGapError) {
+        throw 'The exact live no-Supervisor case unexpectedly succeeded.'
     }
 
     $first = Ensure-VcfVksCluster @arguments

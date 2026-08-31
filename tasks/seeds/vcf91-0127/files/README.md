@@ -7,8 +7,7 @@ Java client for the three vSphere Automation API operations selected in
 operation IDs are recorded in `docs/official_sources.json`.
 
 Do not change the public constructor, record, interface, or method signature.
-Use only the JDK. `TestMain` exercises the class against an IPv4 loopback HTTP
-mock; verification never contacts a VMware endpoint.
+Use only the JDK.
 
 `cloneWaitAndList` must:
 
@@ -36,12 +35,6 @@ mock; verification never contacts a VMware endpoint.
    strings into `VmSummary`.
 7. Return an immutable collection sorted locally by ascending `name`, breaking
    ties by `vm`. Never trust server order.
-
-The mock returns `PENDING`, `RUNNING`, and then `SUCCEEDED` for every clone. It
-refuses a collection request while any clone task is incomplete. On each list
-response it flips the order relative to its previous orientation. Its
-newline-delimited, fsynced request log is read by `TestMain` to verify the
-contract sequence.
 
 Run:
 

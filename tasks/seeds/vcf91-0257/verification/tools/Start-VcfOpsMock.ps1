@@ -137,16 +137,16 @@ try {
                         $script:token = 'ops-token-2f1c4b'
                         $payload = @{
                             token     = $script:token
-                            validity  = 1893456000000
-                            expiresAt = 'Tuesday, January 1, 2030 at 12:00:00 AM UTC'
-                            roles     = @('Administrator')
+                            validity  = 1788098400000
+                            expiresAt = 'Sunday, August 30, 2026 at 12:00:00 PM Coordinated Universal Time'
+                            roles     = @()
                         }
                     }
                 }
 
                 'releaseToken' {
                     $script:token = $null
-                    $payload = @{}
+                    $payload = $null
                 }
 
                 'getCurrentVersionOfServer' {
@@ -156,9 +156,10 @@ try {
                         minor                     = 1
                         minorMinor                = 0
                         patch                     = 0
-                        buildNumber               = 24512000
-                        releasedDate              = 1772568000000
-                        humanlyReadableReleaseDate = 'Tuesday, March 3, 2026 at 12:00:00 PM PST'
+                        buildNumber               = 25541561
+                        description               = $null
+                        releasedDate              = 1772539200000
+                        humanlyReadableReleaseDate = 'Tuesday, March 3, 2026 at 12:00:00 PM Coordinated Universal Time'
                     }
                 }
 
@@ -193,12 +194,28 @@ try {
                         $status = 400
                         $payload = @{ message = 'name, adapterKindKey and credentialKindKey are required' }
                     }
+                    elseif ($json.credentialKindKey -eq 'PRINCIPALCREDENTIAL' -and
+                            (@($json.fields | ForEach-Object { $_.name }) -notcontains 'USER')) {
+                        $status = 400
+                        $payload = @{
+                            type = 'Error'
+                            message = 'Request Validation Failed. Reason is "USER is mandatory".'
+                            httpStatusCode = 400
+                            apiErrorCode = 1517
+                        }
+                    }
                     else {
                         $created = [ordered]@{
                             id                = $NEW_CREDENTIAL_ID
                             name              = $json.name
                             adapterKindKey    = $json.adapterKindKey
                             credentialKindKey = $json.credentialKindKey
+                            fields            = @(
+                                [pscustomobject]@{ name = 'USER'; value = [string](@($json.fields | Where-Object name -eq 'USER')[0].value) }
+                                [pscustomobject]@{ name = 'PASSWORD' }
+                                [pscustomobject]@{ name = 'ACTION_USER' }
+                                [pscustomobject]@{ name = 'ACTION_PASSWORD' }
+                            )
                             editable          = $true
                         }
                         [void]$credentials.Add([pscustomobject]$created)
@@ -214,6 +231,16 @@ try {
                     elseif (-not $json.resourceKey) {
                         # resourceKey is the only required property of adapter-instance.
                         $status = 400; $payload = @{ message = 'resourceKey is required' }
+                    }
+                    elseif (-not ($json.PSObject.Properties.Name -contains 'adapter-certificates') -or
+                            $null -eq $json.'adapter-certificates') {
+                        $status = 400
+                        $payload = @{
+                            type = 'Error'
+                            message = 'Field or property "AdapterCertificates" in type "AdapterInstanceDto" is required.'
+                            httpStatusCode = 400
+                            apiErrorCode = 1502
+                        }
                     }
                     else {
                         $target = $adapters | Where-Object { $_.id -eq $json.id } | Select-Object -First 1

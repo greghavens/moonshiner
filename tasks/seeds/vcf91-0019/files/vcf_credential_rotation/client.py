@@ -50,7 +50,7 @@ class SddcManagerCredentialRotator:
         max_polls: int = 60,
         timeout: float = 10.0,
     ) -> None:
-        raise NotImplementedError("implement the contract-pinned client")
+        raise NotImplementedError("implement the focused client")
 
     def rotate(
         self,

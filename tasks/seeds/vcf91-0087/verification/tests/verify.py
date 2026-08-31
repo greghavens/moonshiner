@@ -17,8 +17,8 @@ PROTECTED_HASHES = {
     "README.md": "34ec53a9d18faa778b58696b892cadef4aab4da1409f7488079ac53815ff4525",
     "docs/contract.json": "b3b1dfcba348578b30ac0cab6c077a93e7880540ddc7beed39c2ae9bf7ee25ac",
     "docs/official_sources.json": "09cbf2b7b94214d8b8e3a81e3e8c2f4cfef0a263e19f2df9939a5729dc397c67",
-    "tests/TestMain.java": "7192d255e5833b920b86dd882d5afcd8ed76a5c66a465a9f3294c5c6f8c826c1",
-    "tests/mock_nsx.py": "44c9ec41718f507b350f92f676750c675e8cba742408c135722774e772efe9ed",
+    "tests/TestMain.java": "37480f06dd9f5de820c136b7cd5b5e3f9b2caabe0e776d748e70233b503eb974",
+    "tests/mock_nsx.py": "1844d07f88b9923387fef51b8e4e71af343f4d1f2d820c0a3c1546330f435efb",
 }
 EXPECTED_OPERATION_IDS = [
     "OrgsOrgIdProjectsProjectIdInfraUpdateSecurityPolicyForDomain",

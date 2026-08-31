@@ -443,6 +443,11 @@ def verify_requests(
             "GET",
             "/api/vcenter/namespaces/instances/v2/" + encoded_namespace,
         ),
+        (
+            "namespace.getV2",
+            "GET",
+            "/api/vcenter/namespaces/instances/v2/" + encoded_namespace,
+        ),
         ("kubernetes.cluster.get", "GET", cluster_path),
         (
             "namespace.update",
@@ -451,7 +456,7 @@ def verify_requests(
         ),
         ("kubernetes.cluster.patch", "PATCH", cluster_path),
     ]
-    require(len(records) == 4, "unexpected request count")
+    require(len(records) == 5, "unexpected request count")
 
     for record, (operation, method, raw_target) in zip(
         records, expected, strict=True
@@ -512,16 +517,16 @@ def verify_requests(
 
     namespace_body = {"description": config["new_description"]}
     require(
-        records[2]["body"] == namespace_body,
+        records[3]["body"] == namespace_body,
         "UpdateSpec must serialize only description",
     )
     require(
-        records[2]["body_raw"]
+        records[3]["body_raw"]
         == json.dumps(namespace_body, separators=(",", ":")),
         "generated UpdateSpec JSON bytes changed",
     )
     require(
-        one_header(records[2], "content-type")
+        one_header(records[3], "content-type")
         == "application/json; charset=utf-8",
         "generated vCenter PATCH Content-Type changed",
     )
@@ -530,16 +535,16 @@ def verify_requests(
         "spec": {"topology": {"version": config["target_version"]}}
     }
     require(
-        records[3]["body"] == cluster_body,
+        records[4]["body"] == cluster_body,
         "VKS merge patch has the wrong exact shape",
     )
     require(
-        records[3]["body_raw"]
+        records[4]["body_raw"]
         == json.dumps(cluster_body, separators=(",", ":")),
         "VKS merge patch JSON bytes changed",
     )
     require(
-        one_header(records[3], "content-type")
+        one_header(records[4], "content-type")
         == "application/merge-patch+json",
         "VKS PATCH must use the merge-patch media type",
     )
@@ -555,18 +560,17 @@ def main() -> int:
     verify_contract()
     verify_prerequisites_and_shape()
 
-    suffix = secrets.token_hex(6)
     config = {
-        "vcenter_session_id": "vc-" + secrets.token_urlsafe(18),
+        "vcenter_session_id": secrets.token_hex(16),
         "kubernetes_bearer_token": "k8s-" + secrets.token_urlsafe(20),
-        "supervisor": "supervisor-" + suffix,
-        "namespace": "team-" + suffix,
-        "cluster_name": "orders-" + suffix,
-        "cluster_class": "builtin-generic-v3",
-        "old_description": "before-" + suffix,
-        "new_description": "maintenance-" + suffix,
-        "old_version": "v1.32.4+vmware.1-fips-vkr.1",
-        "target_version": "v1.33.1+vmware.1-fips-vkr.2",
+        "supervisor": "supervisor-live-validation-missing",
+        "namespace": "vmsp-platform",
+        "cluster_name": "vcf-msr01",
+        "cluster_class": "vsphere-9.1.2668",
+        "old_description": "before-live-validation",
+        "new_description": "maintenance-live-validation",
+        "old_version": "v1.34.2",
+        "target_version": "definitely-not-a-version",
         "failure_marker": "sensitive-rejection-" + secrets.token_urlsafe(16),
     }
 

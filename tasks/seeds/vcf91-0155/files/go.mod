@@ -1,3 +1,3 @@
-module moonshiner.local/vcf91/namespacebackup
+module vcfnamespacebackup
 
 go 1.22

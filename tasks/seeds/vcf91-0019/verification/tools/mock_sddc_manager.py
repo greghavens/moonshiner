@@ -25,6 +25,7 @@ EXPECTED_OPERATION_IDS = {
     "updateOrRotatePasswords",
     "getCredentialsTask",
     "getCredentialTaskByResourceID",
+    "getCredentials",
 }
 
 
