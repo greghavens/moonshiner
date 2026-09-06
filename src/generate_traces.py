@@ -81,7 +81,8 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
         protected_before = protected_hashes(seed, workspace)
         try:
             result = teacher.run_trace(
-                seed, workspace, out_dir=raw_dir, system_prompt="",
+                seed, workspace, out_dir=raw_dir,
+                system_prompt=teacher.coding_guidance(seed) or "",
                 prompt=prompt, interaction=interaction,
                 security=False, tools=None)
         except ModelUnavailable:

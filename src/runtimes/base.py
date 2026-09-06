@@ -454,6 +454,19 @@ def provisioned_powershell_modules() -> str:
     return os.pathsep.join(entries)
 
 
+#: Catalog programs whose seeds are graded against the shared coding rules.
+#: Every runtime reads this one list; no adapter carries its own policy.
+CODING_PROGRAMS = {
+    "Building", "Debugging", "Project & integration", "Feature development",
+    "Refactoring & performance", "Security",
+}
+#: The rules the trace judge grades against. One file, one code path, every
+#: harness -- an adapter that cannot deliver these must fail loudly, never
+#: silently run the author without the rules its verdict assumes.
+CODING_GUIDANCE = (
+    Path(__file__).parent.parent / "coding-agent-guidance.md").read_text()
+
+
 class Runtime(abc.ABC):
     """One agentic CLI usable as teacher and/or judge."""
 
@@ -477,6 +490,23 @@ class Runtime(abc.ABC):
     def captures_reasoning(self) -> bool:
         """Whether this native adapter preserves model reasoning in traces."""
         return False
+
+    def coding_guidance(self, seed: dict | None) -> str | None:
+        """The shared agent rules for ``seed``, or ``None`` when not applicable.
+
+        Policy lives here and only here. Adapters translate the returned text
+        into their own native system-prompt mechanism; they never decide which
+        seeds get rules, nor what the rules say.
+        """
+        if not seed:
+            return None
+        trace = ((self.config.get("pipeline") or {}).get("trace") or {})
+        if not trace.get("coding_system_prompt_append", True):
+            return None
+        programs = set(trace.get("coding_system_prompt_programs")
+                       or CODING_PROGRAMS)
+        return (CODING_GUIDANCE
+                if seed.get("_catalog_program") in programs else None)
 
     def trace_probe_command(self) -> list[str]:
         """Return the native executable probe used before an OCI paid call."""

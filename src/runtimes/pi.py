@@ -30,13 +30,6 @@ from runtimes.credential_proxy import DUMMY_TOKEN, ProxySession
 
 DEFAULT_TIMEOUT_SECONDS = 300
 MAX_TIMEOUT_SECONDS = 600
-CODING_PROGRAMS = {
-    "Building", "Debugging", "Project & integration", "Feature development",
-    "Refactoring & performance", "Security",
-}
-CODING_GUIDANCE = (
-    Path(__file__).parent.parent / "coding-agent-guidance.md").read_text()
-
 def run_streamed(command: list[str], *, workspace: Path, turn: str,
                  stdout_path: Path, stderr_path: Path, timeout: int,
                  environment: dict[str, str]) -> subprocess.CompletedProcess:
@@ -223,14 +216,6 @@ class PiRuntime(Runtime):
             cmd += ["--continue"]
         return cmd
 
-    def _coding_guidance(self, seed: dict) -> str | None:
-        trace = ((self.config.get("pipeline") or {}).get("trace") or {})
-        if not trace.get("coding_system_prompt_append", True):
-            return None
-        programs = set(trace.get("coding_system_prompt_programs")
-                       or CODING_PROGRAMS)
-        return CODING_GUIDANCE if seed.get("_catalog_program") in programs else None
-
     # -- teacher ------------------------------------------------------------ #
     def run_trace(self, seed: dict, workspace: Path, *, out_dir: Path,
                   system_prompt: str, prompt: str,
@@ -242,7 +227,7 @@ class PiRuntime(Runtime):
                          system_prompt=system_prompt, tools=tools,
                          read_only=False, artifact_id=seed["id"],
                          interaction=interaction,
-                         append_system_prompt=self._coding_guidance(seed), seed=seed)
+                         append_system_prompt=system_prompt or None, seed=seed)
 
     def _run(self, *, prompt: str, workspace: Path, out_dir: Path,
              system_prompt: str, tools: list[str] | None,

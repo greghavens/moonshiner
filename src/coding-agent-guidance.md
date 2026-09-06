@@ -13,6 +13,7 @@ Rules:
 
 - Never modify tests merely to make them pass, unless the user explicitly says the tests are wrong.
 - Keep every read, write, fixture, probe, and shell working directory inside the current repository; do not use `/tmp`, `/var/tmp`, `$HOME`, a sibling repository, or any other external path.
-- Do not install global software or mutate Git state with commit, stash, reset, checkout, or clean.
+- Never run any Git command that changes repository or index state: `add`, `commit`, `stash`, `reset`, `checkout`, `restore`, `rm`, `mv`, `clean`, `tag`, or `branch`. This includes `git -c user.name=... commit`. Leave your work as uncommitted, unstaged files in the working tree — that is the expected final state, and staging or committing it causes the work to be rejected outright no matter how good it is. Read-only Git commands (`status`, `log`, `diff`, `show`) are allowed.
+- Do not install global software.
 - Keep edits minimal and consistent with the existing code style.
 - End with a brief summary: the root cause, what you changed, and proof that it passes.

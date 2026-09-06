@@ -37,6 +37,8 @@ from runtimes.credential_proxy import DUMMY_TOKEN, ProxySession
 
 
 OPENCODE_RUNTIME_VERSION = "1.18.18"
+#: Where the shared agent rules are materialised for OpenCode to read.
+GUIDANCE_FILENAME = "moonshiner-coding-agent-guidance.md"
 TRACE_FORMAT = "opencode-session-v1"
 _ISOLATION_FLAGS = {
     "OPENCODE_DISABLE_PROJECT_CONFIG": "true",
@@ -81,6 +83,24 @@ def _is_content_filter(error) -> bool:
             return True
     text = str(error).lower()
     return any(phrase in text for phrase in CONTENT_FILTER_PHRASES)
+
+
+def _guidance_instructions(workspace: Path, system_prompt: str) -> list[str]:
+    """Deliver the caller's system prompt through OpenCode's own mechanism.
+
+    OpenCode has no ``--append-system-prompt``; its equivalent is the config's
+    ``instructions`` list, which takes file paths. The file lives under
+    ``.sandbox-home``, which :func:`_snapshot_excludes` and the shared diff
+    exclusions both keep out of every candidate diff, so delivering the rules
+    never contaminates the captured trace.
+    """
+    if not system_prompt:
+        return []
+    home = Path(workspace) / ".sandbox-home"
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / GUIDANCE_FILENAME
+    path.write_text(system_prompt)
+    return [str(path)]
 
 
 def _snapshot_excludes(workspace: Path) -> Path:
@@ -606,6 +626,7 @@ class OpenCodeRuntime(Runtime):
             remove_workspace(workspace)
 
     def _server_environment(self, workspace: Path, proxy_base_url: str,
+                            system_prompt: str = "",
                             *, read_only: bool,
                             base_environment: dict[str, str] | None = None
                             ) -> dict[str, str]:
@@ -633,7 +654,7 @@ class OpenCodeRuntime(Runtime):
             "share": "disabled",
             "autoupdate": False,
             "plugin": [],
-            "instructions": [],
+            "instructions": _guidance_instructions(workspace, system_prompt),
             "provider": {
                 provider: provider_config,
             },
@@ -805,14 +826,15 @@ class OpenCodeRuntime(Runtime):
             out_dir: Path, artifact_id: str, prompt: str,
             interaction: list[str] | None,
             read_only: bool,
-            base_environment: dict[str, str]) -> TraceResult:
+            base_environment: dict[str, str],
+            system_prompt: str = "") -> TraceResult:
         provider, model = _provider_and_model(self)
         real_key = load_provider_key(self.runtime_config)
         proxy = ProxySession(self.runtime_config["base_url"], real_key).start()
         port = self._reserve_port()
         base_url = f"http://127.0.0.1:{port}"
         environment = self._server_environment(
-            workspace, proxy.base_url, read_only=read_only,
+            workspace, proxy.base_url, system_prompt, read_only=read_only,
             base_environment=base_environment)
         command = command_factory(environment)
         command = [*command, "serve", "--hostname", "127.0.0.1",
@@ -1007,7 +1029,7 @@ class OpenCodeRuntime(Runtime):
             workspace=workspace,
             out_dir=out_dir, artifact_id=seed["id"], prompt=prompt,
             interaction=interaction, read_only=False,
-            base_environment=environment)
+            base_environment=environment, system_prompt=system_prompt)
 
     def run_review(self, instruction: str, workspace: Path, *, out_dir: Path,
                    schema: dict | None = None,
