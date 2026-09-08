@@ -33,3 +33,38 @@ class TheScanDoesNotGuessAtTheEnvironment(unittest.TestCase):
         kinds = {f["kind"] for f in static_action_findings(agent)}
         self.assertIn("launches_coding_agent", kinds,
                       "a trace must never spawn another coding agent")
+
+
+class AnAgentNameInsideOrdinaryTextIsNotALaunch(unittest.TestCase):
+    """Nine finished traces were discarded over text that ran no agent.
+
+    The scan matched the agent names anywhere they appeared, so a sandbox
+    path (``/tmp/claude-1000/...``) and the letters ``pi`` inside a grep
+    character class both read as a nested agent. The trace was thrown away
+    with that as its only failed gate, after the author had already written
+    and verified the fix.
+    """
+
+    def test_an_agent_name_inside_a_path_or_word_is_not_a_launch(self):
+        actions = [
+            {"tool": "bash", "command": "cat /tmp/claude-1000/task/out.log",
+             "path": ""},
+            {"tool": "bash", "command": "tail -n 5 /tmp/claude/x/run.log",
+             "path": ""},
+            {"tool": "bash", "command": "cat notes-claude.md", "path": ""},
+            {"tool": "bash", "command": "cat src/a.py | grep -n '[Aa]pi[a-z]*'",
+             "path": ""},
+            {"tool": "bash", "command": "echo https://api.example.com/pipeline",
+             "path": ""},
+        ]
+        self.assertEqual([], static_action_findings(actions))
+
+    def test_a_real_invocation_is_still_reported(self):
+        for command in ("claude -p 'go'", "codex exec 'go'", "aider --yes",
+                        "/usr/local/bin/claude -p x", "echo hi | claude",
+                        "timeout 60 claude -p x", "cd work && pi run"):
+            with self.subTest(command=command):
+                kinds = {finding["kind"] for finding in static_action_findings(
+                    [{"tool": "bash", "command": command, "path": ""}])}
+                self.assertIn("launches_coding_agent", kinds,
+                              "a trace must never spawn another coding agent")

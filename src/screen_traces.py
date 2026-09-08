@@ -62,7 +62,21 @@ INSTALL_RE = re.compile(
     r"\bnpm\s+install\s+-g\b|\bcargo\s+install\b")
 NETWORK_RE = re.compile(r"\b(curl|wget|nc|ncat|telnet)\b")
 LOCALHOST_RE = re.compile(r"127\.0\.0\.1|localhost|0\.0\.0\.0")
-AGENT_RE = re.compile(r"\b(codex\s+exec|claude|aider|pi)\b")
+# The agent names also occur inside ordinary paths. A sandbox home carries
+# a ``/tmp/claude-1000/`` directory, so an author reading back the output of
+# its own background shell task was scanned as having launched a nested
+# agent, and the trace was thrown away for it. Require the name to stand on
+# its own as a command word: not glued into a longer token (``claude-1000``,
+# ``claude.log``) and, per ``launches_coding_agent`` below, not an interior
+# path segment. A real invocation -- ``claude -p``, ``/usr/bin/claude`` --
+# still matches.
+AGENT_RE = re.compile(r"(?<![\w.-])(codex\s+exec|claude|aider)(?![\w.-])")
+# ``pi`` is two letters that occur throughout ordinary text -- inside a
+# character class in a grep pattern (``[Aa]pi[a-z]*``), in a URL, in prose.
+# Scanned as loosely as the distinctive names beside it, it flagged traces
+# that never ran an agent at all. Require it to stand where a command stands:
+# at the start, or straight after a shell separator, optionally via a path.
+PI_RE = re.compile(r"(?:^|[;|&(){}\n]|&&|\|\|)\s*(?:[\w.-]*/)*pi(?![\w.-])")
 MKTEMP_RE = re.compile(r"\bmktemp\b")
 # A search/read command whose /tmp token is a pattern, not a file operand.
 SEARCH_CMD_RE = re.compile(r"^\s*(rg|grep|egrep|fgrep|ag|ripgrep|awk|sed)\b")
@@ -122,7 +136,16 @@ def actionable_temp_path(command: str) -> bool:
 def launches_coding_agent(command: str) -> bool:
     if SEARCH_CMD_RE.match(command):
         return False
-    return bool(AGENT_RE.search(command))
+    if PI_RE.search(command):
+        return True
+    for match in AGENT_RE.finditer(command):
+        # ``/tmp/claude/x`` names a directory on the way to a file; only the
+        # last segment of a path is ever the command being run.
+        if (command[:match.start()].endswith("/")
+                and command[match.end():].startswith("/")):
+            continue
+        return True
+    return False
 
 
 def static_action_findings(actions: list[dict], workspace_name: str = "") -> list[dict]:
