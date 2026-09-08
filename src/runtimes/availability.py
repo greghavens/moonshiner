@@ -38,6 +38,15 @@ LIMIT_PHRASES = (
     "subscription quota limit",
     "quote_exceeded",
     "quota_exceeded",
+    # Claude Code answers an exhausted budget with prose that shares no wording
+    # with any of the above -- it reports hitting the org monthly spend limit
+    # and points at claude.ai/settings/usage. It is the same live condition: an
+    # admin raises the cap and the next start succeeds. Unrecognised, it took
+    # the INFRASTRUCTURE_EXIT path described above and stranded every queued
+    # seed as infrastructure_blocked. The org wording is carried alongside the
+    # bare substring both spellings share, so a personal cap matches too.
+    "monthly spend limit",
+    "spend limit",
 )
 
 # Exit status used when a queue stops because its runtime is out of quota. The
