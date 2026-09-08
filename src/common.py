@@ -459,7 +459,22 @@ def _overlay_verification_files(source: Path, target: Path) -> None:
             target_path.unlink()
         elif target_path.is_dir():
             shutil.rmtree(target_path)
+        # ``copy2`` carries the source's permission bits across. Seed
+        # verification trees are packaged without the executable bit, so
+        # overlaying a verifier onto the executable stub it replaces stripped
+        # that bit -- and every seed whose ``verify_cmd`` runs the script
+        # directly (``./verify.sh``) then died with ``execvp: Permission
+        # denied``. That was recorded as a candidate whose verification did not
+        # pass twice, so a broken overlay read as the author's fault on every
+        # attempt of the seed, no matter what the author wrote. Carry the
+        # replaced file's executability across: the overlay may install a
+        # verifier, never disarm one.
+        replaced_mode = target_path.stat().st_mode if target_path.exists() \
+            else None
         shutil.copy2(source_path, target_path)
+        if replaced_mode is not None and replaced_mode & 0o111:
+            target_path.chmod(target_path.stat().st_mode
+                              | (replaced_mode & 0o111))
 
 
 def jsonl_lines(path: Path, *, errors: str | None = None) -> list[str]:

@@ -601,3 +601,55 @@ class WhatAnEditorAddsAtTheEndIsNotPartOfThePatch(unittest.TestCase):
         self.assertEqual(applied.returncode, 0, applied.stderr)
         self.assertEqual((self.root / "value.txt").read_text(),
                          "first\nsecond\nthird\n\n")
+
+
+class AnOverlaidVerifierStaysRunnable(unittest.TestCase):
+    """A verifier the overlay installs must still be executable.
+
+    Verification trees are packaged without the executable bit, and the
+    overlay copied the source's mode across the workspace stub it replaced.
+    Every seed whose ``verify_cmd`` runs its script directly (``./verify.sh``)
+    then died with ``Permission denied``, which was recorded as verification
+    that did not pass twice -- a broken overlay reading as the author's fault
+    on every attempt, no matter what the author wrote.
+    """
+
+    def test_overlay_keeps_the_replaced_script_executable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            workspaces = root / "workspaces"
+            workspace = workspaces / "trace"
+            workspace.mkdir(parents=True)
+            stub = workspace / "verify.sh"
+            stub.write_text("#!/bin/sh\necho local checks passed\n")
+            stub.chmod(0o755)
+            seed_directory = root / "seed"
+            verification = seed_directory / "verification"
+            verification.mkdir(parents=True)
+            authority = verification / "verify.sh"
+            authority.write_text("#!/bin/sh\necho ALL TESTS PASSED\n")
+            authority.chmod(0o644)
+            (verification / "cases.json").write_text("[]\n")
+            seed = {"id": "runnable-verifier", "_dir": seed_directory,
+                    "verify_cmd": "./verify.sh"}
+            completed = subprocess.CompletedProcess([], 0, "passed", "")
+
+            def verify(_command, target, _timeout, **_kwargs):
+                overlaid = target / "verify.sh"
+                self.assertEqual("#!/bin/sh\necho ALL TESTS PASSED\n",
+                                 overlaid.read_text())
+                self.assertTrue(overlaid.stat().st_mode & 0o111,
+                                "the overlay disarmed the verifier it installed")
+                # A verifier with no counterpart in the workspace gains
+                # nothing: the overlay may keep executability, never grant it.
+                self.assertFalse((target / "cases.json").stat().st_mode & 0o111)
+                return completed
+
+            with mock.patch.object(common, "WORKSPACES", workspaces), \
+                    mock.patch.object(common, "warm_dependency_cache"), \
+                    mock.patch.object(common, "_sandboxed_command",
+                                      side_effect=verify):
+                passed, _ = common.run_verify(seed, workspace)
+
+            self.assertTrue(passed)
+            self.assertEqual(0o755, stub.stat().st_mode & 0o777)
