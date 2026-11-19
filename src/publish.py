@@ -259,6 +259,8 @@ def main(argv=None)->int:
     parser.add_argument("--task", action="append", default=[])
     parser.add_argument("--allow-shrink", action="store_true",
                         help="Publish even though it removes rows already published.")
+    parser.add_argument("--allow-layout-change", action="store_true",
+                        help="Allow removal of existing dataset layout artifacts.")
     parser.add_argument("--yes",action="store_true"); args=parser.parse_args(argv)
     if not args.dataset:parser.error("--dataset is required")
     if not args.yes:parser.error("publishing requires --yes")
@@ -319,17 +321,25 @@ def main(argv=None)->int:
                                  HfApi)
     api = HfApi(token=auth_token)
     api.create_repo(args.dataset, repo_type="dataset", private=private, exist_ok=True)
-    request=urllib.request.Request(f"https://huggingface.co/api/datasets/{args.dataset}/settings",
-        data=json.dumps({"private":private}).encode(),headers={"Authorization":f"Bearer {auth_token}","Content-Type":"application/json"},method="PUT")
-    with urllib.request.urlopen(request) as response:
-        if response.status//100!=2:raise RuntimeError("dataset visibility update failed")
     operations = [CommitOperationAdd(
         path_in_repo=path.relative_to(args.dir).as_posix(),
         path_or_fileobj=str(path)) for path in files]
     remote = set(api.list_repo_files(args.dataset, repo_type="dataset"))
     active_remote = {path.relative_to(args.dir).as_posix() for path in files}
-    operations.extend(CommitOperationDelete(path_in_repo=path)
-                      for path in inactive_remote_paths(mode, remote, active_remote))
+    inactive = inactive_remote_paths(mode, remote, active_remote)
+    layout_removals = [
+        path for path in inactive
+        if path == "traces.jsonl" or path.startswith("viewer/")
+        or (mode != "parquet-shards" and
+            (path == "dataset-manifest.json" or path.startswith("data/")))
+    ]
+    if layout_removals and not args.allow_layout_change:
+        raise ValueError(
+            "refusing to remove existing dataset layout artifacts: "
+            + ", ".join(layout_removals)
+            + ". Keep the existing publication layout or rerun "
+              "with --allow-layout-change if the removal is intended.")
+    operations.extend(CommitOperationDelete(path_in_repo=path) for path in inactive)
     published = published_row_count(api, args.dataset)
     publishing = publishing_row_count(args.dir)
     if (shrinks_the_dataset(publishing, published,
