@@ -210,6 +210,15 @@ With `parquet-shards`, set `publish.include_jsonl` to `false` to publish only
 the card, manifest, banner, and active Parquet shards while retaining the
 canonical JSONL locally.
 
+`publish.private` sets visibility only when Moonshiner creates the Hub dataset.
+Publishing to an existing dataset leaves its visibility unchanged.
+
+Publication will not remove existing layout artifacts during a routine run.
+If you intend to replace the current layout (including removing a published
+`traces.jsonl` URL), review the paths reported by the publisher and run
+`moonshiner publish --yes --allow-layout-change` once with the intended dataset
+and publication settings. This flag does not bypass the separate row-count check.
+
 These settings are reread between work items. Reducing concurrency does not cancel active model calls.
 
 Hugging Face keeps old LFS objects in repository history. To preview an
