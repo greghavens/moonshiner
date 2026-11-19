@@ -2,8 +2,9 @@ import tempfile
 import unittest
 import json
 import sys
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -26,6 +27,95 @@ class _Response:
 
     def read(self):
         return self.payload
+
+
+class PublicationSafety(unittest.TestCase):
+    @contextmanager
+    def staged_publish(self, remote, *, mode="jsonl-hf-parquet", include_jsonl=True):
+        import publish
+
+        config = {"publish": {"private": True, "format": mode,
+                              "include_jsonl": include_jsonl}}
+        hub = Mock()
+        hub.list_repo_files.return_value = sorted(remote)
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as mocks:
+            base = Path(directory)
+            (base / "traces.jsonl").write_text("{}\n")
+            (base / "README.md").write_text("---\nlicense: cc-by-4.0\n---\n")
+            manifest = {"active_shards": ["data/train-00001.parquet"], "row_count": 1}
+            if mode == "parquet-shards":
+                (base / "data").mkdir()
+                (base / "data" / "train-00001.parquet").write_bytes(b"fixture")
+                (base / "dataset-manifest.json").write_text(json.dumps(manifest))
+
+            for name, value in {
+                "CONFIG": config,
+                "DATA": base / "runtime",
+            }.items():
+                mocks.enter_context(patch.object(publish, name, value))
+            for name, value in {
+                "ensure_local_dataset": {},
+                "validate": None,
+                "sync_parquet": manifest,
+                "privacy_scan_files": [],
+                "token": "hf-test",
+                "published_row_count": 1,
+                "_verify_remote_card": None,
+            }.items():
+                mocks.enter_context(patch.object(publish, name, return_value=value))
+            mocks.enter_context(patch("huggingface_hub.HfApi", return_value=hub))
+            network = mocks.enter_context(patch("publish.urllib.request.urlopen"))
+            args = ["--dataset", "owner/dataset", "--dir", directory, "--yes"]
+            yield publish.main, args, hub, network
+
+    def test_visibility_only_passes_to_repository_creation(self):
+        for remote in (set(), {"README.md", "traces.jsonl"}):
+            with self.subTest(remote=remote), self.staged_publish(remote) as case:
+                main, args, hub, network = case
+                self.assertEqual(main(args), 0)
+                hub.create_repo.assert_called_once_with(
+                    "owner/dataset", repo_type="dataset", private=True, exist_ok=True)
+                network.assert_not_called()
+                hub.update_repo_settings.assert_not_called()
+                hub.create_commit.assert_called_once()
+
+    def test_jsonl_cannot_remove_sharded_layout_without_explicit_intent(self):
+        remote = {"traces.jsonl", "dataset-manifest.json", "data/train-00000.parquet",
+                  "viewer/train-00000.jsonl"}
+        with self.staged_publish(remote) as (main, args, hub, network):
+            with self.assertRaisesRegex(ValueError, r"data/train-00000.parquet.*--allow-layout-change"):
+                main([*args, "--allow-shrink"])
+            hub.create_commit.assert_not_called()
+            network.assert_not_called()
+            self.assertEqual(main([*args, "--allow-layout-change"]), 0)
+            from huggingface_hub import CommitOperationDelete
+            ops = hub.create_commit.call_args.kwargs["operations"]
+            self.assertEqual({op.path_in_repo for op in ops
+                              if isinstance(op, CommitOperationDelete)},
+                             remote - {"traces.jsonl"})
+
+    def test_parquet_only_cannot_remove_existing_canonical_jsonl_without_intent(self):
+        with self.staged_publish({"traces.jsonl"}, mode="parquet-shards",
+                                 include_jsonl=False) as (main, args, hub, _):
+            with self.assertRaisesRegex(ValueError, r"traces.jsonl.*--allow-layout-change"):
+                main(args)
+            hub.create_commit.assert_not_called()
+            self.assertEqual(main([*args, "--allow-layout-change"]), 0)
+            from huggingface_hub import CommitOperationDelete
+            self.assertEqual([op.path_in_repo for op in
+                              hub.create_commit.call_args.kwargs["operations"]
+                              if isinstance(op, CommitOperationDelete)], ["traces.jsonl"])
+
+    def test_parquet_shard_rollover_is_not_a_layout_change(self):
+        with self.staged_publish({"traces.jsonl", "dataset-manifest.json",
+                                  "data/train-00000.parquet"}, mode="parquet-shards") as case:
+            main, args, hub, _ = case
+            self.assertEqual(main(args), 0)
+            from huggingface_hub import CommitOperationDelete
+            self.assertEqual([op.path_in_repo for op in
+                              hub.create_commit.call_args.kwargs["operations"]
+                              if isinstance(op, CommitOperationDelete)],
+                             ["data/train-00000.parquet"])
 
 
 class RemoteCardVerification(unittest.TestCase):
